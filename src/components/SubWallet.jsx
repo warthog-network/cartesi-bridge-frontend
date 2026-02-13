@@ -315,6 +315,7 @@ function SubWallet({
         type: 'sweep_lock',
         subAddress: sub.address,
         sweepProof,
+        index: sub.index,
       });
 
       // Poll for completion
@@ -526,7 +527,7 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
         })
         .filter(Boolean);
       const relevant = parsed.filter(
-        n => n.subAddress === subAddress && ['subwallet_pending', 'sweep_locked', 'subwallet_unlocked'].includes(n.type)
+        n => n.subAddress === subAddress && ['subwallet_pending', 'sweep_locked', 'subwallet_unlocked', 'vault_created'].includes(n.type)
       );
       if (relevant.length > 0) {
         // Take the most recent one (assuming last:20 is recent first)
@@ -765,7 +766,15 @@ return (
                   toast('Vault hidden');
                 } else if (hasChecked) {
                   // Generate vault
-                  toast('Deposit funds to this subwallet to create a vault');
+                  send({
+                    type: 'create_vault',
+                    subAddress: sub.address,
+                    index: sub.index,
+                    owner: mainWallet.address
+                  });
+                  toast('Creating empty vault...');
+                  // After sending, refresh to show the vault
+                  setTimeout(() => refreshSubBalance(sub.address), 5000);
                 } else {
                   // Show vault
                   const vaultAddr = await getVaultAddressForSub(sub.address);
