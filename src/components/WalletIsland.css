@@ -1,147 +1,322 @@
-/* WalletIsland.css - Modern, concise styles */
-:root {
-  --primary-bg: #f8f9fa;
-  --accent-color: #007bff;
-  --danger-color: #dc3545;
-  --spacing-unit: 1rem;
-  --border-radius: 8px;
-  --border-color: #555;
+/* WalletIsland — compact dark shell aligned with Warthog wallet cards */
+
+.wi-shell {
+  width: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 0.25rem 1.5rem;
+  color: #fff;
+  text-align: left;
 }
 
-.vault-section {
-  padding: var(--spacing-unit);
-}
-
-.connected-address {
+/* ── Connect (logged out) ── */
+.wi-connect-card {
+  margin: 1.5rem auto;
+  max-width: 28rem;
+  padding: 1.25rem 1.35rem;
+  border-radius: 16px;
+  border: 1px solid color-mix(in srgb, #fdb913 40%, #333);
+  background: color-mix(in srgb, #0a0a0a 92%, transparent);
   text-align: center;
-  margin: calc(var(--spacing-unit) * 1.5) 0;
-  font-weight: bold;
 }
 
-.register-btn-container {
-  text-align: center;
-  margin: calc(var(--spacing-unit) * 1.5) 0;
+.wi-connect-lead {
+  margin: 0 0 1rem;
+  font-size: 0.92rem;
+  opacity: 0.9;
 }
 
-.card {
-  background: var(--primary-bg);
-  border-radius: var(--border-radius);
-  padding: var(--spacing-unit);
-  margin-bottom: var(--spacing-unit);
+.wi-stat-grid--preview {
+  margin-top: 1.15rem;
 }
 
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: var(--spacing-unit);
-}
-
-
-
-
-
-.yellow { background: #fff3cd; }
-.teal { background: #d1ecf1; }
-.purple { background: #e2e3e5; }
-.blue { background: #cce5ff; }
-.green { background: #d4edda; }
-
-.actions {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  gap: var(--spacing-unit);
-  margin-top: var(--spacing-unit);
-  flex-wrap: wrap;
-}
-
-.burn-input {
-  padding: calc(var(--spacing-unit) / 2);
-  margin: 0 calc(var(--spacing-unit) / 2);
-  border-radius: var(--border-radius);
-  border: 1px solid var(--border-color);
-  width: 140px;
-}
-
-.refresh-btn-container {
-  text-align: center;
-  margin-top: var(--spacing-unit);
-}
-
-.deposit-section h2 {
-  text-align: center;
-  margin-bottom: var(--spacing-unit);
-}
-
-.deposit-grid {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: var(--spacing-unit);
-}
-
-.deposit-box {
+/* ── Header ── */
+.wi-header {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  padding: var(--spacing-unit);
-  background: var(--primary-bg);
-  border-radius: var(--border-radius);
-  gap: calc(var(--spacing-unit) / 2);
+  gap: 0.55rem;
+  margin-bottom: 0.75rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 14px;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, #fdb913 12%, #0a0a0a),
+    color-mix(in srgb, #00ffcc 10%, #0a0a0a)
+  );
+  border: 1px solid rgba(253, 185, 19, 0.35);
 }
 
-.deposit-input {
-  padding: calc(var(--spacing-unit) / 2);
-  width: 100px;
-  border-radius: var(--border-radius);
-  border: 1px solid var(--border-color);
-}
-
-.deposit-controls {
+.wi-header-main {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: calc(var(--spacing-unit) / 2);
+  justify-content: space-between;
+  gap: 0.55rem;
 }
 
-.withdraw-section h2 {
-  text-align: center;
-  margin-bottom: var(--spacing-unit);
-}
-
-.withdraw-box {
+.wi-header-id {
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.wi-header-label {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #ffecb3;
+  opacity: 0.85;
+}
+
+.wi-address-chip {
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(0, 255, 204, 0.35);
+  color: #00ffcc;
+  border-radius: 999px;
+  padding: 0.35rem 0.75rem;
+  font-size: 0.8rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  cursor: pointer;
+  width: fit-content;
+}
+
+.wi-address-chip:hover {
+  border-color: #00ffcc;
+}
+
+.wi-header-tools {
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: calc(var(--spacing-unit) / 2);
-  padding: var(--spacing-unit);
-  /* No background for withdraw box */
+  gap: 0.4rem;
 }
 
-.withdraw-input {
-  padding: calc(var(--spacing-unit) / 2);
-  margin: 0 calc(var(--spacing-unit) / 2);
-  width: 100px;
-  border-radius: var(--border-radius);
-  border: 1px solid var(--border-color);
+.wi-l1-tabs {
+  margin-bottom: 0.55rem;
 }
 
-.withdraw-note {
-  text-align: center;
-  margin-top: calc(var(--spacing-unit) / 2);
-  font-size: 12px;
-  color: #aaa;
+/* ── Panel + stats ── */
+.wi-panel {
+  padding: 0.85rem 0.95rem;
+  border-radius: 14px;
+  border: 1px solid #333;
+  background: color-mix(in srgb, #1a1a1a 80%, #000);
+  margin-bottom: 0.25rem;
 }
 
-.toggle-warthog {
-  text-align: center;
-  margin: calc(var(--spacing-unit) * 1.5) 0;
+.wi-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  gap: 0.45rem;
 }
 
-/* Responsive */
-@media (max-width: 768px) {
-  .grid, .deposit-grid {
-    grid-template-columns: 1fr;
+.wi-stat {
+  background: rgba(0, 0, 0, 0.32);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 0.55rem 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-height: 3.4rem;
+}
+
+.wi-stat--liquid {
+  border-color: color-mix(in srgb, #fdb913 40%, #333);
+}
+
+.wi-stat--spoof {
+  border-color: color-mix(in srgb, #00ffcc 35%, #333);
+}
+
+.wi-stat-icon {
+  opacity: 0.75;
+  color: #fdb913;
+  margin-bottom: 0.1rem;
+}
+
+.wi-stat-k {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  opacity: 0.6;
+  color: #ffecb3;
+}
+
+.wi-stat-v {
+  font-size: 1rem;
+  font-weight: 700;
+  color: #fff;
+  word-break: break-all;
+}
+
+.wi-muted {
+  margin: 0.55rem 0 0;
+  font-size: 0.82rem;
+  opacity: 0.7;
+  line-height: 1.4;
+}
+
+.wi-guide {
+  margin-top: 0.75rem;
+  font-size: 0.82rem;
+}
+
+.wi-guide summary {
+  cursor: pointer;
+  color: #00ffcc;
+  font-weight: 600;
+  opacity: 0.9;
+  list-style: none;
+}
+
+.wi-guide summary::-webkit-details-marker {
+  display: none;
+}
+
+.wi-guide summary::before {
+  content: '▸ ';
+  opacity: 0.7;
+}
+
+.wi-guide[open] summary::before {
+  content: '▾ ';
+}
+
+.wi-guide .bridge-path-steps {
+  margin: 0.5rem 0 0;
+  padding-left: 1.15rem;
+  line-height: 1.5;
+  opacity: 0.85;
+  font-size: 0.8rem;
+}
+
+.wi-guide .bridge-path-steps li + li {
+  margin-top: 0.3rem;
+}
+
+.wi-history {
+  list-style: none;
+  margin: 0.55rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  max-height: 12rem;
+  overflow-y: auto;
+  font-size: 0.78rem;
+}
+
+.wi-history li {
+  padding: 0.35rem 0.5rem;
+  border-radius: 8px;
+  border: 1px solid #333;
+  background: rgba(0, 0, 0, 0.25);
+  opacity: 0.9;
+}
+
+.wi-history--burn li {
+  border-color: color-mix(in srgb, #e74c3c 30%, #333);
+}
+
+/* ── Portals ── */
+.wi-portal-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.55rem;
+  margin-top: 0.55rem;
+}
+
+.wi-portal-card {
+  border: 1px solid color-mix(in srgb, #00ffcc 22%, #333);
+  border-radius: 12px;
+  padding: 0.65rem 0.7rem;
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.wi-portal-card--disabled {
+  border-style: dashed;
+  opacity: 0.85;
+}
+
+.wi-portal-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #00ffcc;
+  margin-bottom: 0.45rem;
+}
+
+.wi-portal-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-bottom: 0.35rem;
+  align-items: center;
+}
+
+.wi-portal-input {
+  flex: 1 1 5.5rem;
+  min-width: 0;
+  padding: 0.4rem 0.5rem !important;
+  font-size: 0.85rem !important;
+  border-radius: 8px !important;
+  border: 1px solid #444 !important;
+  background: #1f2937 !important;
+  color: #fff !important;
+}
+
+.wi-portal-note {
+  margin: 0.25rem 0 0;
+  font-size: 0.72rem;
+  opacity: 0.6;
+  line-height: 1.35;
+}
+
+/* Network badge (shared look with Warthog) */
+.network-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  padding: 0.28rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid #444;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.network-badge--defi {
+  color: #041412;
+  background: linear-gradient(135deg, #00ffcc, #00b399);
+  border-color: transparent;
+}
+
+.network-badge--main {
+  color: #ffd089;
+  border-color: color-mix(in srgb, #e79300 50%, #444);
+  background: color-mix(in srgb, #e79300 15%, #111);
+}
+
+/* Legacy class hooks (if anything still references them) */
+.vault-section {
+  padding: 0;
+}
+
+.preview-section {
+  padding: 0.5rem 0;
+}
+
+@media (max-width: 640px) {
+  .wi-header-tools {
+    width: 100%;
   }
-  .actions {
-    flex-direction: column;
+
+  .wi-header-tools .btn {
+    flex: 1 1 auto;
   }
 }

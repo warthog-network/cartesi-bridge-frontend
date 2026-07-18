@@ -1,52 +1,56 @@
-<!-- src/components/DepositBox.astro -->
+---
+// Compact bridge path reminder — mirrors in-app guides
+---
 <section class="deposit-section">
- 
-
   <div class="deposit-card">
-    <p class="label">Send WART to this address:</p>
-    
-    <div class="address-box">
-      <h3 class="section-title">
-    Deposit Real WART → Get wWART (then mint LIQUID)
-  </h3>
-    </div>
-
-    
-
+    <h3 class="section-title">Quick path</h3>
+    <ol class="path-list">
+      <li><strong>Connect MetaMask</strong> · register L1 if needed</li>
+      <li><strong>Warthog → Sub-wallets</strong> · fund sub → sweep &amp; mint spoofed wWART</li>
+      <li><strong>Overview → WLIQ</strong> · mint shares against available capacity</li>
+      <li><strong>Burn / vault → main</strong> · free collateral, multi-sig withdraw</li>
+    </ol>
     <p class="hint">
-      After sending → wWART is auto-minted → deposit it via ERC20Portal → then click "Mint LIQUID"
+      Native WART uses Sub-wallets (not L1 ERC-20 portals). ETH/CTSI/USDC portals stay on the L1 tab.
     </p>
   </div>
 </section>
 
 <style>
-.deposit-section { margin: 6rem 0; text-align: center; }
-.section-title { font-size: 2rem; color: #ffcc00; text-shadow: 0 0 20px #ffcc0044; margin-bottom: 2rem; }
-.deposit-card { background: rgba(20,20,20,0.8); border-radius: 32px; padding: 3rem; max-width: 680px; margin: 0 auto; border: 1px solid #333; }
-.label { font-size: 1.1rem; opacity: 0.9; margin-bottom: 1rem; }
-.warthog-address { 
-  display: block; 
-  background: #111; 
-  color: #ffcc00; 
-  padding: 1.4rem; 
-  border-radius: 20px; 
-  font-size: 1.4rem; 
-  word-break: break-all; 
-  margin: 1rem auto; 
-  max-width: 100%; 
-  border: 1px solid #444; 
-  box-shadow: 0 0 20px rgba(255,204,0,0.2);
-}
-.copy-btn { 
-  background: linear-gradient(135deg, #ffcc00, #ff9900); 
-  color: black; 
-  font-weight: bold; 
-  padding: 1rem 3rem; 
-  border-radius: 50px; 
-  font-size: 1.2rem; 
-  margin-top: 1rem;
-  box-shadow: 0 8px 30px rgba(255,204,0,0.5);
-}
-.copy-btn:hover { transform: translateY(-4px); }
-.hint { margin-top: 2rem; font-size: 0.95rem; opacity: 0.8; line-height: 1.7; }
+  .deposit-section {
+    margin: 1.75rem 0 2.5rem;
+    text-align: center;
+  }
+  .section-title {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #ffecb3;
+    margin: 0 0 0.75rem;
+  }
+  .deposit-card {
+    background: color-mix(in srgb, #1a1a1a 85%, #000);
+    border-radius: 14px;
+    padding: 1rem 1.15rem 1.15rem;
+    max-width: 40rem;
+    margin: 0 auto;
+    border: 1px solid #333;
+  }
+  .path-list {
+    text-align: left;
+    max-width: 32rem;
+    margin: 0 auto;
+    padding-left: 1.15rem;
+    line-height: 1.5;
+    font-size: 0.85rem;
+    opacity: 0.92;
+  }
+  .path-list li + li {
+    margin-top: 0.3rem;
+  }
+  .hint {
+    margin: 0.85rem 0 0;
+    font-size: 0.78rem;
+    opacity: 0.65;
+    line-height: 1.45;
+  }
 </style>

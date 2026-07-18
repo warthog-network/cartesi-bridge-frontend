@@ -1,77 +1,199 @@
-@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;700&family=Roboto:wght@400;500&display=swap');
+
+/* Wartbunker brand tokens (aligned with webdev/wartbunker) */
+:root {
+  --primary: #FDB913;
+  --primary-hover: #E79300;
+  --primary-deep: #F25C05;
+  --accent-teal: #00ffcc;
+  --accent-light: #333333;
+  --text-primary: #ffffff;
+  --text-muted: #cccccc;
+  --bg-card: #0a0a0a;
+  --bg-section: #1a1a1a;
+  --border: #333333;
+  --shadow: 0 4px 12px -2px rgba(0, 123, 255, 0.12);
+  --radius-card: 16px;
+  --radius-btn: 12px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --primary: #F25C05;
+    --primary-hover: #E79300;
+    --bg-card: #000000;
+    --bg-section: #0f0f0f;
+    --border: #222222;
+    --shadow: 0 4px 12px -2px rgba(242, 92, 5, 0.18);
+  }
+}
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+html {
+  min-height: 100%;
+  background-color: #000000;
+}
+
 body {
-  font-family: 'Inter', sans-serif;
-  background: #000;
-  color: #fff;
+  font-family: 'Inter', 'Roboto', system-ui, sans-serif;
+  color: var(--text-primary);
   min-height: 100vh;
-  background-image: 
-    radial-gradient(circle at top left, #ffcc0022 0%, transparent 50%),
-    radial-gradient(circle at bottom right, #00ffcc22 0%, transparent 50%);
+  background-color: transparent;
+  position: relative;
+  isolation: isolate;
+}
+
+/* Subtle tropical foliage — same treatment as wartbunker */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-color: #040404;
+  background-image:
+    url('/bg-tropical.jpg'),
+    radial-gradient(circle at top left, color-mix(in srgb, var(--primary) 14%, transparent) 0%, transparent 50%),
+    radial-gradient(circle at bottom right, color-mix(in srgb, var(--accent-teal) 12%, transparent) 0%, transparent 50%);
+  background-repeat: repeat, no-repeat, no-repeat;
+  background-size: 480px auto, auto, auto;
+  background-position: center top, center, center;
+  opacity: 1;
+}
+
+body::before {
+  /* layered: tropical at low opacity via filter on a pseudo-stack */
+  filter: none;
+}
+
+/* Separate foliage layer opacity without dimming gradients */
+html {
+  background-color: #000;
 }
 
 .container {
   max-width: 1100px;
   margin: 0 auto;
-  padding: 2rem;
+  padding: 0.75rem 1rem 2rem;
   text-align: center;
 }
 
-/* Warthog yellow glow */
+/* Warthog yellow glow headings */
 h1 {
   font-family: 'Orbitron', sans-serif;
-  font-size: 5rem;
+  font-size: clamp(2.2rem, 6vw, 4.5rem);
   font-weight: 900;
-  background: linear-gradient(90deg, #ffcc00, #ffff66, #ffcc00);
+  background: linear-gradient(90deg, var(--primary), #ffff66, var(--primary));
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  text-shadow: 0 0 40px #ffcc0088;
+  text-shadow: 0 0 40px color-mix(in srgb, var(--primary) 50%, transparent);
   letter-spacing: 0.05em;
 }
 
-/* CTSI teal accents */
+/* Action buttons — pill shape (user preference); teal primary, not yellow squares */
 .btn {
-  padding: 1rem 2.5rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  padding: 0.55rem 1.2rem;
   border: none;
-  border-radius: 50px;
-  font-weight: bold;
+  border-radius: 999px;
+  font-weight: 600;
   cursor: pointer;
-  transition: all 0.3s;
-  font-size: 1.2rem;
+  transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease,
+    opacity 0.15s ease;
+  font-size: 0.9rem;
+  font-family: 'Roboto', 'Inter', system-ui, sans-serif;
+  line-height: 1.25;
+  background: linear-gradient(135deg, #00ffcc, #00b399);
+  color: #041412;
+  box-shadow: 0 0 16px color-mix(in srgb, #00ffcc 22%, transparent);
+}
+
+.btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 24px color-mix(in srgb, #00ffcc 35%, transparent);
+}
+
+.btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
 }
 
 .btn.small {
-  padding: 0.5rem 1rem;
-  font-size: 1rem;
+  padding: 0.4rem 0.9rem;
+  font-size: 0.82rem;
+  border-radius: 999px;
 }
 
-.primary {
+/* Primary = teal pill (class used as "btn primary") */
+.primary,
+.btn.primary,
+.btn-primary {
   background: linear-gradient(135deg, #00ffcc, #00b399);
-  box-shadow: 0 0 20px #00ffcc44;
+  color: #041412;
+  border: none;
+  box-shadow: 0 0 16px color-mix(in srgb, #00ffcc 22%, transparent);
 }
-.primary:hover {
-  box-shadow: 0 10px 30px #00ffcc66;
+.primary:hover:not(:disabled),
+.btn.primary:hover:not(:disabled),
+.btn-primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 24px color-mix(in srgb, #00ffcc 35%, transparent);
 }
 
-.danger {
-  background: linear-gradient(135deg, #ffcc00, #ff9900);
-  box-shadow: 0 0 20px #ffcc0044;
+/* Secondary — soft outline pill */
+.secondary,
+.btn.secondary,
+.btn-secondary {
+  background: transparent;
+  color: #00ffcc;
+  border: 1px solid color-mix(in srgb, #00ffcc 55%, #333);
+  box-shadow: none;
 }
-.danger:hover {
-  box-shadow: 0 10px 30px #ffcc0066;
+.secondary:hover:not(:disabled),
+.btn.secondary:hover:not(:disabled),
+.btn-secondary:hover:not(:disabled) {
+  background: color-mix(in srgb, #00ffcc 12%, transparent);
+  color: #fff;
+  border-color: #00ffcc;
+  transform: translateY(-1px);
+  box-shadow: none;
+}
+
+/* Danger — amber/orange pill (backup/lock), not square yellow tabs */
+.danger,
+.btn.danger,
+.btn-danger {
+  background: linear-gradient(135deg, var(--primary-hover, #e79300), var(--primary-deep, #f25c05));
+  color: #1a1000;
+  border: none;
+  box-shadow: 0 0 14px color-mix(in srgb, var(--primary, #fdb913) 22%, transparent);
+}
+.danger:hover:not(:disabled),
+.btn.danger:hover:not(:disabled),
+.btn-danger:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 22px color-mix(in srgb, var(--primary, #fdb913) 35%, transparent);
 }
 
 .card {
-  background: rgba(20,20,20,0.8);
+  background: color-mix(in srgb, var(--bg-card) 88%, transparent);
   backdrop-filter: blur(15px);
-  border: 1px solid #333;
-  border-radius: 30px;
-  padding: 3rem;
-  margin: 3rem 0;
-  box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  padding: 2rem;
+  margin: 2rem 0;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.55);
 }
 
 .grid {
@@ -81,12 +203,12 @@ h1 {
   margin: 3rem 0;
 }
 
-.box {      /* more horizontal padding */
+.box {
   min-height: 20rem;
-  border-radius: 28px;
+  border-radius: 20px;
   text-align: center;
   background: rgba(255,255,255,0.03);
-  border: 1px solid;
+  border: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -94,28 +216,25 @@ h1 {
 }
 
 .box .big {
-  font-size: 3.8rem;
+  font-size: 3.2rem;
   font-weight: 900;
   margin: 0;
-              /* ← this gives the % room to breathe */
 }
 
-/* Warthog yellow box */
 .yellow {
-  border-color: #ffcc00;
-  background: linear-gradient(135deg, #ffcc0011, #ff990011);
-  box-shadow: 0 0 30px #ffcc0022;
+  border-color: var(--primary);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--primary) 8%, transparent), color-mix(in srgb, var(--primary-hover) 8%, transparent));
+  box-shadow: 0 0 30px color-mix(in srgb, var(--primary) 14%, transparent);
 }
 
-/* CTSI teal box */
 .teal {
-  border-color: #00ffcc;
-  background: linear-gradient(135deg, #00ffcc11, #00b39911);
-  box-shadow: 0 0 30px #00ffcc22;
+  border-color: var(--accent-teal);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent-teal) 8%, transparent), #00b39911);
+  box-shadow: 0 0 30px color-mix(in srgb, var(--accent-teal) 14%, transparent);
 }
 
 .big {
-  font-size: 4.5rem;
+  font-size: 3.5rem;
   font-weight: 900;
   font-family: 'Orbitron', sans-serif;
   margin: 1rem 0;
@@ -134,54 +253,54 @@ h1 {
   padding: 1rem;
   border-radius: 50px;
   background: rgba(255,255,255,0.05);
-  border: 1px solid #444;
+  border: 1px solid var(--border);
   color: white;
   width: 220px;
   text-align: center;
-  font-size: 1.2rem;
+  font-size: 1.1rem;
 }
 
 .deposit-box {
-  background: rgba(10,10,10,0.9);
-  padding: 3rem;
-  border-radius: 30px;
-  border: 1px solid #333;
-  margin-top: 4rem;
+  background: color-mix(in srgb, var(--bg-card) 92%, transparent);
+  padding: 2.5rem;
+  border-radius: 24px;
+  border: 1px solid var(--border);
+  margin-top: 3rem;
 }
 
 .address-box {
-  background: #111;
-  padding: 1.5rem;
-  border-radius: 20px;
+  background: var(--bg-section);
+  padding: 1.25rem;
+  border-radius: 16px;
   font-family: 'Courier New', monospace;
-  font-size: 1.4rem;
+  font-size: 1.1rem;
   display: flex;
   justify-content: space-between;
   align-items: center;
   margin: 1.5rem auto;
   max-width: 650px;
-  border: 1px solid #444;
-  box-shadow: 0 0 20px #000;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
 }
 
 .address {
-  background: #111;
+  background: var(--bg-section);
   padding: 1rem 2rem;
-  border-radius: 20px;
+  border-radius: 16px;
   display: inline-block;
   margin-bottom: 2rem;
   font-family: monospace;
-  border: 1px solid #444;
+  border: 1px solid var(--border);
 }
-/* Register Address Button — Pure CSS, no Tailwind, no inline */
+
 .register-address-btn {
   background: linear-gradient(135deg, #7c3aed, #ec4899);
   color: white;
-  font-size: 24px;
+  font-size: 1.25rem;
   font-weight: bold;
-  padding: 20px 60px;
+  padding: 1rem 2.5rem;
   border: none;
-  border-radius: 16px;
+  border-radius: 14px;
   box-shadow: 0 10px 30px rgba(124, 58, 237, 0.4);
   cursor: pointer;
   transition: all 0.3s ease;
@@ -190,10 +309,31 @@ h1 {
 }
 
 .register-address-btn:hover {
-  transform: translateY(-4px) scale(1.05);
-  box-shadow: 0 20px 40px rgba(124, 58, 237, 0.6);
+  transform: translateY(-3px) scale(1.03);
+  box-shadow: 0 16px 36px rgba(124, 58, 237, 0.55);
 }
 
-.register-address-btn:active {
-  transform: translateY(0) scale(1);
+.network-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+
+.network-badge--defi {
+  color: var(--accent-teal);
+  border-color: color-mix(in srgb, var(--accent-teal) 50%, transparent);
+  background: color-mix(in srgb, var(--accent-teal) 12%, transparent);
+}
+
+.network-badge--main {
+  color: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 50%, transparent);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
 }

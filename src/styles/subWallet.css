@@ -1,4 +1,4 @@
-
+/* Sub-wallets — wartbunker brand tokens + liquid accents */
 .subwallet-actions {
   display: flex;
   flex-wrap: wrap;
@@ -7,11 +7,11 @@
 }
 
 .status-message {
-  width: 100%;                    /* forces it below */
+  width: 100%;
   margin-top: 12px;
   padding: 8px 12px;
-  background: rgba(0, 123, 255, 0.08);  /* light blue for unlock */
-  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent-teal, #00ffcc) 10%, transparent);
+  border-radius: 8px;
   font-size: 0.9em;
   display: flex;
   align-items: center;
@@ -19,145 +19,603 @@
 }
 
 .status-unlock {
-  color: #0d6efd;   /* bootstrap primary blue */
-  border: 1px solid rgba(13, 110, 253, 0.25);
+  color: var(--accent-teal, #00ffcc);
+  border: 1px solid color-mix(in srgb, var(--accent-teal, #00ffcc) 30%, transparent);
 }
 .subwallet-section {
-  padding: 1.5rem;
+  padding: 0;
+  border-radius: 0;
+  border: none;
+  background: transparent;
+}
+
+.subwallet-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  margin-bottom: 0.65rem;
+}
+
+.subwallet-top h3 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.bridge-flow-guide {
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  max-width: 100%;
+}
+
+.bridge-flow-guide summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #00ffcc;
+  opacity: 0.9;
+  list-style: none;
+  user-select: none;
+}
+.bridge-flow-guide summary::-webkit-details-marker {
+  display: none;
+}
+.bridge-flow-guide summary::before {
+  content: '▸ ';
+  opacity: 0.7;
+}
+.bridge-flow-guide[open] summary::before {
+  content: '▾ ';
+}
+.bridge-flow-guide[open] {
+  margin-bottom: 0.5rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 10px;
+  border: 1px solid #333;
+  background: rgba(0, 0, 0, 0.25);
+  width: 100%;
+}
+
+.bridge-flow-lead {
+  margin: 0.4rem 0 0.45rem;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  opacity: 0.85;
+}
+
+.bridge-flow-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.28rem;
+}
+
+.bridge-flow-steps li {
+  display: flex;
+  gap: 0.45rem;
+  align-items: flex-start;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.bridge-flow-steps .step-num {
+  flex-shrink: 0;
+  width: 1.4rem;
+  height: 1.4rem;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #fff;
+  background: var(--primary-hover, #e79300);
+  border: 1px solid color-mix(in srgb, var(--primary-hover, #e79300) 70%, #333);
+}
+
+.bridge-flow-steps code {
+  font-size: 0.82em;
+  color: #ffecb3;
+}
+
+.action-label {
+  display: block;
+  width: 100%;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  opacity: 0.65;
+  margin-bottom: 0.1rem;
+}
+
+.action-hint {
+  display: none; /* keep space tight; details live in title/tooltips */
+}
+
+.action-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 0.4rem;
+  align-items: center;
+  padding: 0.4rem 0.5rem;
+  border-radius: 10px;
+  border: 1px solid #333;
+  background: rgba(0, 0, 0, 0.22);
+  margin-bottom: 0.35rem;
+}
+
+.deposit-group {
+  border-color: color-mix(in srgb, #00ffcc 35%, #333);
+}
+
+.sweep-group {
+  border-color: color-mix(in srgb, var(--primary-hover, #e79300) 28%, #333);
+}
+
+.withdraw-group {
+  border-color: #444;
+}
+
+.vault-withdraw-group {
+  border-color: color-mix(in srgb, #66ff99 40%, #333);
+  width: 100%;
+}
+
+.burn-group {
+  border-color: color-mix(in srgb, #ff6b6b 45%, #333);
+  width: 100%;
 }
 
 .subwallet-controls {
-  margin-bottom: 1.5rem;
+  margin-bottom: 0.65rem;
   display: flex;
-  gap: 1rem;
+  gap: 0.5rem;
   align-items: center;
   flex-wrap: wrap;
 }
 
 .regen-group {
   display: flex;
-  gap: 0.5rem;
+  gap: 0.35rem;
   align-items: center;
 }
 
-.btn {
-  padding: 0.6rem 1.2rem;
-  border: none;
-  border-radius: 50px;
-  cursor: pointer;
-  font-weight: 500;
-  transition: all 0.3s;
-  font-size: 1.2rem;
-  color: black;
+.regen-group .regen-input {
+  width: 5.5rem;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.85rem;
 }
 
-.btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-  transform: none;
+/* Sub-wallet actions — keep global pill shape, slightly denser */
+.subwallet-section .btn,
+.subwallet-item .btn,
+.subwallet-actions .btn,
+.action-group .btn {
+  font-size: 0.82rem;
+  padding: 0.4rem 0.95rem;
+  border-radius: 999px;
+  font-weight: 600;
+  white-space: nowrap;
 }
 
-.btn-primary {
-  background: linear-gradient(135deg, #00ffcc, #00b399);
-  box-shadow: 0 0 20px #00ffcc44;
+.subwallet-section .btn.small,
+.action-group .btn.small {
+  padding: 0.35rem 0.85rem;
+  font-size: 0.8rem;
+  border-radius: 999px;
 }
 
-.btn-primary:hover {
-  box-shadow: 0 10px 30px #00ffcc66;
-}
-
-.btn-secondary {
-  background: linear-gradient(135deg, #80e6ff, #4dd0e1);
-  box-shadow: 0 0 20px #80e6ff44;
-}
-
-.btn-secondary:hover {
-  box-shadow: 0 10px 30px #80e6ff66;
-}
-
-.btn-success {
+.btn-success,
+.btn.success {
   background: linear-gradient(135deg, #66ff99, #4dd0a1);
-  box-shadow: 0 0 20px #66ff9944;
+  color: #041412;
+  border: none;
+  box-shadow: 0 0 14px color-mix(in srgb, #66ff99 22%, transparent);
+}
+.btn-success:hover:not(:disabled),
+.btn.success:hover:not(:disabled) {
+  box-shadow: 0 8px 22px color-mix(in srgb, #66ff99 35%, transparent);
 }
 
-.btn-success:hover {
-  box-shadow: 0 10px 30px #66ff9966;
+.btn-outline,
+.btn.outline {
+  background: transparent;
+  color: #ccc;
+  border: 1px solid #444;
+  box-shadow: none;
+  border-radius: 999px;
 }
-
-.btn-danger {
-  background: linear-gradient(135deg, #ffcc00, #ff9900);
-  box-shadow: 0 0 20px #ffcc0044;
-}
-
-.btn-danger:hover {
-  box-shadow: 0 10px 30px #ffcc0066;
-}
-
-.btn-info {
-  background: linear-gradient(135deg, #b3e6ff, #80d4ff);
-  box-shadow: 0 0 20px #b3e6ff44;
-}
-
-.btn-info:hover {
-  box-shadow: 0 10px 30px #b3e6ff66;
-}
-
-.btn-outline {
-  background: linear-gradient(135deg, #666, #555);
-  box-shadow: 0 0 20px #6666;
-  color: white;
-}
-
-.btn-outline:hover {
-  box-shadow: 0 10px 30px #666a;
-  color: white;
-}
-
-.btn-warning {
-  background: linear-gradient(135deg, #ffff66, #ffdd44);
-  box-shadow: 0 0 20px #ffff6644;
-}
-
-.btn-warning:hover {
-  box-shadow: 0 10px 30px #ffff6666;
-}
-
-.btn.small {
-  padding: 0.5rem 1rem;
-  font-size: 1rem;
+.btn-outline:hover:not(:disabled),
+.btn.outline:hover:not(:disabled) {
+  border-color: #00ffcc;
+  color: #fff;
+  background: color-mix(in srgb, #00ffcc 10%, transparent);
 }
 
 .input {
-  padding: 0.5rem;
-  border-radius: 6px;
+  padding: 0.4rem 0.55rem;
+  border-radius: 8px;
   border: 1px solid #444;
   background: #1f2937;
   color: white;
+  font-size: 0.85rem;
 }
 
 .regen-input {
-  width: 180px;
+  width: 5.5rem;
 }
 
 .amount-input {
-  width: 140px;
+  width: 7.5rem;
+  min-width: 0;
 }
 
 .withdraw-group .amount-input {
-  width: 160px;
+  width: 7.5rem;
+}
+
+.sw-empty {
+  padding: 1.25rem 1rem;
+  text-align: center;
+  border: 1px dashed #444;
+  border-radius: 12px;
+  opacity: 0.8;
+  font-size: 0.9rem;
+}
+
+/* One sub + vault pair at a time */
+.sw-carousel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.sw-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.45rem 0.55rem;
+  border-radius: 12px;
+  border: 1px solid #333;
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.sw-pager-btn {
+  flex: 0 0 auto;
+  min-width: 4.5rem;
+}
+
+.sw-pager-center {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 0;
+}
+
+.sw-pager-count {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.65;
+  color: #00ffcc;
+}
+
+.sw-pager-select {
+  width: min(100%, 22rem);
+  max-width: 100%;
+  padding: 0.35rem 0.5rem !important;
+  font-size: 0.8rem !important;
+  border-radius: 8px !important;
+  text-align: center;
+}
+
+.sw-pager-dots {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.35rem;
+}
+
+/* Numbered teal pills — 1, 2, 3… for each sub-wallet */
+.sw-dot {
+  min-width: 1.55rem;
+  height: 1.55rem;
+  padding: 0 0.35rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, #00ffcc 35%, #555);
+  background: color-mix(in srgb, #00ffcc 12%, #1a1a1a);
+  color: #9af5e0;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.15s,
+    box-shadow 0.15s;
+}
+.sw-dot:hover {
+  border-color: #00ffcc;
+  color: #fff;
+  transform: scale(1.06);
+}
+.sw-dot.is-active {
+  background: linear-gradient(135deg, #00ffcc, #00b399);
+  border-color: transparent;
+  color: #041412;
+  box-shadow: 0 0 12px #00ffcc55;
+}
+.sw-dot.is-locked:not(.is-active) {
+  border-color: color-mix(in srgb, #e79300 55%, #555);
+  background: color-mix(in srgb, #e79300 18%, #1a1a1a);
+  color: #ffd089;
+}
+
+/* Two cards: active Sub + its Vault only */
+.sw-cards {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.65rem;
+}
+
+@media (min-width: 900px) {
+  .sw-cards {
+    grid-template-columns: 1fr 1fr;
+    align-items: start;
+  }
 }
 
 .subwallet-list {
   list-style: none;
   padding: 0;
+  margin: 0;
 }
 
 .subwallet-item {
-  border: 1px solid #444;
-  border-radius: 8px;
-  padding: 1.2rem;
+  list-style: none;
+  border: none;
+  background: transparent;
+  padding: 0;
   margin-bottom: 1rem;
-  transition: all 0.3s ease;
+}
+
+.sw-card {
+  border: 1px solid #333;
+  border-radius: 14px;
+  padding: 0.7rem 0.8rem;
+  background: color-mix(in srgb, var(--bg-section, #1a1a1a) 75%, #000);
+  text-align: left;
+}
+
+.sw-card--sub {
+  border-color: color-mix(in srgb, #00ffcc 28%, #333);
+}
+
+.sw-card--vault {
+  border-color: color-mix(in srgb, var(--primary-hover, #e79300) 32%, #333);
+}
+
+.sw-card--vault.is-busy {
+  opacity: 0.72;
+  pointer-events: none;
+}
+
+.sw-card--empty {
+  border-style: dashed;
+  opacity: 0.95;
+}
+
+.sw-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.sw-card-title {
+  margin: 0;
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: #ffecb3;
+  letter-spacing: 0.02em;
+}
+
+.sw-card--sub .sw-card-title {
+  color: #00ffcc;
+}
+
+.sw-pill {
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid #444;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.sw-pill-muted {
+  color: #aaa;
+  font-weight: 600;
+}
+
+.sw-pill.status-locked {
+  color: #ff8a8a;
+  border-color: color-mix(in srgb, #e74c3c 45%, #333);
+}
+
+.sw-pill.status-unlocked {
+  color: #7dffa8;
+  border-color: color-mix(in srgb, #2ecc9a 40%, #333);
+}
+
+.sw-card-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-bottom: 0.45rem;
+  font-size: 0.82rem;
+}
+
+.sw-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.65rem;
+  align-items: baseline;
+}
+
+.sw-meta-k {
+  min-width: 4.5rem;
+  opacity: 0.55;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-weight: 600;
+}
+
+.sw-meta-v {
+  color: #eee;
+  word-break: break-all;
+}
+
+.sw-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: #eee;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.sw-link:hover {
+  color: #00ffcc;
+  text-decoration: underline;
+}
+
+.sw-live-tag {
+  opacity: 0.5;
+  font-size: 0.72em;
+  margin-left: 0.25rem;
+}
+
+.sw-card-note {
+  margin: 0 0 0.45rem;
+  font-size: 0.72rem;
+  opacity: 0.55;
+  line-height: 1.3;
+}
+
+.sw-card-empty-msg {
+  margin: 0 0 0.55rem;
+  font-size: 0.82rem;
+  opacity: 0.7;
+}
+
+.sw-card-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-bottom: 0.45rem;
+}
+
+/* In-card action tabs — mirrors app Overview / Send / Sub-wallets pills */
+.sw-action-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0.15rem 0 0.55rem;
+}
+
+.sw-action-tab {
+  background: rgba(255, 255, 255, 0.06) !important;
+  color: #e0e0e0 !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 999px !important;
+  padding: 0.35rem 0.85rem !important;
+  font-size: 0.78rem !important;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  margin: 0 !important;
+  width: auto !important;
+  box-shadow: none !important;
+  transform: none !important;
+  transition: background 0.2s, border-color 0.2s, color 0.2s, box-shadow 0.2s;
+}
+
+.sw-action-tab:hover {
+  border-color: color-mix(in srgb, #00ffcc 50%, #666) !important;
+  color: #fff !important;
+  background: rgba(0, 255, 204, 0.08) !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+.sw-action-tab.is-active {
+  background: linear-gradient(135deg, #00ffcc, #00b399) !important;
+  color: #041412 !important;
+  border-color: transparent !important;
+  box-shadow: 0 0 12px color-mix(in srgb, #00ffcc 28%, transparent) !important;
+}
+
+.sw-card--vault .sw-action-tab:hover {
+  border-color: color-mix(in srgb, #e79300 50%, #666) !important;
+  background: rgba(231, 147, 0, 0.1) !important;
+}
+
+.sw-card--vault .sw-action-tab.is-active {
+  background: linear-gradient(135deg, #e79300, #f25c05) !important;
+  color: #1a1000 !important;
+  box-shadow: 0 0 12px color-mix(in srgb, #fdb913 28%, transparent) !important;
+}
+
+.sw-action-panel {
+  min-height: 2.5rem;
+}
+
+.sw-tab-empty {
+  margin: 0.35rem 0 0;
+  font-size: 0.8rem;
+  opacity: 0.65;
+  line-height: 1.4;
+}
+
+.sw-card .action-group {
+  margin-bottom: 0;
+  border: none;
+  background: transparent;
+  padding: 0.15rem 0;
+}
+
+.sw-card .action-group:last-of-type {
+  margin-bottom: 0;
+}
+
+.sw-card-empty .btn {
+  margin-top: 0.15rem;
+}
+
+.subwallet-info {
+  margin-bottom: 0.5rem !important;
+  line-height: 1.4 !important;
+  font-size: 0.85rem;
+}
+
+.subwallet-actions {
+  margin-top: 0.5rem !important;
+  gap: 0.35rem !important;
 }
 
 .subwallet-item.locked {

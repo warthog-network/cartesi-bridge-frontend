@@ -5,24 +5,25 @@
 import './WalletIsland.css'; // Added external styles for modern, concise CSS
 
 import { useState, useEffect } from 'react';
-import { Wallet, Zap, ArrowDown, Coins, RefreshCw } from 'lucide-react';
+import { Wallet, Coins, RefreshCw } from 'lucide-react';
 import { Toaster, toast } from 'react-hot-toast';
-import { ethers } from 'ethers';
+import { ethers, toUtf8String, getBytes } from 'ethers-v6';
 import WarthogWallet from './WarthogWallet'; // Added import for WarthogWallet component
 import '../styles/global.css'; // Assuming global styles (including new Warthog CSS) in Astro
 import '../styles/warthog.css';
-// CARTESI CLI LOCAL CONFIG (from original WalletIsland)
-const INSPECT_URL = "/rollup/inspect";  // Proxy to 8080 for vault reads
-const RPC_URL = "http://localhost:8545";  // Anvil RPC - update to Sepolia if needed
-const INPUT_BOX_ADDRESS = "0x59b22D57D4f067708AB0c00552767405926dc768";
-const DAPP_ADDRESS = "0xab7528bb862fB57E8A2BCd567a2e929a0Be56a5e";  // Update if needed
+import { getInspectUrl, L1_RPC_URL, LOCAL_ADDRESSES } from '../utils/bridgeConfig.js';
+import { SHARE_TOKEN } from '../utils/tokenNames.js';
 
-// PORTAL AND TOKEN ADDRESSES (from original)
-const ETHER_PORTAL_ADDRESS = "0xFfdbe43d4c855BF7e0f105c400A50857f53AB044";
-const ERC20_PORTAL_ADDRESS = "0x4b088b2dee4d3c6ec7aa5fb4e6cd8e9f0a1b2c3d";
-const WWART_ADDRESS = "0xYourWWARTContractHere"; // Update
+// CARTESI CLI 1.5 local Anvil address book
+const RPC_URL = L1_RPC_URL;
+const INPUT_BOX_ADDRESS = LOCAL_ADDRESSES.inputBox;
+const DAPP_ADDRESS = LOCAL_ADDRESSES.dapp;
+const ETHER_PORTAL_ADDRESS = LOCAL_ADDRESSES.etherPortal;
+const ERC20_PORTAL_ADDRESS = LOCAL_ADDRESSES.erc20Portal;
+// WWART not deployed locally — UI will disable deposit until set
+const WWART_ADDRESS = "";
 const CTSI_ADDRESS = "0xae7f61eCf06C65405560166b259C54031428A9C4";
-const USDC_ADDRESS = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"; // Real Sepolia USDC (6 decimals)
+const USDC_ADDRESS = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
 
 const INPUT_BOX_ABI = [
   "function addInput(address dappAddress, bytes calldata input) external returns (uint256)"
@@ -61,17 +62,20 @@ export default function WalletIsland() {
   const [loading, setLoading] = useState(false);
 
   // NEW: Toggle for Warthog section (to keep UI optional in Astro island)
-  const [showWarthog, setShowWarthog] = useState(false);
+  const [showWarthog, setShowWarthog] = useState(true);
+  const [rollupOnline, setRollupOnline] = useState(null);
+  /** L1 Cartesi panel tabs — mirrors Warthog Overview/Send pill pattern */
+  const [l1Tab, setL1Tab] = useState('balances'); // balances | spoofed | portals
 
   // useEffects FROM ORIGINAL WalletIsland
   useEffect(() => {
     const tryAutoConnect = async () => {
       if (!window.ethereum) return;
       try {
-        const prov = new ethers.providers.Web3Provider(window.ethereum);
+        const prov = new ethers.BrowserProvider(window.ethereum);
         const accounts = await prov.listAccounts();
         if (accounts.length > 0) {
-          const sign = prov.getSigner();
+          const sign = await prov.getSigner();
           const addr = await sign.getAddress();
           setProvider(prov);
           setSigner(sign);
@@ -95,6 +99,78 @@ export default function WalletIsland() {
     }
   }, [connected, address]);
 
+  // Probe Cartesi (inspect and/or GraphQL) — INSPECT_URL was removed from imports
+  // which made the badge stuck offline even when cartesi run is healthy.
+  useEffect(() => {
+    let cancelled = false;
+    const probe = async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      const zero = '0000000000000000000000000000000000000000';
+      // Prefer same-origin Vite proxy, then direct local node
+      const inspectBases = [
+        getInspectUrl().replace(/\/$/, ''),
+        '/rollup/inspect',
+        'http://127.0.0.1:8080/inspect',
+      ];
+      const graphqlUrls = [
+        typeof window !== 'undefined'
+          ? new URL('/rollup/graphql', window.location.origin).href
+          : null,
+        'http://127.0.0.1:8080/graphql',
+      ].filter(Boolean);
+
+      let online = false;
+      try {
+        for (const base of inspectBases) {
+          try {
+            const res = await fetch(`${base}/vault/${zero}`, {
+              signal: controller.signal,
+              cache: 'no-store',
+            });
+            // Cartesi returns 200 Accepted even for empty vaults
+            if (res.ok) {
+              online = true;
+              break;
+            }
+          } catch {
+            /* try next */
+          }
+        }
+        if (!online) {
+          for (const gurl of graphqlUrls) {
+            try {
+              const res = await fetch(gurl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ query: '{ __typename }' }),
+                signal: controller.signal,
+                cache: 'no-store',
+              });
+              if (res.ok) {
+                online = true;
+                break;
+              }
+            } catch {
+              /* try next */
+            }
+          }
+        }
+      } catch {
+        online = false;
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!cancelled) setRollupOnline(online);
+    };
+    probe();
+    const t = setInterval(probe, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
+
   // FUNCTIONS FROM ORIGINAL WalletIsland
   const connect = async () => {
     if (!window.ethereum) {
@@ -116,8 +192,8 @@ export default function WalletIsland() {
       } catch (e) {}
 
       await window.ethereum.request({ method: 'eth_requestAccounts' });
-      const prov = new ethers.providers.Web3Provider(window.ethereum);
-      const sign = prov.getSigner();
+      const prov = new ethers.BrowserProvider(window.ethereum);
+      const sign = await prov.getSigner();
       const addr = await sign.getAddress();
 
       setProvider(prov);
@@ -132,20 +208,62 @@ export default function WalletIsland() {
     }
   };
 
+  /** Cartesi inspect reports payload is 0x-hex JSON, not raw UTF-8 bytes. */
+  const decodeInspectPayload = (payload) => {
+    if (payload == null) return null;
+    if (typeof payload === 'object') return payload;
+    const s = String(payload);
+    try {
+      if (s.startsWith('0x') || s.startsWith('0X')) {
+        return JSON.parse(toUtf8String(s));
+      }
+      // raw JSON string
+      if (s.trim().startsWith('{')) return JSON.parse(s);
+      // hex without 0x
+      if (/^[0-9a-fA-F]+$/.test(s) && s.length % 2 === 0) {
+        return JSON.parse(toUtf8String('0x' + s));
+      }
+      return JSON.parse(new TextDecoder().decode(getBytes(s)));
+    } catch (e) {
+      console.warn('[refreshVault] payload decode failed', e);
+      return null;
+    }
+  };
+
   const refreshVault = async (addr) => {
     if (!addr) return;
     setLoading(true);
     try {
-      const res = await fetch(`${INSPECT_URL}/vault/${addr.slice(2).toLowerCase()}`);
+      // Normalize to 0x + 40 lowercase hex for rollup map keys
+      let hex = String(addr).trim().replace(/^0x/i, '').toLowerCase();
+      if (hex.length !== 40 || !/^[0-9a-f]+$/.test(hex)) {
+        console.warn('[refreshVault] invalid L1 address for inspect:', addr);
+        return;
+      }
+      const base = getInspectUrl().replace(/\/$/, '');
+      const res = await fetch(`${base}/vault/${hex}`);
       const data = await res.json();
       if (data.reports?.length > 0) {
-        const payload = data.reports[0].payload;
-        const json = JSON.parse(ethers.utils.toUtf8String(payload));
-        setSpoofedWwart({ history: json.spoofedMintHistory || [], burnHistory: json.spoofedBurnHistory || [], total: json.totalSpoofedMinted || '0', totalBurned: json.totalSpoofedBurned || '0' });
-        setVault(json);
+        const json = decodeInspectPayload(data.reports[0].payload);
+        if (!json || json.error) {
+          console.warn('[refreshVault] inspect error/empty', json);
+          return;
+        }
+        setSpoofedWwart({
+          history: json.spoofedMintHistory || [],
+          burnHistory: json.spoofedBurnHistory || [],
+          total: String(json.totalSpoofedMinted || '0'),
+          totalBurned: String(json.totalSpoofedBurned || '0'),
+        });
+        // wWART credits from Warthog path are E8-scale on the dApp; keep raw for formatWart paths
+        setVault((prev) => ({
+          ...prev,
+          ...json,
+          // Prefer numeric display helpers: eth already human; ERC20 fields may be wei or E8
+        }));
       }
     } catch (err) {
-      console.log("Vault not ready yet");
+      console.log('Vault not ready yet', err?.message || err);
     } finally {
       setLoading(false);
     }
@@ -159,11 +277,13 @@ export default function WalletIsland() {
     try {
       setLoading(true);
       const message = JSON.stringify(payload);
-      const payloadBytes = ethers.utils.toUtf8Bytes(message);
+      const payloadBytes = new TextEncoder().encode(message);
       const inputBox = new ethers.Contract(INPUT_BOX_ADDRESS, INPUT_BOX_ABI, signer);
       const tx = await inputBox.addInput(DAPP_ADDRESS, payloadBytes, { gasLimit: 200000 });
       const receipt = await tx.wait();
-      toast.success(`Sent! Tx: ${receipt.transactionHash.slice(0,10)}...`);
+      // ethers-v6: receipt.hash (v5 used transactionHash)
+      const txHash = receipt?.hash || receipt?.transactionHash || tx?.hash || '';
+      toast.success(txHash ? `Sent! Tx: ${String(txHash).slice(0, 10)}…` : 'Sent to rollup InputBox');
       setTimeout(() => refreshVault(address), 8000);
       return receipt;
     } catch (err) {
@@ -179,7 +299,7 @@ export default function WalletIsland() {
     if (!ethDepositAmt || !signer) return;
     try {
       setLoading(true);
-      const amountWei = ethers.utils.parseEther(ethDepositAmt);
+      const amountWei = ethers.parseEther(ethDepositAmt);
       const portal = new ethers.Contract(ETHER_PORTAL_ADDRESS, ETHER_PORTAL_ABI, signer);
       const tx = await portal.depositEther(DAPP_ADDRESS, "0x", { value: amountWei, gasLimit: 200000 });
       await tx.wait();
@@ -234,10 +354,11 @@ export default function WalletIsland() {
     if (!amountStr || !signer) return;
     try {
       setLoading(true);
-      const amount = ethers.utils.parseUnits(amountStr, decimals);
+      const amount = ethers.parseUnits(amountStr, decimals);
       const token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
+      // ethers-v6 returns bigint — never use BigNumber .lt()
       const allowance = await token.allowance(address, ERC20_PORTAL_ADDRESS);
-      if (allowance.lt(amount)) {
+      if (allowance < amount) {
         const txApprove = await token.approve(ERC20_PORTAL_ADDRESS, amount, { gasLimit: 100000 });
         await txApprove.wait();
         toast.success('Approved!');
@@ -255,21 +376,49 @@ export default function WalletIsland() {
     }
   };
 
-  const depositWwart = () => depositErc20(WWART_ADDRESS, wwartDepositAmt, 18).then(() => setWwartDepositAmt(''));
+    const depositWwart = () => {
+    if (!WWART_ADDRESS) {
+      toast.error('wWART token not configured for this network yet');
+      return;
+    }
+    return depositErc20(WWART_ADDRESS, wwartDepositAmt, 18).then(() => setWwartDepositAmt(''));
+  };
   const depositCtsi = () => depositErc20(CTSI_ADDRESS, ctsiDepositAmt, 18).then(() => setCtsiDepositAmt(''));
   const depositUsdc = () => depositErc20(USDC_ADDRESS, usdcDepositAmt, 6).then(() => setUsdcDepositAmt(''));
 
-  const format = (val, decimals) => Number(ethers.utils.formatUnits(val || "0", decimals));
+  const format = (val, decimals) => Number(ethers.formatUnits(val || "0", decimals));
   const formatWart = (e8Str) => {
     if (!e8Str || e8Str === '0') return '0.00000000';
-    const bn = BigInt(e8Str);
-    const integer = (bn / 100000000n).toString();
-    let fractional = (bn % 100000000n).toString().padStart(8, '0').replace(/0+$/, '');
-    return fractional ? `${integer}.${fractional}` : integer;
+    try {
+      const bn = BigInt(e8Str);
+      const integer = (bn / 100000000n).toString();
+      let fractional = (bn % 100000000n).toString().padStart(8, '0').replace(/0+$/, '');
+      return fractional ? `${integer}.${fractional}` : integer;
+    } catch {
+      return '0.00000000';
+    }
+  };
+
+  /**
+   * Rollup stores Warthog-path wWART / spoofed amounts in E8 (8 decimals).
+   * Portal ERC-20 deposits may use 18-dec wei. Heuristic: values &lt; 1e15 treated as E8.
+   */
+  const formatVaultToken = (val, portalDecimals = 18) => {
+    if (val == null || val === '' || val === '0') return 0;
+    try {
+      const bn = BigInt(val);
+      // E8-scale amounts from sweep_lock (e.g. 100 WART = 1e10)
+      if (bn > 0n && bn < 10n ** 15n) {
+        return Number(bn) / 1e8;
+      }
+      return Number(ethers.formatUnits(bn, portalDecimals));
+    } catch {
+      return Number(val) || 0;
+    }
   };
 
   const liquid = format(vault.liquid, 18);
-  const wWART = format(vault.wWART, 18);
+  const wWART = formatVaultToken(vault.wWART, 18);
   const CTSI = format(vault.CTSI, 18);
   const eth = Number(vault.eth || 0);
   const usdc = format(vault.usdc, 6);
@@ -280,239 +429,357 @@ export default function WalletIsland() {
   const ethPct = totalBacking > 0 ? (eth / totalBacking * 100).toFixed(1) : 0;
   const usdcPct = totalBacking > 0 ? (usdc / totalBacking * 100).toFixed(1) : 0;
 
+  const outstandingSpoofed = (() => {
+    try {
+      const m = BigInt(spoofedWwart.total || '0');
+      const b = BigInt(spoofedWwart.totalBurned || '0');
+      return (m > b ? m - b : 0n).toString();
+    } catch {
+      return '0';
+    }
+  })();
+
+  const L1_TABS = [
+    { id: 'balances', label: 'Balances' },
+    { id: 'spoofed', label: 'Spoofed wWART' },
+    { id: 'portals', label: 'L1 portals' },
+  ];
+
+  const renderPortalAsset = ({
+    label,
+    depositVal,
+    setDeposit,
+    onDeposit,
+    withdrawVal,
+    setWithdraw,
+    onWithdraw,
+    note,
+    depositDisabled = false,
+  }) => (
+    <div className="wi-portal-card">
+      <div className="wi-portal-title">{label}</div>
+      <div className="wi-portal-row">
+        <input
+          type="number"
+          placeholder="Deposit"
+          value={depositVal}
+          onChange={(e) => setDeposit(e.target.value)}
+          className="input wi-portal-input"
+          disabled={depositDisabled}
+        />
+        <button
+          type="button"
+          onClick={onDeposit}
+          className="btn primary small"
+          disabled={loading || depositDisabled}
+        >
+          Deposit
+        </button>
+      </div>
+      <div className="wi-portal-row">
+        <input
+          type="number"
+          placeholder="Withdraw"
+          value={withdrawVal}
+          onChange={(e) => setWithdraw(e.target.value)}
+          className="input wi-portal-input"
+          disabled={depositDisabled}
+        />
+        <button
+          type="button"
+          onClick={onWithdraw}
+          className="btn danger small"
+          disabled={loading || !withdrawVal || depositDisabled}
+        >
+          Withdraw
+        </button>
+      </div>
+      {note ? <p className="wi-portal-note">{note}</p> : null}
+    </div>
+  );
+
   if (!connected) {
     return (
-      <div className="preview-section">
+      <div className="wi-shell preview-section">
         <Toaster position="top-right" />
-        <button onClick={connect} className="btn primary text-xl px-12 py-6 mb-12">
-          <Wallet className="inline mr-4" size={28} />
-          Connect Wallet
-        </button>
-        <div className="card preview-card">
-          <p className="preview-label">Preview — Connect to load your vault</p>
-          <div className="grid">
-            <div className="box yellow"><Coins size={64} className="mx-auto mb-3" /><p className="big">1,500</p><p>LIQUID</p></div>
-            <div className="box teal"><p className="big">50%</p><p>wWART</p><p className="text-2xl font-bold mt-2">750</p></div>
-            <div className="box teal"><p className="big">30%</p><p>CTSI</p><p className="text-2xl font-bold mt-2">450</p></div>
-            <div className="box purple"><p className="big">20%</p><p>ETH</p><p className="text-2xl font-bold mt-2">0.12</p></div>
+        <div className="wi-connect-card">
+          <p className="wi-connect-lead">Cartesi L1 vault — connect MetaMask (local Anvil)</p>
+          <button type="button" onClick={connect} className="btn primary">
+            <Wallet className="inline" size={18} style={{ marginRight: 8, verticalAlign: -3 }} />
+            Connect wallet
+          </button>
+          <div className="wi-stat-grid wi-stat-grid--preview">
+            <div className="wi-stat wi-stat--liquid">
+              <span className="wi-stat-k">{SHARE_TOKEN.symbol}</span>
+              <span className="wi-stat-v">1,500</span>
+            </div>
+            <div className="wi-stat">
+              <span className="wi-stat-k">wWART</span>
+              <span className="wi-stat-v">750</span>
+            </div>
+            <div className="wi-stat">
+              <span className="wi-stat-k">CTSI</span>
+              <span className="wi-stat-v">450</span>
+            </div>
+            <div className="wi-stat">
+              <span className="wi-stat-k">ETH</span>
+              <span className="wi-stat-v">0.12</span>
+            </div>
           </div>
+          <p className="wi-muted">Preview only — connect to load your vault</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="vault-section">
+    <div className="wi-shell vault-section">
       <Toaster position="top-right" />
-      <p className="connected-address">Connected: {address.slice(0,6)}...{address.slice(-4)}</p>
 
-      <div className="register-btn-container">
-        <button onClick={() => send({ type: "register_address" })} className="register-address-btn" disabled={loading}>
-          Register My Address with DApp
-        </button>
-      </div>
-
-      <div className="card">
-        <div className="grid">
-          <div className="box yellow">
-            <Coins size={64} className="mx-auto mb-3" />
-            <p className="big">{liquid.toLocaleString(undefined, {maximumFractionDigits: 0})}</p>
-            <p>LIQUID Balance</p>
+      {/* Compact L1 header — same density as Warthog header */}
+      <header className="wi-header">
+        <div className="wi-header-main">
+          <div className="wi-header-id">
+            <span className="wi-header-label">L1 MetaMask</span>
+            <button
+              type="button"
+              className="wi-address-chip"
+              title={address}
+              onClick={() => {
+                navigator.clipboard?.writeText(address);
+                toast.success('Address copied');
+              }}
+            >
+              {address.slice(0, 6)}…{address.slice(-4)}
+            </button>
           </div>
-          <div className="box teal">
-            <p className="big">{wwartPct}%</p>
-            <p>wWART Backing</p>
-            <p className="text-2xl font-bold mt-2">{wWART.toFixed(4)}</p>
-          </div>
-          <div className="box teal">
-            <p className="big">{ctsiPct}%</p>
-            <p>CTSI Backing</p>
-            <p className="text-2xl font-bold mt-2">{CTSI.toFixed(4)}</p>
-          </div>
-          <div className="box purple">
-            <p className="big">{ethPct}%</p>
-            <p>ETH Backing</p>
-            <p className="text-2xl font-bold mt-2">{eth.toFixed(6)}</p>
-          </div>
-          <div className="box blue">
-            <p className="big">{usdcPct}%</p>
-            <p>USDC Backing</p>
-            <p className="text-2xl font-bold mt-2">{usdc.toFixed(4)}</p>
-          </div>
-          <div className="box green">
-    <p className="big">Spoofed wWART</p>
-    <p>Total Minted: {formatWart(spoofedWwart.total)}</p>
-    {spoofedWwart.history.length > 0 && (
-      <ul className="mint-history">
-        {spoofedWwart.history.map((m, i) => (
-          <li key={i}>
-            Mint {formatWart(m.amount)} to {m.subAddress.slice(0,10)}... at {new Date(m.timestamp).toLocaleString()}
-          </li>
-        ))}
-      </ul>
-    )}
-    {spoofedWwart.totalBurned > '0' && (
-      <>
-        <p>Total Burned: {formatWart(spoofedWwart.totalBurned)}</p>
-        {spoofedWwart.burnHistory.length > 0 && (
-          <ul className="burn-history">
-            {spoofedWwart.burnHistory.map((b, i) => (
-              <li key={i}>
-                Burn {formatWart(b.amount)} from {b.subAddress.slice(0,10)}... at {new Date(b.timestamp).toLocaleString()}
-              </li>
-            ))}
-          </ul>
-        )}
-      </>
-    )}
-  </div>
+          <span
+            className={`network-badge ${
+              rollupOnline ? 'network-badge--defi' : 'network-badge--main'
+            }`}
+          >
+            {rollupOnline === null
+              ? 'Rollup…'
+              : rollupOnline
+                ? 'Rollup online'
+                : 'Rollup offline'}
+          </span>
         </div>
-
-
-
-        <div className="refresh-btn-container">
-          <button onClick={() => refreshVault(address)} className="btn small" disabled={loading}>
-            <RefreshCw size={18} className="inline mr-2" /> Refresh Vault
+        <div className="wi-header-tools">
+          <button
+            type="button"
+            className="btn secondary small"
+            onClick={() => send({ type: 'register_address' })}
+            disabled={loading || rollupOnline === false}
+            title="Register L1 address with the Cartesi dApp"
+          >
+            Register
+          </button>
+          <button
+            type="button"
+            className="btn primary small"
+            onClick={() => refreshVault(address)}
+            disabled={loading}
+          >
+            <RefreshCw size={14} className="inline" style={{ marginRight: 4, verticalAlign: -2 }} />
+            Refresh
+          </button>
+          <button
+            type="button"
+            className={`btn small ${showWarthog ? 'secondary' : 'primary'}`}
+            onClick={() => setShowWarthog(!showWarthog)}
+          >
+            {showWarthog ? 'Hide Warthog' : 'Show Warthog'}
           </button>
         </div>
-      </div>
+      </header>
 
-      {/* Deposit Section */}
-      <div className="deposit-section">
-        <h2>Deposit Backing Assets</h2>
-        <div className="deposit-grid">
-          <div className="deposit-box">
-            <p>ETH</p>
-            <div className="deposit-controls">
-              <input
-                type="number"
-                placeholder="Amount"
-                value={ethDepositAmt}
-                onChange={(e) => setEthDepositAmt(e.target.value)}
-                className="deposit-input"
-              />
-              <button onClick={depositEth} className="btn primary small" disabled={loading}>Deposit</button>
-            </div>
-            <div className="withdraw-section">
-              <div className="withdraw-box">
-                <input
-                  type="number"
-                  placeholder="Amount"
-                  value={withdrawEthAmt}
-                  onChange={(e) => setWithdrawEthAmt(e.target.value)}
-                  className="withdraw-input"
-                />
-                <button onClick={withdrawEth} className="btn danger small" disabled={loading || !withdrawEthAmt}>Withdraw</button>
-              </div>
-              <p className="withdraw-note">
-                Note: After submission, monitor for the voucher in your wallet or L1 explorer. Execute it trustlessly on L1.
-              </p>
-            </div>
-          </div>
+      {/* L1 panel tabs */}
+      <nav className="sw-action-tabs wi-l1-tabs" role="tablist" aria-label="Cartesi L1 vault">
+        {L1_TABS.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={l1Tab === t.id}
+            className={`sw-action-tab ${l1Tab === t.id ? 'is-active' : ''}`}
+            onClick={() => setL1Tab(t.id)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </nav>
 
-          <div className="deposit-box">
-            <p>wWART</p>
-            <div className="deposit-controls">
-              <input
-                type="number"
-                placeholder="Amount"
-                value={wwartDepositAmt}
-                onChange={(e) => setWwartDepositAmt(e.target.value)}
-                className="deposit-input"
-              />
-              <button onClick={depositWwart} className="btn primary small" disabled={loading}>Deposit</button>
+      {l1Tab === 'balances' && (
+        <div className="wi-panel">
+          <div className="wi-stat-grid">
+            <div className="wi-stat wi-stat--liquid">
+              <Coins size={18} className="wi-stat-icon" />
+              <span className="wi-stat-k">{SHARE_TOKEN.symbol}</span>
+              <span className="wi-stat-v">
+                {liquid.toLocaleString(undefined, { maximumFractionDigits: 4 })}
+              </span>
             </div>
-            <div className="withdraw-section">
-              <div className="withdraw-box">
-                <input
-                  type="number"
-                  placeholder="Amount"
-                  value={withdrawWwartAmt}
-                  onChange={(e) => setWithdrawWwartAmt(e.target.value)}
-                  className="withdraw-input"
-                />
-                <button onClick={withdrawWwart} className="btn danger small" disabled={loading || !withdrawWwartAmt}>Withdraw</button>
-              </div>
-              <p className="withdraw-note">
-                Trustless Voucher: Monitor L1 for execution.
-              </p>
+            <div className="wi-stat">
+              <span className="wi-stat-k">wWART · {wwartPct}%</span>
+              <span className="wi-stat-v">{wWART.toFixed(4)}</span>
             </div>
-          </div>
-          <div className="deposit-box">
-            <p>CTSI</p>
-            <div className="deposit-controls">
-              <input
-                type="number"
-                placeholder="Amount"
-                value={ctsiDepositAmt}
-                onChange={(e) => setCtsiDepositAmt(e.target.value)}
-                className="deposit-input"
-              />
-              <button onClick={depositCtsi} className="btn primary small" disabled={loading}>Deposit</button>
+            <div className="wi-stat">
+              <span className="wi-stat-k">CTSI · {ctsiPct}%</span>
+              <span className="wi-stat-v">{CTSI.toFixed(4)}</span>
             </div>
-            <div className="withdraw-section">
-              <div className="withdraw-box">
-                <input
-                  type="number"
-                  placeholder="Amount"
-                  value={withdrawCtsiAmt}
-                  onChange={(e) => setWithdrawCtsiAmt(e.target.value)}
-                  className="withdraw-input"
-                />
-                <button onClick={withdrawCtsi} className="btn danger small" disabled={loading || !withdrawCtsiAmt}>Withdraw</button>
-              </div>
-              <p className="withdraw-note">
-                Trustless Voucher: Monitor L1 for execution.
-              </p>
+            <div className="wi-stat">
+              <span className="wi-stat-k">ETH · {ethPct}%</span>
+              <span className="wi-stat-v">{eth.toFixed(6)}</span>
+            </div>
+            <div className="wi-stat">
+              <span className="wi-stat-k">USDC · {usdcPct}%</span>
+              <span className="wi-stat-v">{usdc.toFixed(4)}</span>
+            </div>
+            <div className="wi-stat wi-stat--spoof">
+              <span className="wi-stat-k">Spoofed outstanding</span>
+              <span className="wi-stat-v">{formatWart(outstandingSpoofed)}</span>
             </div>
           </div>
-          <div className="deposit-box">
-            <p>USDC</p>
-            <div className="deposit-controls">
-              <input
-                type="number"
-                placeholder="Amount"
-                value={usdcDepositAmt}
-                onChange={(e) => setUsdcDepositAmt(e.target.value)}
-                className="deposit-input"
-              />
-              <button onClick={depositUsdc} className="btn primary small" disabled={loading}>Deposit</button>
+          <details className="wi-guide">
+            <summary>WART bridge path</summary>
+            <ol className="bridge-path-steps">
+              <li>
+                <strong>Warthog → Sub-wallets</strong> — fund sub, sweep → vault + mint
+              </li>
+              <li>
+                <strong>Spoofed wWART</strong> — 1:1 on L1 vault (this panel / Spoofed tab)
+              </li>
+              <li>
+                <strong>Mint {SHARE_TOKEN.symbol}</strong> — Warthog Overview → {SHARE_TOKEN.symbol}
+              </li>
+              <li>
+                <strong>L1 portals</strong> — optional ETH/CTSI/USDC backing (not native WART)
+              </li>
+            </ol>
+          </details>
+        </div>
+      )}
+
+      {l1Tab === 'spoofed' && (
+        <div className="wi-panel">
+          <div className="wi-stat-grid">
+            <div className="wi-stat">
+              <span className="wi-stat-k">Total minted</span>
+              <span className="wi-stat-v">{formatWart(spoofedWwart.total)}</span>
             </div>
-            <div className="withdraw-section">
-              <div className="withdraw-box">
-                <input
-                  type="number"
-                  placeholder="Amount"
-                  value={withdrawUsdcAmt}
-                  onChange={(e) => setWithdrawUsdcAmt(e.target.value)}
-                  className="withdraw-input"
-                />
-                <button onClick={withdrawUsdc} className="btn danger small" disabled={loading || !withdrawUsdcAmt}>Withdraw</button>
+            <div className="wi-stat">
+              <span className="wi-stat-k">Total burned</span>
+              <span className="wi-stat-v">{formatWart(spoofedWwart.totalBurned)}</span>
+            </div>
+            <div className="wi-stat wi-stat--spoof">
+              <span className="wi-stat-k">Outstanding</span>
+              <span className="wi-stat-v">{formatWart(outstandingSpoofed)}</span>
+            </div>
+          </div>
+          <p className="wi-muted">
+            Minted 1:1 on sub → vault sweep. Burn freeable amounts on{' '}
+            <strong>Warthog → Sub-wallets</strong> (partial burns leave residual pin).
+          </p>
+          {spoofedWwart.history.length > 0 && (
+            <ul className="wi-history">
+              {spoofedWwart.history.slice(0, 8).map((m, i) => (
+                <li key={`m-${i}`}>
+                  Mint {formatWart(m.amount)} · sub {m.subAddress?.slice(0, 10)}… ·{' '}
+                  {new Date(m.timestamp).toLocaleString()}
+                </li>
+              ))}
+            </ul>
+          )}
+          {spoofedWwart.burnHistory?.length > 0 && (
+            <ul className="wi-history wi-history--burn">
+              {spoofedWwart.burnHistory.slice(0, 8).map((b, i) => (
+                <li key={`b-${i}`}>
+                  Burn {formatWart(b.amount)} · {b.subAddress?.slice(0, 10)}… ·{' '}
+                  {new Date(b.timestamp).toLocaleString()}
+                </li>
+              ))}
+            </ul>
+          )}
+          {spoofedWwart.history.length === 0 &&
+            !(spoofedWwart.burnHistory?.length > 0) && (
+              <p className="wi-muted">No mint/burn history yet.</p>
+            )}
+        </div>
+      )}
+
+      {l1Tab === 'portals' && (
+        <div className="wi-panel">
+          <p className="wi-muted">
+            Anvil/MetaMask portals for ETH / ERC-20. Native WART → spoofed wWART uses{' '}
+            <strong>Warthog Sub-wallets</strong>, not these portals.
+          </p>
+          <div className="wi-portal-grid">
+            {renderPortalAsset({
+              label: 'ETH',
+              depositVal: ethDepositAmt,
+              setDeposit: setEthDepositAmt,
+              onDeposit: depositEth,
+              withdrawVal: withdrawEthAmt,
+              setWithdraw: setWithdrawEthAmt,
+              onWithdraw: withdrawEth,
+              note: 'Withdraw creates a voucher — execute on L1 when ready.',
+            })}
+            {WWART_ADDRESS ? (
+              renderPortalAsset({
+                label: 'wWART (L1 ERC-20)',
+                depositVal: wwartDepositAmt,
+                setDeposit: setWwartDepositAmt,
+                onDeposit: depositWwart,
+                withdrawVal: withdrawWwartAmt,
+                setWithdraw: setWithdrawWwartAmt,
+                onWithdraw: withdrawWwart,
+                note: 'Trustless voucher on L1.',
+              })
+            ) : (
+              <div className="wi-portal-card wi-portal-card--disabled">
+                <div className="wi-portal-title">wWART (L1 ERC-20)</div>
+                <p className="wi-portal-note">
+                  Not on local Anvil. Use Sub-wallets for spoofed wWART. Set WWART_ADDRESS later for
+                  portal deposits.
+                </p>
               </div>
-              <p className="withdraw-note">
-                Trustless Voucher: Monitor L1 for execution.
-              </p>
-            </div>
+            )}
+            {renderPortalAsset({
+              label: 'CTSI',
+              depositVal: ctsiDepositAmt,
+              setDeposit: setCtsiDepositAmt,
+              onDeposit: depositCtsi,
+              withdrawVal: withdrawCtsiAmt,
+              setWithdraw: setWithdrawCtsiAmt,
+              onWithdraw: withdrawCtsi,
+              note: 'Trustless voucher on L1.',
+            })}
+            {renderPortalAsset({
+              label: 'USDC',
+              depositVal: usdcDepositAmt,
+              setDeposit: setUsdcDepositAmt,
+              onDeposit: depositUsdc,
+              withdrawVal: withdrawUsdcAmt,
+              setWithdraw: setWithdrawUsdcAmt,
+              onWithdraw: withdrawUsdc,
+              note: 'Trustless voucher on L1.',
+            })}
           </div>
         </div>
-      </div>
-
-      {/* NEW: Toggle for Warthog Section */}
-      <div className="toggle-warthog">
-        <button onClick={() => setShowWarthog(!showWarthog)} className="btn primary">
-          {showWarthog ? 'Hide' : 'Show'} Warthog Native Wallet & Bridge
-        </button>
-      </div>
+      )}
 
       {showWarthog && (
         <WarthogWallet
-          send={send} // Pass the send function for relaying proofs
-          address={address} // Pass L1 address for relay
-          l1Address={address} // NEW: Explicitly pass L1 address
+          send={send}
+          address={address}
+          l1Address={address}
           loading={loading}
           setLoading={setLoading}
           burnAmt={burnAmt}
           setBurnAmt={setBurnAmt}
+          l1Vault={vault}
+          onRefreshL1Vault={() => refreshVault(address)}
         />
       )}
     </div>

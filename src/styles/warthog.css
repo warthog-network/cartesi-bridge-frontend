@@ -1,23 +1,19 @@
-/* src/styles/warthog.css — Final Version with Dark Theme from Wallet.css + Liquid Accents (Yellow/Teal) */
+/* src/styles/warthog.css — Wartbunker brand tokens + Cartesi liquid accents */
 
-/* Import Fonts from Wallet.css */
 @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700&family=Press+Start+2P&family=Orbitron:wght@400;700&family=Roboto:wght@400;500&display=swap');
 
-/* Blink animation */
 @keyframes blink {
   0%, 50% { opacity: 1; }
   51%, 100% { opacity: 0; }
 }
 
-
-
 .tx-log-item {
-  border: 1px solid #ccc;
+  border: 1px solid var(--border, #333);
   margin-bottom: 10px;
   padding: 10px;
-  border-radius: 5px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-section, #1a1a1a) 80%, transparent);
 }
-
 
 .controls {
   display: flex;
@@ -42,47 +38,46 @@
   color: white;
   padding: 0.6rem 1rem;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--radius-btn, 12px);
   cursor: pointer;
 }
 
 .secondary-btn:hover {
   background: #4b5563;
 }
-/* Warthog Section Container (Dark background like Wallet, with Liquid blur) */
+
+/* Warthog Section — matches wartbunker card surface */
 .warthog-section {
-  margin-top: 40px;
-  background-color: rgba(7, 7, 7, 0.9); /* From Wallet #070707 */
-  backdrop-filter: blur(15px); /* Liquid style */
-  padding: 20px;
-  border-radius: 12px;
-  border: 2px solid #FFC107; /* Yellow border from Wallet */
-  box-shadow: 2px 2px 2px #00ffcc44; /* Teal shadow accent from Liquid */
-  color: #FFFFFF; /* White text from Wallet */
-  font-family: 'Roboto', sans-serif; /* From Wallet */
+  margin-top: 1.25rem;
+  background-color: color-mix(in srgb, var(--bg-card, #0a0a0a) 92%, transparent);
+  backdrop-filter: blur(15px);
+  padding: 1rem 1.1rem 1.15rem;
+  border-radius: var(--radius-card, 16px);
+  border: 1px solid color-mix(in srgb, var(--primary, #FDB913) 45%, #333);
+  box-shadow: var(--shadow, 0 4px 12px -2px rgba(242, 92, 5, 0.18));
+  color: var(--text-primary, #fff);
+  font-family: 'Roboto', 'Inter', sans-serif;
   max-width: 100%;
   box-sizing: border-box;
 }
 
-/* Headings (Montserrat from Wallet, yellow/teal gradients from Liquid) */
 .warthog-section h2 {
   font-family: 'Montserrat', sans-serif;
   font-size: 1.8rem;
-  color: #FFC107; /* Solid yellow instead of gradient */
-  text-shadow: 2px 1px 0px #2a3d3c; /* Teal glow for accent, reduced for less blur */
+  color: var(--primary, #FDB913);
+  text-shadow: 2px 1px 0px #2a3d3c;
   text-align: center;
   margin-bottom: 20px;
 }
-h2
+
 .warthog-section h3 {
   font-family: 'Montserrat', sans-serif;
   font-size: 1.2rem;
-  color: #FFECB3; /* Light yellow from Wallet */
+  color: #FFECB3;
   margin-bottom: 10px;
-  text-shadow: 1px 1px 2px #000000; /* Subtle shadow from Wallet */
+  text-shadow: 1px 1px 2px #000000;
 }
 
-/* Form Groups (From Wallet) */
 .warthog-section .form-group {
   margin-bottom: 15px;
 }
@@ -90,12 +85,11 @@ h2
 .warthog-section .form-group label {
   display: block;
   font-family: 'Montserrat', sans-serif;
-  color: #FFECB3; /* Light yellow from Wallet */
+  color: #FFECB3;
   margin-bottom: 5px;
   font-size: 14px;
 }
 
-/* Button alignment with input fields */
 .warthog-section .form-group + button:not(.download-wallet-btn) {
   margin-left: 0;
   margin-right: auto;
@@ -120,13 +114,14 @@ h2
 .warthog-section input[type="password"],
 .warthog-section input[type="number"],
 .warthog-section input[type="file"],
-.warthog-section select {
+.warthog-section select,
+.warthog-section textarea {
   width: 100%;
   padding: 10px;
   background-color: #1C2526; /* Dark teal/gray from Wallet */
   color: #FFFFFF;
   border: 2px solid #FFC107; /* Yellow border from Wallet */
-  border-radius: 4px;
+  border-radius: 8px;
   font-family: 'Montserrat', sans-serif;
   font-size: 16px;
   transition: border-color 0.3s, box-shadow 0.3s;
@@ -137,54 +132,779 @@ h2
 .warthog-section input[type="password"]:focus,
 .warthog-section input[type="number"]:focus,
 .warthog-section input[type="file"]:focus,
-.warthog-section select:focus {
+.warthog-section select:focus,
+.warthog-section textarea:focus {
   outline: none;
   border-color: #00ffcc; /* Teal focus from Liquid */
   box-shadow: 0 0 8px #00ffcc66; /* Teal glow */
 }
 
-/* Buttons (Override global .btn styles to match WalletIsland) */
-.warthog-section .btn.primary {
-  padding: 1rem 2.5rem;
-  border: none;
-  border-radius: 50px;
-  font-weight: bold;
+/* ── Activity tab ── */
+.activity-panel {
+  text-align: left;
+  color: var(--text-primary, #fff);
+}
+
+.activity-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.activity-head h3 {
+  margin: 0;
+  font-size: 1.05rem;
+  color: #ffecb3;
+}
+
+.activity-source {
+  font-size: 0.75rem;
+  font-weight: 500;
+  opacity: 0.65;
+  color: #00ffcc;
+}
+
+.activity-error {
+  padding: 0.55rem 0.75rem;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, #e74c3c 50%, #333);
+  background: color-mix(in srgb, #e74c3c 12%, transparent);
+  color: #ffb4b4;
+  font-size: 0.85rem;
+  margin-bottom: 0.75rem;
+}
+
+.activity-empty {
+  opacity: 0.7;
+  font-size: 0.9rem;
+  margin: 0.5rem 0;
+}
+
+.activity-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-height: min(60vh, 520px);
+  overflow-y: auto;
+}
+
+.activity-row {
+  border: 1px solid #333;
+  border-radius: 10px;
+  padding: 0.5rem 0.65rem;
+  background: rgba(0, 0, 0, 0.28);
+  font-size: 0.82rem;
+}
+
+.activity-row.in {
+  border-color: color-mix(in srgb, #00ffcc 30%, #333);
+}
+.activity-row.out {
+  border-color: color-mix(in srgb, #e79300 28%, #333);
+}
+
+.activity-row-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.45rem 0.75rem;
+}
+
+.activity-dir {
+  font-weight: 700;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  opacity: 0.85;
+}
+.activity-dir.in {
+  color: #00ffcc;
+}
+.activity-dir.out {
+  color: #fdb913;
+}
+
+.activity-amt {
+  font-weight: 600;
+  color: #fff;
+}
+
+.activity-fee {
+  opacity: 0.55;
+  font-size: 0.75rem;
+}
+
+.activity-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.65rem;
+  margin-top: 0.25rem;
+  opacity: 0.7;
+  font-size: 0.75rem;
+}
+
+.activity-type {
+  color: #ffecb3;
+  opacity: 1;
+}
+
+.activity-row-addrs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.5rem;
+  margin-top: 0.3rem;
+}
+
+.activity-addr {
+  background: transparent;
+  border: 1px solid #333;
+  border-radius: 999px;
+  color: #bbb;
+  font-size: 0.72rem;
+  padding: 0.15rem 0.5rem;
   cursor: pointer;
-  transition: all 0.3s;
-  font-size: 1.2rem;
+  font-family: inherit;
+}
+.activity-addr:hover {
+  border-color: #00ffcc;
+  color: #fff;
+}
+.activity-addr.mono {
+  font-family: ui-monospace, monospace;
+}
+
+.activity-pager {
+  margin-top: 0.75rem;
+}
+
+/* ── Streamlined shell (auth + dashboard tabs) ── */
+.warthog-section .wh-title-row {
+  text-align: center;
+  margin-bottom: 1.25rem;
+}
+
+.warthog-section .wh-subtitle {
+  color: var(--text-muted, #ccc);
+  font-size: 0.9rem;
+  margin-top: 0.25rem;
+}
+
+.warthog-section .wh-install {
+  display: block;
+  margin: 0 auto 1rem;
+}
+
+.warthog-section .wh-card {
+  background: color-mix(in srgb, var(--bg-section, #1a1a1a) 88%, transparent);
+  border: 1px solid color-mix(in srgb, var(--primary, #FDB913) 45%, transparent);
+  border-radius: 14px;
+  padding: 1.25rem;
+  margin-bottom: 1rem;
+  text-align: left;
+}
+
+.warthog-section .wh-card--inset {
+  background: rgba(0, 0, 0, 0.28);
+  border-color: rgba(0, 255, 204, 0.22);
+}
+
+.warthog-section .wh-card--unlock {
+  border-color: color-mix(in srgb, var(--accent-teal, #00ffcc) 50%, transparent);
+}
+
+.warthog-section .wh-card h3 {
+  margin-bottom: 0.5rem;
+}
+
+.warthog-section .wh-auth-tabs,
+.warthog-section .wh-app-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-bottom: 0.75rem;
+}
+
+/* Nav tabs — always pills; must beat button:not(.btn) yellow-square fallback */
+.warthog-section .wh-auth-tab,
+.warthog-section .wh-app-tab,
+.warthog-section button.wh-auth-tab,
+.warthog-section button.wh-app-tab {
+  background: rgba(255, 255, 255, 0.06) !important;
+  color: #e8e8e8 !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 999px !important;
+  padding: 0.4rem 0.95rem !important;
+  font-size: 0.82rem !important;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: 'Montserrat', 'Roboto', sans-serif;
+  transition: background 0.2s, border-color 0.2s, color 0.2s, box-shadow 0.2s;
+  margin: 0 !important;
+  width: auto !important;
+  box-shadow: none !important;
+  transform: none !important;
+}
+
+.warthog-section .wh-auth-tab:hover,
+.warthog-section .wh-app-tab:hover:not(:disabled),
+.warthog-section button.wh-auth-tab:hover,
+.warthog-section button.wh-app-tab:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent-teal, #00ffcc) 55%, #666) !important;
+  color: #fff !important;
+  background: rgba(0, 255, 204, 0.08) !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+.warthog-section .wh-auth-tab.is-active,
+.warthog-section .wh-app-tab.is-active,
+.warthog-section button.wh-auth-tab.is-active,
+.warthog-section button.wh-app-tab.is-active {
+  background: linear-gradient(135deg, #00ffcc, #00b399) !important;
+  color: #041412 !important;
+  border-color: transparent !important;
+  box-shadow: 0 0 14px color-mix(in srgb, #00ffcc 28%, transparent) !important;
+}
+
+.warthog-section .wh-app-tab:disabled,
+.warthog-section button.wh-app-tab:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.warthog-section .wh-auth-panel {
+  text-align: left;
+}
+
+.warthog-section .wh-row-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.warthog-section .wh-seed-input {
+  resize: vertical;
+  min-height: 4.5rem;
+  line-height: 1.45;
+}
+
+.warthog-section .wh-primary-cta {
+  margin-top: 0.5rem;
+}
+
+.warthog-section .wh-muted {
+  color: var(--text-muted, #ccc);
+  font-size: 0.9rem;
+  margin-bottom: 0.75rem;
+}
+
+.warthog-section .wh-hint {
+  font-size: 0.78rem;
+  color: #b8b8b8;
+  margin: 0.35rem 0 0.75rem;
+  line-height: 1.4;
+}
+
+/* Shared in-panel action tabs (Overview, Sub, Vault) — matches app nav pills */
+.warthog-section .sw-action-tabs,
+.sw-action-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0 0 0.65rem;
+}
+
+.warthog-section .sw-action-tab,
+.sw-action-tab {
+  background: rgba(255, 255, 255, 0.06) !important;
+  color: #e0e0e0 !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 999px !important;
+  padding: 0.35rem 0.85rem !important;
+  font-size: 0.78rem !important;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  margin: 0 !important;
+  width: auto !important;
+  box-shadow: none !important;
+  transform: none !important;
+  transition: background 0.2s, border-color 0.2s, color 0.2s, box-shadow 0.2s;
+}
+
+.warthog-section .sw-action-tab:hover,
+.sw-action-tab:hover {
+  border-color: color-mix(in srgb, #00ffcc 50%, #666) !important;
+  color: #fff !important;
+  background: rgba(0, 255, 204, 0.08) !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+.warthog-section .sw-action-tab.is-active,
+.sw-action-tab.is-active {
+  background: linear-gradient(135deg, #00ffcc, #00b399) !important;
+  color: #041412 !important;
+  border-color: transparent !important;
+  box-shadow: 0 0 12px color-mix(in srgb, #00ffcc 28%, transparent) !important;
+}
+
+.sw-action-panel {
+  min-height: 2.5rem;
+}
+
+.warthog-section .wh-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  margin-bottom: 0.75rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 14px;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--primary, #FDB913) 12%, #0a0a0a),
+    color-mix(in srgb, var(--accent-teal, #00ffcc) 10%, #0a0a0a)
+  );
+  border: 1px solid rgba(253, 185, 19, 0.35);
+  text-align: left;
+}
+
+.warthog-section .wh-header-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.warthog-section .wh-header-id-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.2rem;
+}
+
+.warthog-section .wh-wallet-name {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #00ffcc;
+  opacity: 0.9;
+}
+
+/* Named wallet picker (login) */
+.warthog-section .wh-saved-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+  max-height: 14rem;
+  overflow-y: auto;
+}
+
+.warthog-section .wh-saved-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100% !important;
+  margin: 0 !important;
+  padding: 0.55rem 0.75rem !important;
+  border-radius: 10px !important;
+  border: 1px solid #333 !important;
+  background: rgba(0, 0, 0, 0.3) !important;
+  color: #eee !important;
+  box-shadow: none !important;
+  transform: none !important;
+  text-align: left;
+  cursor: pointer;
+}
+
+.warthog-section .wh-saved-card:hover {
+  border-color: color-mix(in srgb, #00ffcc 45%, #333) !important;
+  background: rgba(0, 255, 204, 0.08) !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+.warthog-section .wh-saved-card.is-selected {
+  border-color: transparent !important;
+  background: linear-gradient(135deg, #00ffcc, #00b399) !important;
+  color: #041412 !important;
+}
+
+.warthog-section .wh-saved-card__name {
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+
+.warthog-section .wh-saved-card__meta {
+  font-size: 0.72rem;
+  opacity: 0.7;
+}
+
+.warthog-section .wh-manage-list {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.warthog-section .wh-manage-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.45rem 0.55rem;
+  border-radius: 8px;
+  border: 1px solid #333;
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.warthog-section .wh-divider {
+  border: none;
+  border-top: 1px solid #333;
+  margin: 0.85rem 0;
+}
+
+.warthog-section .wh-balance-label {
+  display: block;
+  font-size: 0.75rem;
+  color: #FFECB3;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.warthog-section .wh-balance-value {
+  font-size: 1.3rem;
+  font-weight: 700;
+  color: #fff;
+  font-family: 'Montserrat', sans-serif;
+}
+
+.warthog-section .wh-balance-mempool {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: #ffb74d;
+  opacity: 0.95;
+  max-width: 16rem;
+  line-height: 1.3;
+}
+
+.warthog-section .wh-address-chip {
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(0, 255, 204, 0.35);
+  color: #00ffcc;
+  border-radius: 999px;
+  padding: 0.4rem 0.85rem;
+  font-size: 0.8rem;
+  font-family: ui-monospace, monospace;
+  cursor: pointer;
+  margin: 0;
+}
+
+.warthog-section .wh-header-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.warthog-section .wh-node-select {
+  max-width: min(100%, 220px);
+  font-size: 0.8rem !important;
+  padding: 0.4rem 0.55rem !important;
+}
+
+.warthog-section .wh-panel {
+  text-align: left;
+}
+
+.warthog-section .wh-panel-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.warthog-section .wh-overview-tabs {
+  margin-bottom: 0.15rem;
+}
+
+.warthog-section .wh-send-card .form-group {
+  margin-bottom: 0.65rem;
+}
+
+.warthog-section .wh-send-card .wh-primary-cta {
+  margin-top: 0.25rem;
+}
+
+.warthog-section .wh-advanced {
+  margin: 0.35rem 0 0.65rem;
+  font-size: 0.8rem;
+}
+
+.warthog-section .wh-advanced summary {
+  cursor: pointer;
+  color: #00ffcc;
+  opacity: 0.85;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+
+.warthog-section .form-group {
+  margin-bottom: 0.65rem;
+  text-align: left;
+}
+
+.warthog-section .form-group label {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  opacity: 0.65;
+  margin-bottom: 0.25rem;
+  color: #ffecb3;
+}
+
+.warthog-section .form-group .input,
+.warthog-section .wh-inline-burn .input {
+  width: 100%;
+}
+
+.warthog-section .result {
+  margin-top: 0.65rem;
+  padding: 0.65rem 0.75rem;
+  border-radius: 10px;
+  border: 1px solid #333;
+  background: rgba(0, 0, 0, 0.35);
+  max-height: 12rem;
+  overflow: auto;
+}
+
+.warthog-section .result pre {
+  margin: 0;
+  font-size: 0.72rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #ccc;
+}
+
+.warthog-section .wh-linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  color: #00ffcc;
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.warthog-section .wh-card {
+  padding: 0.85rem 0.95rem;
+  margin-bottom: 0;
+}
+
+.warthog-section .wh-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.65rem;
+}
+
+.warthog-section .wh-stat {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 0.75rem;
+}
+
+.warthog-section .wh-stat-label {
+  display: block;
+  font-size: 0.7rem;
+  color: #a8a8a8;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 0.25rem;
+}
+
+.warthog-section .wh-stat-value {
+  font-size: 0.9rem;
+  color: #FFECB3;
+  word-break: break-all;
+}
+
+.warthog-section .wh-stat-value.mono,
+.warthog-section .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+}
+
+.warthog-section .wh-inline-burn {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+
+.warthog-section .wh-inline-burn .input {
+  flex: 1;
+  min-width: 120px;
+}
+
+.warthog-section .wh-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.warthog-section .wh-tx-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.warthog-section .wh-linkish {
+  background: none;
+  border: none;
+  color: #00ffcc;
+  cursor: pointer;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.warthog-section .wh-pulse {
+  display: inline-block;
+  width: 0.55rem;
+  height: 0.55rem;
+  margin-left: 0.35rem;
+  border-radius: 50%;
+  background: #ffec00;
+  animation: blink 1s infinite;
+  vertical-align: middle;
+}
+
+.warthog-section .wh-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  color: #FFECB3;
+  font-size: 0.85rem;
+  margin: 0.65rem 0;
+  cursor: pointer;
+}
+
+.warthog-section .wh-seed-reveal {
+  margin: 0.75rem 0;
+}
+
+.warthog-section .wh-seed-text {
+  background: rgba(255, 236, 179, 0.12);
+  border: 1px solid rgba(253, 185, 19, 0.4);
+  border-radius: 8px;
+  padding: 0.75rem;
+  color: #caa21e;
+  font-weight: 700;
+  font-family: 'Montserrat', sans-serif;
+  word-break: break-word;
+}
+
+.warthog-section .wh-advanced {
+  margin: 0.75rem 0 1rem;
+  color: #ddd;
+  font-size: 0.85rem;
+}
+
+.warthog-section .wh-advanced summary {
+  cursor: pointer;
+  color: #FFECB3;
+  margin-bottom: 0.5rem;
+}
+
+/* Sub-wallet root sits flush inside tab panel (cards provide their own chrome) */
+.warthog-section .subwallet-section {
+  margin-top: 0 !important;
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+}
+
+@media (max-width: 720px) {
+  .warthog-section .wh-row-2 {
+    grid-template-columns: 1fr;
+  }
+
+  .warthog-section .wh-header-tools .btn {
+    flex: 1 1 auto;
+  }
+
+  .warthog-section .wh-node-select {
+    max-width: 100%;
+    flex: 1 1 100%;
+  }
+}
+
+/* Action pills inside Warthog shell — keep pill radius, moderate size */
+.warthog-section .btn.primary {
+  padding: 0.5rem 1.15rem;
+  border: none;
+  border-radius: 999px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-size: 0.88rem;
   background: linear-gradient(135deg, #00ffcc, #00b399);
-  box-shadow: 0 0 20px #00ffcc44;
-  color: black; /* Ensure text is visible on gradient */
+  box-shadow: 0 0 16px #00ffcc44;
+  color: #041412;
 }
 
 .warthog-section .btn.primary:hover {
-  box-shadow: 0 10px 30px #00ffcc66;
-  color: black;
+  box-shadow: 0 8px 24px #00ffcc66;
+  color: #041412;
 }
 
 .warthog-section .btn.danger {
-  padding: 1rem 2.5rem;
+  padding: 0.5rem 1.15rem;
   border: none;
-  border-radius: 50px;
-  font-weight: bold;
+  border-radius: 999px;
+  font-weight: 600;
   cursor: pointer;
-  transition: all 0.3s;
-  font-size: 1.2rem;
-  background: linear-gradient(135deg, #ffcc00, #ff9900);
-  box-shadow: 0 0 20px #ffcc0044;
-  color: black; /* Ensure text is visible on gradient */
+  transition: all 0.2s;
+  font-size: 0.88rem;
+  background: linear-gradient(135deg, #e79300, #f25c05);
+  box-shadow: 0 0 14px #fdb91344;
+  color: #1a1000;
 }
 
 .warthog-section .btn.danger:hover {
-  box-shadow: 0 10px 30px #ffcc0066;
-  color: black;
+  box-shadow: 0 8px 22px #fdb91366;
+  color: #1a1000;
 }
 
 .warthog-section .btn.small {
-  padding: 0.5rem 1rem;
-  font-size: 1rem;
-  margin-right: 0.5rem;
-  margin-bottom: 0.5rem;
+  padding: 0.38rem 0.9rem;
+  font-size: 0.82rem;
+  border-radius: 999px;
+  margin-right: 0.35rem;
+  margin-bottom: 0.35rem;
 }
 
 .warthog-section .btn:disabled {
@@ -194,33 +914,39 @@ h2
   transform: none;
 }
 
-/* Fallback for any buttons not using .btn class */
-.warthog-section button:not(.btn) {
-  background: linear-gradient(45deg, #FFC107, #FFECB3); /* Yellow gradient from Wallet */
-  color: #1C2526; /* Dark text from Wallet */
+/*
+ * Fallback for bare <button> only — never tabs (wh-app-tab / wh-auth-tab).
+ * Old rule painted every non-.btn control as square yellow (Overview/Send/…).
+ */
+.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab) {
+  background: linear-gradient(135deg, #00ffcc, #00b399);
+  color: #041412;
   font-family: 'Montserrat', sans-serif;
-  font-weight: 700;
-  padding: 10px 20px;
-  border: 2px solid #1C2526; /* Dark border from Wallet */
-  border-radius: 4px;
+  font-weight: 600;
+  padding: 0.55rem 1.15rem;
+  border: none;
+  border-radius: 999px;
   cursor: pointer;
   transition: transform 0.2s, box-shadow 0.2s, background 0.3s;
-  margin-right: 10px;
-  margin-bottom: 10px;
+  margin-right: 0.5rem;
+  margin-bottom: 0.5rem;
   box-sizing: border-box;
+  box-shadow: 0 0 16px color-mix(in srgb, #00ffcc 22%, transparent);
 }
 
-.warthog-section button:not(.btn):hover {
-  transform: scale(1.05);
-  box-shadow: 0 0 10px #00ffcc; /* Teal glow accent from Liquid */
-  background: linear-gradient(45deg, #00ffcc, #00b399); /* Teal gradient on hover from Liquid */
-  color: #FFFFFF;
+.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 22px color-mix(in srgb, #00ffcc 35%, transparent);
+  background: linear-gradient(135deg, #00ffcc, #00b399);
+  color: #041412;
 }
 
-.warthog-section button:not(.btn):disabled {
-  background: #ccc;
+.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):disabled {
+  background: #555;
+  color: #aaa;
   cursor: not-allowed;
   box-shadow: none;
+  transform: none;
 }
 
 /* Specific Button Styles */
@@ -398,11 +1124,20 @@ h2
     padding: 8px;
   }
 
-  .warthog-section button {
+  .warthog-section button:not(.wh-app-tab):not(.wh-auth-tab) {
     width: 100%;
     margin-right: 0;
     padding: 12px;
     font-size: 14px;
+  }
+
+  /* Keep tab row horizontal pills on mobile */
+  .warthog-section .wh-app-tabs button.wh-app-tab,
+  .warthog-section .wh-auth-tabs button.wh-auth-tab {
+    width: auto !important;
+    flex: 0 0 auto;
+    padding: 0.4rem 0.85rem !important;
+    font-size: 0.78rem !important;
   }
 
   .warthog-section .result p,

@@ -1,9 +1,14 @@
 // astro.config.mjs
 import { defineConfig } from 'astro/config';
 import react from '@astrojs/react';
-import { nodePolyfills } from 'vite-plugin-node-polyfills';
-import viteCommonjs from 'vite-plugin-commonjs';
 import netlify from '@astrojs/netlify';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const projectRoot = path.dirname(fileURLToPath(import.meta.url));
+const ethersV6Entry = path.resolve(projectRoot, 'node_modules/ethers-v6/lib.esm/index.js');
+const cryptoShim = path.resolve(projectRoot, 'src/shims/crypto.js');
+const processShim = path.resolve(projectRoot, 'src/shims/process.js');
 
 export default defineConfig({
   output: 'server',
@@ -13,21 +18,61 @@ export default defineConfig({
     cacheOnDemandPages: true,
   }),
   vite: {
+    worker: {
+      format: 'es',
+    },
+    define: {
+      global: 'globalThis',
+      'process.env': {},
+    },
     resolve: {
+      // Prefer warthog-js's nested ethers@6 over root ethers@5 when both exist.
+      // Without this, Vite prebundles root ethers@5 into /node_modules/.vite/deps/ethers.js
+      // and warthog-js's `import { SigningKey } from "ethers"` fails (SigningKey is v6-only).
+      dedupe: ['ethers'],
       alias: {
-        crypto: 'crypto-browserify',
-        stream: 'stream-browserify',
+        // Force ALL bare "ethers" imports (including warthog-js) onto ethers v6.
+        // App code that needs v6 should import from 'ethers-v6' (same entry).
+        // Root package "ethers" stays at v5 in package.json for any leftover utils usage,
+        // but the browser bundle always gets v6.
+        ethers: ethersV6Entry,
+        'ethers-v6': ethersV6Entry,
+
+        // Pure-ESM crypto shim — NEVER load crypto-browserify (CJS exports/require)
+        crypto: cryptoShim,
+        'node:crypto': cryptoShim,
+        'crypto-browserify': cryptoShim,
+
+        buffer: path.resolve(projectRoot, 'node_modules/buffer'),
+        process: processShim,
+        stream: path.resolve(projectRoot, 'node_modules/stream-browserify'),
+        vm: path.resolve(projectRoot, 'node_modules/vm-browserify'),
+        '@': path.resolve(projectRoot, 'src'),
       },
     },
-    ssr: {
-      noExternal: ['crypto-browserify', 'stream-browserify'],
-    },
-       optimizeDeps: {
+    optimizeDeps: {
+      include: [
+        'buffer',
+        'elliptic',
+        'ethers',
+        'ethers-v6',
+        '@noble/hashes/sha2.js',
+        '@noble/hashes/hmac.js',
+        '@noble/hashes/pbkdf2.js',
+      ],
+      exclude: [
+        'warthog-js',
+        'crypto-browserify',
+      ],
       esbuildOptions: {
         define: {
           global: 'globalThis',
         },
       },
+    },
+    ssr: {
+      external: ['warthog-js'],
+      noExternal: [],
     },
     server: {
       proxy: {
@@ -36,13 +81,12 @@ export default defineConfig({
           changeOrigin: true,
           rewrite: (path) => path.replace(/^\/rollup/, ''),
         },
-        
       },
     },
     build: {
       commonjsOptions: {
-        transformMixedEsModules: true
-      }
-    }
+        transformMixedEsModules: true,
+      },
+    },
   },
 });

@@ -1,10 +1,37 @@
 ---
-// src/components/Header.astro
+// Compact product header — matches Warthog shell density
 ---
-<header class="text-center py-12">
-  <h1 class="text-9xl font-black bg-gradient-to-r from-yellow-400 via-pink-500 to-cyan-400 bg-clip-text text-transparent">
-    LIQUID
-  </h1>
-  <p class="text-3xl mt-4 opacity-90">WART + CTSI Symbiotic Token</p>
-  <p class="text-lg mt-2 opacity-70">Your personal ratio is preserved forever</p>
+<header class="bridge-header">
+  <p class="bridge-badge">Warthog × Cartesi · DeFi testnet MVP</p>
+  <h1>WLIQ</h1>
+  <p class="bridge-sub">WART bridge · multi-sig vaults · share mint</p>
 </header>
+
+<style>
+  .bridge-header {
+    text-align: center;
+    padding: 1.35rem 1rem 0.85rem;
+  }
+  .bridge-badge {
+    display: inline-block;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--accent-teal, #00ffcc);
+    border: 1px solid color-mix(in srgb, var(--accent-teal, #00ffcc) 40%, transparent);
+    background: color-mix(in srgb, var(--accent-teal, #00ffcc) 10%, transparent);
+    border-radius: 999px;
+    padding: 0.25rem 0.75rem;
+    margin-bottom: 0.65rem;
+  }
+  .bridge-header h1 {
+    margin: 0;
+    font-size: clamp(1.75rem, 4.5vw, 2.6rem);
+  }
+  .bridge-sub {
+    font-size: 0.95rem;
+    opacity: 0.75;
+    margin-top: 0.35rem;
+  }
+</style>

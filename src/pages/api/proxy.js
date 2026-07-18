@@ -1,84 +1,138 @@
-// src/pages/api/proxy.js
-// Update: Hardcode or env-var the prod nodeBase for safety.
-// Use process.env.NODE_BASE if set (add to Netlify env vars: NODE_BASE=https://warthognode.duckdns.org),
-// fallback to public node for dev.
-
-import https from 'https';  // For custom agent
+import { rejectFakeMineIfRemote, rejectLocalNodeInProxy } from '../../utils/proxyGuards.js';
 
 export const prerender = false;
 
-const agent = new https.Agent({
-  rejectUnauthorized: false,  // Bypass strict cert validation (use only if cert errors occur; insecure for untrusted nodes)
-});
+const PROXY_TIMEOUT_MS = 10000;
+const DEFAULT_NODE_BASE = process.env.NODE_BASE || 'https://warthog-defitestnet.duckdns.org';
 
-export const GET = async ({ request }) => {
-  try {
-    const url = new URL(request.url);
-    const nodePath = url.searchParams.get('nodePath');
-    const nodeBase = url.searchParams.get('nodeBase') || process.env.NODE_BASE || 'https://node.wartscan.io';
-    console.log(`[GET] Proxying to: ${nodeBase}/${nodePath}`); // Debug log
-    if (!nodePath) {
-      return new Response(JSON.stringify({ error: 'Missing nodePath query parameter' }), { status: 400 });
-    }
-    const targetUrl = `${nodeBase}/${nodePath}`;
-    const response = await fetch(targetUrl, {
+function jsonError(status, error) {
+  return new Response(JSON.stringify({ code: 1, error }), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-cache',
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
+}
+
+async function forwardToNode({ nodeBase, nodePath, method = 'GET', body = null }) {
+  const resolvedBase = nodeBase || DEFAULT_NODE_BASE;
+
+  if (!nodePath) {
+    return jsonError(400, 'Missing nodePath');
+  }
+
+  const localNodeRejection = rejectLocalNodeInProxy(resolvedBase);
+  if (localNodeRejection) {
+    return new Response(localNodeRejection.body, {
+      status: localNodeRejection.status,
       headers: { 'Content-Type': 'application/json' },
-      agent: targetUrl.startsWith('https') ? agent : undefined,  // Apply agent only for HTTPS
     });
-    const data = await response.text();
-    console.log(`[GET] Response status: ${response.status}, data: ${data}`); // Debug log
-    return new Response(data, {
+  }
+
+  const fakeMineRejection = rejectFakeMineIfRemote(nodePath, resolvedBase);
+  if (fakeMineRejection) {
+    return new Response(fakeMineRejection.body, {
+      status: fakeMineRejection.status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  const targetUrl = resolvedBase.replace(/\/$/, '') + '/' + nodePath.replace(/^\//, '');
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS);
+
+  const fetchOptions = {
+    method,
+    signal: controller.signal,
+    headers: { 'Cache-Control': 'no-cache' },
+  };
+
+  if (method !== 'GET' && method !== 'HEAD' && body != null) {
+    fetchOptions.body = body;
+    fetchOptions.headers['Content-Type'] = 'application/json';
+  }
+
+  try {
+    const response = await fetch(targetUrl, fetchOptions);
+    clearTimeout(timeoutId);
+    const text = await response.text();
+    return new Response(text, {
       status: response.status,
-      headers: { 
+      headers: {
         'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache',
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, Authorization',
       },
     });
-  } catch (err) {
-    console.error('[GET] Proxy error:', err.message, err.stack);  // Enhanced logging
-    return new Response(JSON.stringify({ error: err.message }), { status: 500 });
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      return jsonError(
+        408,
+        `Node request timed out after ${PROXY_TIMEOUT_MS / 1000}s (${resolvedBase}). `
+          + 'The node may be offline or unreachable from the server proxy — try another node.',
+      );
+    }
+    return jsonError(
+      502,
+      `Upstream fetch failed (${resolvedBase}): ${error.message || 'network error'}`,
+    );
   }
+}
+
+export const GET = async ({ request }) => {
+  const url = new URL(request.url);
+  return forwardToNode({
+    nodeBase: url.searchParams.get('nodeBase'),
+    nodePath: url.searchParams.get('nodePath'),
+    method: 'GET',
+  });
 };
 
 export const POST = async ({ request }) => {
-  try {
-    const url = new URL(request.url);
-    const nodePath = url.searchParams.get('nodePath');
-    const nodeBase = url.searchParams.get('nodeBase') || process.env.NODE_BASE || 'https://node.wartscan.io'; 
-    console.log(`[POST] Proxying to: ${nodeBase}/${nodePath}`); // Debug log
-    if (!nodePath) {
-      return new Response(JSON.stringify({ error: 'Missing nodePath query parameter' }), { status: 400 });
+  const contentType = request.headers.get('content-type') || '';
+
+  if (contentType.includes('application/json')) {
+    try {
+      const envelope = await request.json();
+      if (envelope?.nodeBase && envelope?.nodePath != null) {
+        const forwardBody = envelope.body != null
+          ? JSON.stringify(envelope.body)
+          : null;
+        return forwardToNode({
+          nodeBase: envelope.nodeBase,
+          nodePath: envelope.nodePath,
+          method: envelope.method || 'GET',
+          body: forwardBody,
+        });
+      }
+    } catch {
+      // fall through to legacy query-param POST
     }
-    const body = await request.json();
-    const targetUrl = `${nodeBase}/${nodePath}`;
-    const response = await fetch(targetUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      agent: targetUrl.startsWith('https') ? agent : undefined,
-    });
-    const data = await response.text();
-    console.log(`[POST] Response status: ${response.status}, data: ${data}`); // Debug log
-    return new Response(data, {
-      status: response.status,
-      headers: { 
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      },
-    });
-  } catch (err) {
-    console.error('[POST] Proxy error:', err.message, err.stack);
-    return new Response(JSON.stringify({ error: err.message }), { status: 500 });
   }
+
+  const url = new URL(request.url);
+  const nodePath = url.searchParams.get('nodePath');
+  const nodeBase = url.searchParams.get('nodeBase');
+  if (!nodePath) {
+    return jsonError(400, 'Missing nodePath');
+  }
+
+  const body = await request.text();
+  return forwardToNode({
+    nodeBase,
+    nodePath,
+    method: 'POST',
+    body: body || null,
+  });
 };
 
-// Handle OPTIONS for CORS preflight
-export const OPTIONS = async () => {
-  return new Response(null, {
+export const OPTIONS = async () =>
+  new Response(null, {
     status: 204,
     headers: {
       'Access-Control-Allow-Origin': '*',
@@ -86,4 +140,3 @@ export const OPTIONS = async () => {
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     },
   });
-};
