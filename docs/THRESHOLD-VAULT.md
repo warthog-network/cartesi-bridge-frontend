@@ -13,8 +13,9 @@ Keygen (browser, once):
   d_user, d_dapp ← random scalars
   Q = (d_user + d_dapp)·G  →  Warthog address
   Paillier: ckey = Enc(d_user)
-  Store client: d_user + Paillier sk (encrypted w/ mnemonic)
+  Store client: d_user + Paillier sk (encrypted w/ mnemonic) only
   Cosigner:     d_dapp + ckey + Paillier pk   (never d_user plaintext)
+  Never store d_dapp in browser / user-vault-share.txt (ops cosigner backup only)
 
 Sign (interactive, Lindell-style):
   1. Client: k1, R1 = k1·G

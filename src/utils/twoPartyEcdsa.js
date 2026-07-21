@@ -1,8 +1,9 @@
 /**
  * 2-party ECDSA (Lindell-style) — full private key never assembled.
  *
- * d = d_user + d_dapp (mod n). Cosigner stores d_dapp + Enc(d_user) only.
- * Sign: interactive; output (r,s,recid) under aggregate pubkey.
+ * Aggregate pubkey Q = d_user·G + d_dapp·G (additive shares). Cosigner stores
+ * d_dapp + Enc(d_user) only. Sign is interactive Lindell; output (r,s,recid)
+ * under Q. Full scalar d is never formed after keygen (and not at keygen either).
  */
 
 import { secp256k1 } from '@noble/curves/secp256k1';
@@ -15,8 +16,14 @@ export const MULTISIG_SCHEME = 'wart-2p-ecdsa-lindell-v1';
 export const CURVE_N = secp256k1.CURVE.n;
 const G = secp256k1.ProjectivePoint.BASE;
 
-const ENC_PREFIX = 'cartesi-bridge-2p-ecdsa-enc-v1';
+/** @deprecated XOR stream prefix — still decryptable for migration */
+const ENC_PREFIX_XOR_V1 = 'cartesi-bridge-2p-ecdsa-enc-v1';
+/** AES-256-GCM + PBKDF2 (v2) blob prefix */
+const ENC_PREFIX_AES_V2 = 'cartesi-bridge-2p-aesgcm-v2:';
 const USER_STORE_PREFIX = 'cartesi-bridge-msig2p-user-v1:';
+/** Default Paillier modulus bits (lab was 1024; product floor 2048) */
+export const DEFAULT_PAILLIER_BITS = 2048;
+const PBKDF2_ITERS = 120_000;
 
 export function modN(a) {
   let x = a % CURVE_N;
@@ -84,16 +91,56 @@ function hashToScalar(hashHex) {
   return modN(BigInt('0x' + String(hashHex).replace(/^0x/i, '')));
 }
 
-export function encryptJsonWithMnemonic(obj, mnemonic) {
-  const phrase = String(mnemonic || '').trim().replace(/\s+/g, ' ');
-  if (!phrase) throw new Error('Mnemonic required');
+function getSubtle() {
+  const c = globalThis.crypto;
+  if (c?.subtle) return c.subtle;
+  throw new Error('WebCrypto subtle unavailable — need browser or Node 18+');
+}
+
+function bytesToHex(u8) {
+  return Array.from(u8, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function hexToBytes(hex) {
+  const h = String(hex).replace(/^0x/i, '');
+  if (h.length % 2) throw new Error('odd hex length');
+  const out = new Uint8Array(h.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+async function deriveAesKeyFromMnemonic(phrase, saltU8) {
+  const subtle = getSubtle();
+  const base = await subtle.importKey(
+    'raw',
+    new TextEncoder().encode(phrase),
+    'PBKDF2',
+    false,
+    ['deriveKey'],
+  );
+  return subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: saltU8,
+      iterations: PBKDF2_ITERS,
+      hash: 'SHA-256',
+    },
+    base,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
+/** Legacy XOR stream (v1) — migration only */
+function encryptJsonXorV1(obj, phrase) {
   const data = new TextEncoder().encode(JSON.stringify(obj));
   const out = new Uint8Array(data.length);
   let counter = 0;
   let offset = 0;
   while (offset < data.length) {
     const block = getBytes(
-      sha256(toUtf8Bytes(`${ENC_PREFIX}:${phrase}:${counter}`)),
+      sha256(toUtf8Bytes(`${ENC_PREFIX_XOR_V1}:${phrase}:${counter}`)),
     );
     for (let i = 0; i < 32 && offset < data.length; i++, offset++) {
       out[offset] = data[offset] ^ block[i];
@@ -103,15 +150,14 @@ export function encryptJsonWithMnemonic(obj, mnemonic) {
   return hexlify(out).slice(2);
 }
 
-export function decryptJsonWithMnemonic(encHex, mnemonic) {
-  const phrase = String(mnemonic || '').trim().replace(/\s+/g, ' ');
+function decryptJsonXorV1(encHex, phrase) {
   const data = getBytes('0x' + String(encHex).replace(/^0x/i, ''));
   const out = new Uint8Array(data.length);
   let counter = 0;
   let offset = 0;
   while (offset < data.length) {
     const block = getBytes(
-      sha256(toUtf8Bytes(`${ENC_PREFIX}:${phrase}:${counter}`)),
+      sha256(toUtf8Bytes(`${ENC_PREFIX_XOR_V1}:${phrase}:${counter}`)),
     );
     for (let i = 0; i < 32 && offset < data.length; i++, offset++) {
       out[offset] = data[offset] ^ block[i];
@@ -122,25 +168,80 @@ export function decryptJsonWithMnemonic(encHex, mnemonic) {
 }
 
 /**
+ * Encrypt clientSecret (user half) with mnemonic via AES-256-GCM + PBKDF2.
+ * Returns versioned string starting with ENC_PREFIX_AES_V2.
+ */
+export async function encryptJsonWithMnemonic(obj, mnemonic) {
+  const phrase = String(mnemonic || '').trim().replace(/\s+/g, ' ');
+  if (!phrase) throw new Error('Mnemonic required');
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveAesKeyFromMnemonic(phrase, salt);
+  const pt = new TextEncoder().encode(JSON.stringify(obj));
+  const ctBuf = await getSubtle().encrypt({ name: 'AES-GCM', iv }, key, pt);
+  const ct = new Uint8Array(ctBuf);
+  // salt(16) || iv(12) || ciphertext+tag
+  const packed = new Uint8Array(16 + 12 + ct.length);
+  packed.set(salt, 0);
+  packed.set(iv, 16);
+  packed.set(ct, 28);
+  return ENC_PREFIX_AES_V2 + bytesToHex(packed);
+}
+
+/**
+ * Decrypt clientSecret. Supports AES-GCM v2 and legacy XOR v1 (auto-migrate path).
+ */
+export async function decryptJsonWithMnemonic(encHex, mnemonic) {
+  const phrase = String(mnemonic || '').trim().replace(/\s+/g, ' ');
+  const raw = String(encHex || '');
+  if (raw.startsWith(ENC_PREFIX_AES_V2)) {
+    const packed = hexToBytes(raw.slice(ENC_PREFIX_AES_V2.length));
+    if (packed.length < 16 + 12 + 16) throw new Error('AES-GCM blob too short');
+    const salt = packed.subarray(0, 16);
+    const iv = packed.subarray(16, 28);
+    const ct = packed.subarray(28);
+    const key = await deriveAesKeyFromMnemonic(phrase, salt);
+    try {
+      const ptBuf = await getSubtle().decrypt({ name: 'AES-GCM', iv }, key, ct);
+      return JSON.parse(new TextDecoder().decode(ptBuf));
+    } catch {
+      throw new Error('Cannot decrypt 2P client secret (AES-GCM) — wrong mnemonic?');
+    }
+  }
+  // Legacy XOR — try and let caller re-wrap with AES
+  try {
+    return decryptJsonXorV1(raw, phrase);
+  } catch {
+    throw new Error('Cannot decrypt 2P client secret — wrong mnemonic or corrupt blob');
+  }
+}
+
+/** True if blob is already AES-GCM v2 */
+export function isAesGcmClientSecretBlob(encHex) {
+  return String(encHex || '').startsWith(ENC_PREFIX_AES_V2);
+}
+
+/**
  * Keygen: additive shares + Paillier Enc(d_user) for cosigner.
- * Full d is computed only to derive address/pubkey, then discarded.
+ * Public key Q = d_user·G + d_dapp·G — full scalar d is NEVER formed.
  */
 export async function createTwoPartyVault({ subAddress, index, owner } = {}) {
   const dUser = randomScalar();
   const dDapp = randomScalar();
-  const d = modN(dUser + dDapp);
-  const Q = G.multiply(d);
+  // Homomorphic aggregate pubkey — no d = dUser+dDapp scalar
+  const Q = G.multiply(dUser).add(G.multiply(dDapp));
   const pubHex = pointToCompressedHex(Q);
   const address = addressFromPubCompressedHex(pubHex);
 
-  const bits =
+  const envBits =
     typeof process !== 'undefined' && process.env?.PAILLIER_BITS
       ? Number(process.env.PAILLIER_BITS)
-      : 1024;
+      : NaN;
+  const bits =
+    Number.isFinite(envBits) && envBits >= 2048 ? envBits : DEFAULT_PAILLIER_BITS;
   const { publicKey, privateKey } = await generateRandomKeys(bits);
   const ckey = publicKey.encrypt(dUser);
 
-  // discard d from memory path
   const vault = {
     scheme: MULTISIG_SCHEME,
     address,
@@ -164,6 +265,7 @@ export async function createTwoPartyVault({ subAddress, index, owner } = {}) {
       publicKey: pubHex,
       address,
       scheme: MULTISIG_SCHEME,
+      paillierBits: bits,
     },
     subAddress: subAddress
       ? String(subAddress).replace(/^0x/i, '').toLowerCase()
@@ -182,9 +284,9 @@ function storageKey(mainAddress, subAddress) {
 }
 
 /**
- * Persist client secret + optional encrypted cosignerRegister backup.
- * Backup lets us re-register d_dapp after cosigner store wipe (same vault address).
- * Still encrypted with mnemonic — not plaintext on disk.
+ * Persist **user half only** (encrypted with mnemonic).
+ * Never store d_dapp / cosignerRegister in the browser — that lives only on the cosigner
+ * (and ops cosigner-backup.mjs). Client-side cosigner backups were removed as a split-key hole.
  */
 export function saveTwoPartyClientLocal({
   mainAddress,
@@ -192,7 +294,8 @@ export function saveTwoPartyClientLocal({
   vaultAddress,
   index,
   encryptedClientSecret,
-  encryptedCosignerBackup = null,
+  /** @deprecated ignored — cosigner half must not live in the browser */
+  encryptedCosignerBackup: _ignoredCosignerBackup = null,
   scheme = MULTISIG_SCHEME,
 }) {
   if (typeof localStorage === 'undefined') return;
@@ -203,29 +306,40 @@ export function saveTwoPartyClientLocal({
       subAddress: String(subAddress).replace(/^0x/i, '').toLowerCase(),
       index: Number(index),
       encryptedClientSecret,
-      encryptedCosignerBackup: encryptedCosignerBackup || null,
       scheme,
       savedAt: Date.now(),
     }),
   );
 }
 
-/** Re-register cosigner from browser backup after Unknown vault. */
-export function restoreCosignerRegisterFromLocal(mainAddress, subAddress, mnemonic) {
-  const local = loadTwoPartyClientLocal(mainAddress, subAddress);
-  if (!local?.encryptedCosignerBackup) return null;
-  try {
-    return decryptJsonWithMnemonic(local.encryptedCosignerBackup, mnemonic);
-  } catch {
-    return null;
-  }
+/**
+ * @deprecated Always returns null. Cosigner half is no longer kept in the browser.
+ * Recovery after cosigner wipe is ops-only (cosigner-restore.mjs).
+ */
+export function restoreCosignerRegisterFromLocal(_mainAddress, _subAddress, _mnemonic) {
+  return null;
 }
 
 export function loadTwoPartyClientLocal(mainAddress, subAddress) {
   if (typeof localStorage === 'undefined') return null;
   try {
     const raw = localStorage.getItem(storageKey(mainAddress, subAddress));
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    // Scrub legacy cosigner-half backups left from older builds
+    if (parsed?.encryptedCosignerBackup) {
+      const { encryptedCosignerBackup: _drop, ...rest } = parsed;
+      try {
+        localStorage.setItem(
+          storageKey(mainAddress, subAddress),
+          JSON.stringify({ ...rest, savedAt: Date.now() }),
+        );
+      } catch {
+        /* */
+      }
+      return rest;
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -245,8 +359,8 @@ export function clearTwoPartyClientLocal(mainAddress, subAddress) {
 //
 // File: user-vault-share.txt — single CryptoJS AES ciphertext (text/plain).
 // Unlock: password only (like warthog_wallet.txt). Never uploaded to cosigner.
-// Inside (after password decrypt): user clientSecret + optional cosignerRegister.
-// Full d is never stored. Cosigner still holds live d_dapp separately.
+// Inside (after password decrypt): **user clientSecret only** (d_user + Paillier sk).
+// Cosigner half (d_dapp) is never written here — only on the cosigner service / ops backup.
 
 /** Logical type inside the encrypted payload (never visible in the .txt). */
 export const VAULT_SHARE_FILE_TYPE = 'cartesi-bridge-vault-share-v1';
@@ -255,7 +369,7 @@ export const VAULT_SHARE_DOWNLOAD_NAME = 'user-vault-share.txt';
 
 /**
  * Build the *plaintext* payload that will be password-AES encrypted into the .txt.
- * Prefer passing clientSecret / cosignerRegister objects (not outer mnemonic wraps).
+ * User half only — any cosignerRegister argument is ignored/discarded.
  */
 export function buildVaultSharePlainPayload({
   mainAddress,
@@ -263,7 +377,8 @@ export function buildVaultSharePlainPayload({
   vaultAddress,
   index,
   clientSecret,
-  cosignerRegister = null,
+  /** @deprecated ignored — never put d_dapp in the share file */
+  cosignerRegister: _ignoredCosignerRegister = null,
   scheme = MULTISIG_SCHEME,
   ownerL1 = null,
 }) {
@@ -281,7 +396,7 @@ export function buildVaultSharePlainPayload({
     .toLowerCase();
   return {
     type: VAULT_SHARE_FILE_TYPE,
-    version: 2,
+    version: 3, // v3 = user half only (no cosignerRegister)
     scheme: scheme || MULTISIG_SCHEME,
     createdAt: Date.now(),
     mainAddress: main || null,
@@ -291,7 +406,6 @@ export function buildVaultSharePlainPayload({
     ownerL1: ownerL1 ? String(ownerL1).toLowerCase() : null,
     /** Plain only inside password-encrypted blob — never written as open JSON */
     clientSecret,
-    cosignerRegister: cosignerRegister || null,
   };
 }
 
@@ -377,15 +491,15 @@ export function buildVaultShareBackupFile(args) {
   return buildVaultSharePlainPayload({
     ...args,
     clientSecret: args.clientSecret,
-    cosignerRegister: args.cosignerRegister,
   });
 }
 
 /**
  * Build plain payload from localStorage (needs mnemonic to unwrap mnemonic-wrapped secrets).
+ * User half only — never exports cosigner material even if legacy storage had it.
  * @returns {object|null}
  */
-export function exportVaultShareBackupFromLocal(
+export async function exportVaultShareBackupFromLocal(
   mainAddress,
   subAddress,
   { ownerL1 = null, mnemonic = null } = {},
@@ -398,17 +512,9 @@ export function exportVaultShareBackupFromLocal(
   }
   let clientSecret;
   try {
-    clientSecret = decryptJsonWithMnemonic(local.encryptedClientSecret, phrase);
+    clientSecret = await decryptJsonWithMnemonic(local.encryptedClientSecret, phrase);
   } catch {
     throw new Error('Cannot unwrap local user share — wrong mnemonic?');
-  }
-  let cosignerRegister = null;
-  if (local.encryptedCosignerBackup) {
-    try {
-      cosignerRegister = decryptJsonWithMnemonic(local.encryptedCosignerBackup, phrase);
-    } catch {
-      cosignerRegister = null;
-    }
   }
   return buildVaultSharePlainPayload({
     mainAddress,
@@ -416,7 +522,6 @@ export function exportVaultShareBackupFromLocal(
     vaultAddress: local.vaultAddress,
     index: local.index,
     clientSecret,
-    cosignerRegister,
     scheme: local.scheme,
     ownerL1,
   });
@@ -424,11 +529,12 @@ export function exportVaultShareBackupFromLocal(
 
 /**
  * Import opaque password .txt (or legacy open JSON v1).
- * Re-wraps secrets with mnemonic into localStorage. Does NOT contact cosigner.
+ * Re-wraps **user half only** into localStorage. Does NOT contact cosigner.
+ * Legacy files that still contain cosignerRegister are accepted but that material is discarded.
  *
- * @returns {{ vaultAddress, subAddress, index, hasCosignerBackup, scheme }}
+ * @returns {{ vaultAddress, subAddress, index, hasCosignerBackup, strippedCosignerMaterial, scheme }}
  */
-export function importVaultShareBackupFile(
+export async function importVaultShareBackupFile(
   raw,
   {
     mainAddress,
@@ -457,25 +563,13 @@ export function importVaultShareBackupFile(
     } else if (file.encryptedClientSecret) {
       let clientSecret;
       try {
-        clientSecret = decryptJsonWithMnemonic(file.encryptedClientSecret, phrase);
+        clientSecret = await decryptJsonWithMnemonic(file.encryptedClientSecret, phrase);
       } catch {
         throw new Error('Legacy vault-share: cannot decrypt with this mnemonic');
-      }
-      let cosignerRegister = null;
-      if (file.encryptedCosignerBackup) {
-        try {
-          cosignerRegister = decryptJsonWithMnemonic(
-            file.encryptedCosignerBackup,
-            phrase,
-          );
-        } catch {
-          /* optional */
-        }
       }
       payload = {
         ...file,
         clientSecret,
-        cosignerRegister,
       };
     } else {
       throw new Error('Legacy vault-share missing user half');
@@ -492,6 +586,12 @@ export function importVaultShareBackupFile(
     throw new Error('Decrypted payload is not a valid 2P client secret');
   }
 
+  // Security: never install cosigner half into the browser, even from old backups
+  const strippedCosignerMaterial = !!(
+    payload.cosignerRegister?.dappShareHex ||
+    payload.encryptedCosignerBackup
+  );
+
   const main = String(mainAddress || payload.mainAddress || '')
     .replace(/^0x/i, '')
     .toLowerCase();
@@ -505,10 +605,7 @@ export function importVaultShareBackupFile(
     .replace(/^0x/i, '')
     .toLowerCase();
 
-  const enc = encryptJsonWithMnemonic(clientSecret, phrase);
-  const encBackup = payload.cosignerRegister
-    ? encryptJsonWithMnemonic(payload.cosignerRegister, phrase)
-    : null;
+  const enc = await encryptJsonWithMnemonic(clientSecret, phrase);
 
   saveTwoPartyClientLocal({
     mainAddress: main,
@@ -516,7 +613,6 @@ export function importVaultShareBackupFile(
     vaultAddress: vault,
     index: payload.index != null ? Number(payload.index) : 0,
     encryptedClientSecret: enc,
-    encryptedCosignerBackup: encBackup,
     scheme: payload.scheme || MULTISIG_SCHEME,
   });
 
@@ -524,7 +620,8 @@ export function importVaultShareBackupFile(
     vaultAddress: vault,
     subAddress: sub,
     index: payload.index != null ? Number(payload.index) : 0,
-    hasCosignerBackup: !!payload.cosignerRegister,
+    hasCosignerBackup: false,
+    strippedCosignerMaterial,
     scheme: payload.scheme || MULTISIG_SCHEME,
   };
 }
@@ -679,16 +776,6 @@ function u64be(n) {
     x >>= 8n;
   }
   return b;
-}
-
-function hexToBytes(hex) {
-  const h = String(hex).replace(/^0x/i, '');
-  if (h.length % 2) throw new Error('odd hex');
-  const out = new Uint8Array(h.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(h.slice(i * 2, i * 2 + 2), 16);
-  }
-  return out;
 }
 
 function concatBytes(...parts) {

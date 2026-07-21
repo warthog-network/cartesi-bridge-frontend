@@ -1795,9 +1795,9 @@ const WarthogWallet = ({
                   <summary>Capacity details</summary>
                   <div className="wh-details-body">
                     <p className="wh-hint">
-                      Shared pool: locked WART → capacity. Mint uses capacity (Used ↑). Depositing
-                      MetaMask wWART back is inventory only (Used unchanged). Burn frees Available.
-                      Release locked WART (Bridge) is optional and separate from burn.
+                      Shared pool: locked WART → capacity. Mint uses capacity (Used ↑). Open
+                      claims can burn immediately; filled claims (MetaMask ERC-20) need deposit
+                      back before burn frees Available. Release locked WART is separate.
                     </p>
                     <div className="wh-stat-grid">
                       <div className="wh-stat">
@@ -1805,8 +1805,18 @@ const WarthogWallet = ({
                         <span className="wh-stat-value">{mintCap.liquid}</span>
                       </div>
                       <div className="wh-stat">
-                        <span className="wh-stat-label">wWART claims</span>
+                        <span className="wh-stat-label">wWART claims (total)</span>
                         <span className="wh-stat-value">{mintCap.claim || '0'}</span>
+                      </div>
+                      <div className="wh-stat">
+                        <span className="wh-stat-label">Open / filled</span>
+                        <span className="wh-stat-value">
+                          {mintCap.openClaim || '0'} / {mintCap.filledClaim || '0'}
+                        </span>
+                      </div>
+                      <div className="wh-stat">
+                        <span className="wh-stat-label">Burnable now</span>
+                        <span className="wh-stat-value">{mintCap.burnableClaim || '0'}</span>
                       </div>
                       <div className="wh-stat">
                         <span className="wh-stat-label">MetaMask wWART</span>
@@ -2058,22 +2068,36 @@ const WarthogWallet = ({
 
                 <details className="wh-details">
                   <summary>
-                    Burn wWART claims (free capacity) · claims {mintCap.claim || '0'}
+                    Burn wWART claims (free capacity) · burnable{' '}
+                    {mintCap.burnableClaim || '0'} / total {mintCap.claim || '0'}
                   </summary>
                   <div className="wh-details-body">
                     <p className="wh-hint">
-                      Backend frees <strong>Used</strong> capacity when you burn the claim.
-                      Depositing MetaMask wWART first only restores rollup balance — it does not
-                      free Available. After burn you may optionally <strong>Release</strong>{' '}
-                      locked WART on Bridge (unlock collateral → Vault → main).
+                      <strong>Open</strong> claims ({mintCap.openClaim || '0'}) are still on the
+                      rollup (not withdrawn) — burn frees Used immediately.{' '}
+                      <strong>Filled</strong> claims ({mintCap.filledClaim || '0'}) already
+                      minted ERC-20 to MetaMask — deposit that wWART back first, then burn.
+                      Burnable now: <strong>{mintCap.burnableClaim || '0'}</strong>
+                      {mmWwartBal != null ? ` · MetaMask wWART ${mmWwartBal}` : ''}.
                     </p>
+                    {Number(mintCap.filledClaim || 0) > 0 &&
+                      Number(mintCap.burnableClaim || 0) < claimNum && (
+                        <p className="wh-hint" style={{ color: 'var(--warning, #e79300)' }}>
+                          {mintCap.filledClaim} claim is filled on L1. Portal-deposit MetaMask
+                          wWART, then burn — you cannot free Available while ERC-20 is still out.
+                        </p>
+                      )}
                     <div className="wh-inline-burn">
                       <input
                         type="number"
                         step="any"
                         min="0"
                         placeholder={
-                          claimNum > 0 ? `Burn ≤ ${mintCap.claim}` : 'No wWART claims'
+                          Number(mintCap.burnableClaim || 0) > 0
+                            ? `Burn ≤ ${mintCap.burnableClaim}`
+                            : claimNum > 0
+                              ? 'Deposit L1 wWART first'
+                              : 'No wWART claims'
                         }
                         value={burnWwartAmt}
                         onChange={(e) => setBurnWwartAmt(e.target.value)}
@@ -2082,8 +2106,8 @@ const WarthogWallet = ({
                       <button
                         type="button"
                         className="btn secondary small"
-                        disabled={claimNum <= 0}
-                        onClick={() => setBurnWwartAmt(mintCap.claim || '0')}
+                        disabled={Number(mintCap.burnableClaim || 0) <= 0}
+                        onClick={() => setBurnWwartAmt(mintCap.burnableClaim || '0')}
                       >
                         Max
                       </button>
@@ -2092,8 +2116,14 @@ const WarthogWallet = ({
                         onClick={async () => {
                           if (!burnWwartAmt || Number(burnWwartAmt) <= 0) return;
                           let amt = String(burnWwartAmt).trim();
-                          if (Number(amt) > claimNum + 1e-12) {
-                            amt = mintCap.claim;
+                          const maxBurn = Number(mintCap.burnableClaim || 0);
+                          if (maxBurn <= 0) {
+                            return toast.error(
+                              'No burnable claims — deposit MetaMask wWART first if claims are filled on L1',
+                            );
+                          }
+                          if (Number(amt) > maxBurn + 1e-12) {
+                            amt = mintCap.burnableClaim;
                             setBurnWwartAmt(amt);
                           }
                           try {
@@ -2117,7 +2147,7 @@ const WarthogWallet = ({
                               throw sendErr;
                             }
                             toast.success(
-                              `Burned ${amt} wWART claim · capacity freed (same pool as WLIQ)`,
+                              `Burned ${amt} wWART claim · capacity freed (open/returned inventory only)`,
                               { duration: 6000 },
                             );
                           } catch (e) {
@@ -2126,7 +2156,11 @@ const WarthogWallet = ({
                           setTimeout(refreshAll, 4000);
                         }}
                         className="btn danger small"
-                        disabled={!burnWwartAmt || propLoading || claimNum <= 0}
+                        disabled={
+                          !burnWwartAmt ||
+                          propLoading ||
+                          Number(mintCap.burnableClaim || 0) <= 0
+                        }
                       >
                         Burn wWART claims
                       </button>

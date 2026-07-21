@@ -44,7 +44,7 @@ function buildWartTransferHashLocal({ pinHash, pinHeight, nonceId, feeE8, toAddr
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(__dirname, '../../../.data');
-const STORE_PATH = path.join(DATA_DIR, 'threshold-shares.json');
+const PLAIN_FORBIDDEN = path.join(DATA_DIR, 'threshold-shares.json');
 const CURVE_N = secp256k1.CURVE.n;
 
 const GRAPHQL_URL =
@@ -59,23 +59,31 @@ const INSPECT_URL =
 const REQUIRE_TICKETS = process.env.COSIGNER_REQUIRE_TICKETS === '1';
 const ALLOW_FORCE = process.env.COSIGNER_ALLOW_FORCE === '1';
 
-function ensureStore() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(STORE_PATH)) {
-    fs.writeFileSync(STORE_PATH, JSON.stringify({ vaults: {} }, null, 2));
+// Encrypted vault store only (same as Rust cosigner / cosigner-node). Never write plaintext.
+import { createSecureStore } from '../../../../cosigner-node/secureStore.mjs';
+const secure = createSecureStore(DATA_DIR);
+
+function scrubPlaintextShares() {
+  try {
+    if (fs.existsSync(PLAIN_FORBIDDEN)) {
+      const bak = PLAIN_FORBIDDEN + '.scrubbed.' + Date.now();
+      fs.renameSync(PLAIN_FORBIDDEN, bak);
+      fs.chmodSync(bak, 0o600);
+      console.warn('[cosigner.local] moved plaintext threshold-shares.json →', bak);
+    }
+  } catch (e) {
+    console.warn('[cosigner.local] scrub plaintext failed', e?.message || e);
   }
 }
+scrubPlaintextShares();
+
 function readStore() {
-  ensureStore();
-  try {
-    return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8'));
-  } catch {
-    return { vaults: {} };
-  }
+  const mem = secure.loadMemory();
+  return { vaults: mem.vaults || {} };
 }
 function writeStore(store) {
-  ensureStore();
-  fs.writeFileSync(STORE_PATH, JSON.stringify(store, null, 2));
+  secure.saveMemory({ vaults: store.vaults || {} });
+  scrubPlaintextShares();
 }
 function json(status, body) {
   return new Response(JSON.stringify(body), {
@@ -165,11 +173,11 @@ async function fetchOutstandingFromGraphQL({ vaultAddress, subAddress }) {
   const sub = normAddr(subAddress);
   let minted = 0n;
   let burned = 0n;
-  let lastRemaining = null;
-  let unlocked = false;
   let matches = 0;
-  let ticketSum = 0n;
-  let ticketCount = 0;
+  // Tickets only in current pin epoch (reset on re-lock after full unlock)
+  let epochTicketSum = 0n;
+  let epochTicketCount = 0;
+  let runningOutstanding = 0n;
 
   for (const e of edges) {
     const n = decodeNoticePayload(e?.node?.payload);
@@ -180,12 +188,18 @@ async function fetchOutstandingFromGraphQL({ vaultAddress, subAddress }) {
     matches++;
     if (n.type === 'sweep_locked' && n.mintedE8 != null) {
       try {
-        minted += BigInt(String(n.mintedE8));
+        const m = BigInt(String(n.mintedE8));
+        minted += m;
+        if (runningOutstanding === 0n && m > 0n) {
+          epochTicketSum = 0n;
+          epochTicketCount = 0;
+        }
+        runningOutstanding += m;
       } catch {
         /* */
       }
     }
-    if (n.type === 'spoofed_wwart_burned') {
+    if (n.type === 'spoofed_wwart_burned' || n.type === 'subwallet_unlocked') {
       if (n.burnedE8 != null) {
         try {
           burned += BigInt(String(n.burnedE8));
@@ -193,34 +207,41 @@ async function fetchOutstandingFromGraphQL({ vaultAddress, subAddress }) {
           /* */
         }
       }
-      if (n.remainingMintedE8 != null) {
+      if (n.remainingMintedE8 != null && n.remainingMintedE8 !== '') {
         try {
-          lastRemaining = BigInt(String(n.remainingMintedE8));
+          runningOutstanding = BigInt(String(n.remainingMintedE8));
+        } catch {
+          /* */
+        }
+      } else if (n.type === 'subwallet_unlocked') {
+        runningOutstanding = 0n;
+      } else if (n.burnedE8 != null) {
+        try {
+          const b = BigInt(String(n.burnedE8));
+          runningOutstanding = runningOutstanding > b ? runningOutstanding - b : 0n;
         } catch {
           /* */
         }
       }
-    }
-    if (n.type === 'subwallet_unlocked') {
-      unlocked = true;
-      lastRemaining = 0n;
+      if (n.type === 'subwallet_unlocked') runningOutstanding = 0n;
     }
     if (n.type === 'release_ticket' && n.amountE8 != null) {
       try {
-        ticketSum += BigInt(String(n.amountE8));
-        ticketCount++;
+        epochTicketSum += BigInt(String(n.amountE8));
+        epochTicketCount++;
       } catch {
         /* */
       }
     }
   }
 
-  let outstanding;
-  if (unlocked || lastRemaining === 0n) outstanding = 0n;
-  else if (lastRemaining != null) outstanding = lastRemaining;
-  else outstanding = minted > burned ? minted - burned : 0n;
+  // mint−burn sum: unlock-then-re-lock must re-pin (never sticky-zero from old unlock)
+  const outstanding = minted > burned ? minted - burned : 0n;
+  void runningOutstanding;
 
-  const freeableBase = ticketSum > 0n ? ticketSum : burned;
+  const ticketSum = epochTicketSum;
+  const ticketCount = epochTicketCount;
+  const freeableBase = ticketSum > 0n ? ticketSum : 0n;
   return {
     source: 'graphql',
     graphqlUrl: GRAPHQL_URL,

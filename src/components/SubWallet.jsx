@@ -12,10 +12,10 @@ import {
   createTwoPartyVault,
   encryptJsonWithMnemonic,
   decryptJsonWithMnemonic,
+  isAesGcmClientSecretBlob,
   saveTwoPartyClientLocal,
   loadTwoPartyClientLocal,
   clearTwoPartyClientLocal,
-  restoreCosignerRegisterFromLocal,
   buildVaultSharePlainPayload,
   downloadVaultShareBackupFile,
   exportVaultShareBackupFromLocal,
@@ -26,7 +26,6 @@ import {
 } from '../utils/twoPartyEcdsa.js';
 import { registerMultiSigVault, cosignerStatus } from '../utils/cosignerClient.js';
 import { multiSigTransferWart } from '../utils/multiSigTransfer.js';
-import { deriveVaultWallet } from '../utils/vaultDerive.js';
 import { getSmartNonce, bumpNonceAfterSuccess } from '../utils/cancelLimitOrder.js';
 import { computeWliqMintAvailable } from '../utils/wliqCapacity.js';
 import { SHARE_TOKEN } from '../utils/tokenNames.js';
@@ -233,7 +232,7 @@ function SubWallet({
    * Download opaque password-encrypted user-vault-share.txt (WartBunker-style).
    * Never uploads to cosigner/server — trust model intact.
    */
-  const downloadVaultShareBackup = (sub) => {
+  const downloadVaultShareBackup = async (sub) => {
     const mainAddr = mainWallet?.address || address;
     if (!mainAddr) return toast.error('Unlock main Warthog wallet first');
     if (!sub?.address) return toast.error('No sub-wallet');
@@ -249,7 +248,7 @@ function SubWallet({
       }
       if (!password) return toast('Download cancelled — no password');
 
-      const plain = exportVaultShareBackupFromLocal(mainAddr, sub.address, {
+      const plain = await exportVaultShareBackupFromLocal(mainAddr, sub.address, {
         ownerL1: l1Address,
         mnemonic: mainMnemonic,
       });
@@ -261,7 +260,7 @@ function SubWallet({
       }
       const name = downloadVaultShareBackupFile(plain, password);
       toast.success(
-        `Downloaded ${name} — opaque password blob (like warthog_wallet.txt). Cosigner still holds d_dapp separately.`,
+        `Downloaded ${name} — user half only (password blob). Cosigner half stays on the cosigner; not in this file.`,
         { duration: 9000 },
       );
     } catch (e) {
@@ -282,7 +281,7 @@ function SubWallet({
       return toast.error('Mnemonic required to install vault share into this browser');
     }
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       try {
         const text = String(reader.result || '');
         const isLegacyJson = text.trim().startsWith('{');
@@ -291,7 +290,7 @@ function SubWallet({
           password = promptVaultSharePassword('decrypt');
           if (!password) return toast('Import cancelled — no password');
         }
-        const result = importVaultShareBackupFile(text, {
+        const result = await importVaultShareBackupFile(text, {
           mainAddress: mainAddr,
           mnemonic: mainMnemonic,
           password,
@@ -311,12 +310,31 @@ function SubWallet({
                 : s,
             ),
           );
+          // Refresh balance so funded old vault shows immediately after import
+          try {
+            const bal = await fetchBalanceAndNonce(result.vaultAddress, true);
+            setSubWallets((prev) =>
+              prev.map((s) =>
+                s.index === sub.index
+                  ? {
+                      ...s,
+                      vaultBalance: bal.balance || '0',
+                      vaultSpendable: bal.spendable || bal.balance || '0',
+                      vaultBalanceAt: Date.now(),
+                    }
+                  : s,
+              ),
+            );
+          } catch {
+            /* ignore */
+          }
         }
         toast.success(
           `Imported user share for vault ${String(result.vaultAddress).slice(0, 12)}…` +
-            (result.hasCosignerBackup
-              ? ' (cosigner re-register material included — still separate from user half)'
-              : ''),
+            (result.strippedCosignerMaterial
+              ? ' (legacy cosigner half in file was discarded — not stored in browser)'
+              : ' (user half only). Use Load if cosigner check is needed.') +
+            ` Balance refresh attempted.`,
           { duration: 9000 },
         );
       } catch (e) {
@@ -930,12 +948,8 @@ function SubWallet({
   };
 
   /**
-   * Withdraw vault → main.
-   * 1) Multi-sig 2P path when cosigner still has this vault
-   * 2) Legacy mnemonic-derived vault (vaultDerive) if address matches
-   *
-   * Note: "Force UI unlock" only clears local lock flags — it does not move keys
-   * or restore cosigner shares. After rollup wipe, multi-sig still needs cosigner.
+   * Withdraw vault → main via multi-sig 2P only (cosigner + user half).
+   * Force UI unlock only clears local flags — does not restore cosigner shares.
    */
   const withdrawVaultToMain = async (sub) => {
     const vaultAddr = (sub.vaultAddress || sub.pendingVaultAddress || '')
@@ -948,9 +962,43 @@ function SubWallet({
       return toast.error('Main Warthog address required as recipient');
     }
 
-    // Force UI unlock only clears UI; if mintedE8 still set, user may still hit freeable checks.
-    // Treat explicit full free as spendable when live balance exists and user cleared UI lock.
-    const outstandingE8 = BigInt(sub.mintedE8 || '0');
+    // Live pin from rollup — never trust stale localStorage / Force UI unlock alone.
+    // (Historical subwallet_unlocked + re-lock used to leave mintedE8=0 and open full withdraw.)
+    let outstandingE8 = 0n;
+    try {
+      const rebuilt = await rebuildOutstandingE8FromNotices(sub.address);
+      if (rebuilt?.outstandingE8 != null) {
+        outstandingE8 = BigInt(String(rebuilt.outstandingE8));
+      }
+    } catch {
+      try {
+        outstandingE8 = BigInt(sub.mintedE8 || '0');
+      } catch {
+        outstandingE8 = 0n;
+      }
+    }
+    // Also prefer L1 inspect snapshot when parent passed it (authoritative dApp counters)
+    try {
+      const inspOut = l1Vault?.outstandingE8;
+      if (inspOut != null && BigInt(String(inspOut)) > outstandingE8) {
+        outstandingE8 = BigInt(String(inspOut));
+      }
+    } catch {
+      /* */
+    }
+    // Keep UI in sync with live pin
+    setSubWallets((prev) =>
+      prev.map((s) =>
+        s.index === sub.index
+          ? {
+              ...s,
+              mintedE8: outstandingE8.toString(),
+              locked: outstandingE8 > 0n,
+            }
+          : s,
+      ),
+    );
+
     const mainAddr = mainWallet?.address || address;
 
     setIsVaultWithdrawing((prev) => ({ ...prev, [sub.index]: true }));
@@ -969,6 +1017,8 @@ function SubWallet({
                 vaultBalance: liveTotal,
                 vaultSpendable: liveSpendable,
                 vaultBalanceAt: Date.now(),
+                mintedE8: outstandingE8.toString(),
+                locked: outstandingE8 > 0n,
               }
             : s,
         ),
@@ -987,13 +1037,18 @@ function SubWallet({
           const freeE8 = balE8 > outstandingE8 ? balE8 - outstandingE8 : 0n;
           freeable = e8ToWartDisplay(freeE8);
         } catch {
-          freeable = freeableVaultWart({ ...sub, vaultBalance: liveSpendable });
+          freeable = freeableVaultWart({
+            ...sub,
+            vaultBalance: liveSpendable,
+            mintedE8: outstandingE8.toString(),
+          });
         }
       }
       if (outstandingE8 > 0n && Number(freeable) <= 0) {
         throw new Error(
-          'Nothing withdrawable yet — release locked WART first, or use Force UI unlock only after rollup wipe (then locked should be 0 in UI). ' +
-            'Force unlock does not move coins by itself.',
+          `Vault is pinned: ${e8ToWartDisplay(outstandingE8)} WART still locked as collateral ` +
+            `(rollup outstanding / WLIQ capacity). Release locked WART first (burn/unlock spoofed), ` +
+            `then withdraw freeable only. Force UI unlock does not free coins.`,
         );
       }
 
@@ -1040,41 +1095,38 @@ function SubWallet({
             }
           }
 
-          // Unknown vault → re-push d_dapp from encrypted browser backup (if we have it)
+          // Unknown vault → browser no longer holds d_dapp; recovery is ops-only
           if (needRestore) {
-            const backup = restoreCosignerRegisterFromLocal(
-              mainWallet?.address || address,
-              sub.address,
-              mainMnemonic,
+            throw new Error(
+              'COSIGNER_MISSING: Cosigner says Unknown vault (no d_dapp for this address). ' +
+                'The browser does not store the cosigner half (split-key). ' +
+                'Restore from ops cosigner backup (cosigner-restore.mjs), then retry. ' +
+                'Multi-sig cannot sign this address without the server-side d_dapp. ' +
+                'Will try legacy secret-derived key next — if this was a 2P multi-sig vault, ' +
+                'only ops cosigner restore recovers the old address.',
             );
-            if (backup?.dappShareHex && backup?.ckey) {
-              toast.loading('Cosigner lost vault — restoring share from browser backup…', {
-                id: toastId,
-              });
-              await registerMultiSigVault({
-                ...backup,
-                vaultAddress: vaultAddr,
-                owner: l1Address.toLowerCase(),
-                subAddress: sub.address,
-                index: sub.index,
-                mainAddress: mainAddr,
-                allowedTo: [mainAddr],
-              });
-              toast.loading('Cosigner restored — signing multi-sig…', { id: toastId });
-            } else {
-              throw new Error(
-                'COSIGNER_MISSING: Cosigner says Unknown vault (no d_dapp for this address). ' +
-                  'This browser has no encrypted cosigner backup either (vault created before backup feature). ' +
-                  'Multi-sig cannot sign this address. Will try legacy secret-derived key next — ' +
-                  'if this was a 2P multi-sig vault, funds need an old cosigner backup file.',
-              );
-            }
           }
 
-          const clientSecret = decryptJsonWithMnemonic(
+          const clientSecret = await decryptJsonWithMnemonic(
             local.encryptedClientSecret,
             mainMnemonic,
           );
+          // Transparent upgrade: re-wrap XOR-era secrets as AES-GCM v2
+          if (!isAesGcmClientSecretBlob(local.encryptedClientSecret)) {
+            try {
+              const rewrapped = await encryptJsonWithMnemonic(clientSecret, mainMnemonic);
+              saveTwoPartyClientLocal({
+                mainAddress: mainWallet?.address || address,
+                subAddress: sub.address,
+                vaultAddress: vaultAddr,
+                index: sub.index,
+                encryptedClientSecret: rewrapped,
+                scheme: MULTISIG_SCHEME,
+              });
+            } catch {
+              /* non-fatal */
+            }
+          }
           toast.loading('Co-signer pin check + 2P-ECDSA multi-sig…', { id: toastId });
           const result = await multiSigTransferWart({
             nodeBase: selectedNode,
@@ -1112,88 +1164,22 @@ function SubWallet({
         } catch (e) {
           multiSigErr = e;
           console.warn('[vault withdraw] multi-sig failed', e);
-          const m = String(e?.message || e);
-          // Policy / pin failures must NOT fall through to legacy full-key path
-          // (that would bypass COSIGNER_REQUIRE_TICKETS and freeable caps).
-          if (
-            /COSIGNER_REQUIRE_TICKETS|release_ticket|ticket-backed|ticket sum|freeable|outstanding|Insufficient|Pin held|Pin:|amountE8|Nothing freeable|Mnemonic|owner mismatch|not allowed|Destination not allowed|hashHex does not match/i.test(
-              m,
-            )
-          ) {
-            throw e;
-          }
-          // Only fall through to legacy on Unknown vault / missing cosigner share
-          if (
-            !/COSIGNER_MISSING|Unknown vault|unknown vault|Missing 2P|recreate multi-sig|no encrypted cosigner backup/i.test(
-              m,
-            )
-          ) {
-            // Other multi-sig errors: still surface (do not silent-bypass policy)
-            throw e;
-          }
+          throw e;
         }
       }
 
-      // --- Legacy secret-derived vault (vaultDerive) ---
-      toast.loading('Trying legacy mnemonic vault key…', { id: toastId });
-      const derived = deriveVaultWallet({
-        mnemonic: mainMnemonic,
-        subAddress: sub.address,
-        index: sub.index,
-      });
-      const derivedAddr = String(derived.address).replace(/^0x/i, '').toLowerCase();
-      const vaultNorm = vaultAddr.length === 48 ? vaultAddr.slice(0, 40) : vaultAddr;
-      const derNorm = derivedAddr.length === 48 ? derivedAddr.slice(0, 40) : derivedAddr;
-
-      if (derNorm !== vaultNorm && derivedAddr !== vaultAddr) {
-        const hint = multiSigErr
-          ? ` Multi-sig failed: ${String(multiSigErr.message || multiSigErr).slice(0, 160)}`
-          : multiSigTried
-            ? ''
-            : ' No 2P client secret on this browser.';
+      if (!local?.encryptedClientSecret) {
         throw new Error(
-          `Cannot spend this vault. Address is not your legacy secret-derived vault for sub #${sub.index}, ` +
-            `and multi-sig cosigner cannot help (often after VPS redeploy / Force UI unlock alone). ` +
-            `Derived would be ${derivedAddr.slice(0, 12)}… but vault is ${vaultAddr.slice(0, 12)}….` +
-            hint +
-            ` If this was multi-sig and cosigner lost d_dapp, funds need cosigner backup — creating a NEW vault will not recover the old address.`,
+          'No 2P client secret on this browser for this sub. Load/create multi-sig vault first, ' +
+            'or Import vault share. Cosigner 2P-ECDSA is required.',
         );
       }
-
-      const api = await createWarthogApi(selectedNode);
-      const nonceId = getSmartNonce(vaultAddr, 0);
-      toast.loading('Signing legacy vault → main…', { id: toastId });
-      const { nonce, data } = await signAndSubmitTransaction(api, {
-        privateKey: derived.privateKey,
-        nonceId,
-        buildSpec: {
-          type: 'WART_TRANSFER',
-          toAddress: mainAddr,
-          amount: String(amount).trim(),
-        },
-      });
-      bumpNonceAfterSuccess(vaultAddr, nonce, 0);
-      const txHash = data?.txHash || data?.hash;
-      if (!txHash) throw new Error('Node accepted legacy transfer but no tx hash returned');
-
-      toast.success(`Legacy vault → main: ${String(txHash).slice(0, 12)}…`, {
-        id: toastId,
-        duration: 6000,
-      });
-      setVaultWithdrawAmounts((prev) => ({ ...prev, [sub.index]: '' }));
-
-      const refreshed = await fetchBalanceAndNonce(vaultAddr, true);
-      setSubWallets((prev) =>
-        prev.map((s) =>
-          s.index === sub.index
-            ? {
-                ...s,
-                vaultBalance: refreshed.balance || refreshed.spendable || '0',
-                vaultSpendable: refreshed.spendable || refreshed.balance || '0',
-                vaultBalanceAt: Date.now(),
-              }
-            : s,
-        ),
+      if (multiSigTried && multiSigErr) {
+        throw multiSigErr;
+      }
+      throw new Error(
+        'Multi-sig vault withdraw requires MetaMask L1 owner + cosigner. ' +
+          (multiSigErr ? String(multiSigErr.message || multiSigErr).slice(0, 200) : ''),
       );
     } catch (err) {
       toast.error('Vault withdraw failed: ' + (err.message || err), {
@@ -1328,7 +1314,11 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
   /**
    * Rebuild locked outstanding (E8) for a sub from full notice history.
    * minted = sum(sweep_locked.mintedE8), burned = sum(spoofed burns).
-   * Source of truth after partial releases — do not trust a single stale notice.
+   *
+   * CRITICAL: do NOT treat a historical `subwallet_unlocked` as permanent.
+   * Unlock-then-re-lock (sweep_locked after full release) must restore pin:
+   * outstanding = sum(mints) − sum(burns) across the whole stream.
+   * A sticky fullyUnlocked flag left UI at 0 after re-locking 100 WART.
    */
   const rebuildOutstandingE8FromNotices = async (subAddress, { last = 120 } = {}) => {
     const subNorm = String(subAddress || '')
@@ -1342,7 +1332,8 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
     let minted = 0n;
     let burned = 0n;
     let lastBurnNotice = null;
-    let fullyUnlocked = false;
+    // Chronological running pin (GraphQL last:N is oldest→newest on this stack)
+    let runningOutstanding = 0n;
     for (const e of notices?.edges || []) {
       const n = parseNoticePayload(e.node.payload);
       if (!n?.type) continue;
@@ -1352,7 +1343,9 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
       if (nSub && nSub !== subNorm) continue;
       if (n.type === 'sweep_locked' && n.mintedE8 != null) {
         try {
-          minted += BigInt(String(n.mintedE8));
+          const m = BigInt(String(n.mintedE8));
+          minted += m;
+          runningOutstanding += m; // re-lock after unlock re-pins
         } catch {
           /* */
         }
@@ -1361,28 +1354,36 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
         n.burnedE8 != null
       ) {
         try {
-          burned += BigInt(String(n.burnedE8));
+          const b = BigInt(String(n.burnedE8));
+          burned += b;
+          if (n.remainingMintedE8 != null && n.remainingMintedE8 !== '') {
+            runningOutstanding = BigInt(String(n.remainingMintedE8));
+          } else if (n.type === 'subwallet_unlocked') {
+            runningOutstanding = 0n;
+          } else {
+            runningOutstanding =
+              runningOutstanding > b ? runningOutstanding - b : 0n;
+          }
         } catch {
           /* */
         }
         // Keep the newest burn notice (GraphQL last:N is oldest→newest on this stack)
         lastBurnNotice = n;
-        if (n.type === 'subwallet_unlocked' || String(n.remainingMintedE8 || '') === '0') {
-          fullyUnlocked = true;
-        }
+      } else if (n.type === 'subwallet_unlocked') {
+        runningOutstanding = 0n;
+        lastBurnNotice = n;
       }
     }
-    const outstandingE8 = fullyUnlocked
-      ? 0n
-      : minted > burned
-        ? minted - burned
-        : 0n;
+    // Prefer sum(mint−burn); running stream is a cross-check for remainingMintedE8 paths
+    const bySum = minted > burned ? minted - burned : 0n;
+    const outstandingE8 = bySum;
     return {
       outstandingE8: outstandingE8.toString(),
       mintedE8: minted.toString(),
       burnedE8: burned.toString(),
       lastBurnNotice,
-      fullyUnlocked: fullyUnlocked || outstandingE8 === 0n,
+      runningOutstandingE8: runningOutstanding.toString(),
+      fullyUnlocked: outstandingE8 === 0n,
     };
   };
 
@@ -1731,10 +1732,14 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
           cosignerOk = true;
         } catch (e) {
           // Client only has d_user; cosigner holds d_dapp. If cosigner store was
-          // wiped (empty .data/threshold-shares.json), this vault cannot sign —
-          // re-keygen is required (new vault address).
+          // wiped, this vault cannot sign — re-keygen is required (new address).
+          // Do NOT treat proxy/upstream errors as "unknown vault" (that wiped
+          // valid local shares when /api/cosigner accidentally used local fallback).
           const msg = String(e?.message || e);
-          if (/unknown vault|404|not found/i.test(msg)) {
+          if (
+            /unknown vault|Unknown vault/i.test(msg) &&
+            !/unreachable|502|503|ECONNREFUSED|fetch failed|network/i.test(msg)
+          ) {
             console.warn(
               `[2p-ecdsa] Cosigner has no material for ${vaultAddr}; clearing local and re-keygen`,
             );
@@ -1745,7 +1750,11 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
               { id: toastId },
             );
           } else {
-            throw e;
+            throw new Error(
+              `Cosigner check failed: ${msg}. ` +
+                `If this is a network/proxy error, fix /api/cosigner → COSIGNER_UPSTREAM ` +
+                `(do not re-keygen — your vault may still be valid).`,
+            );
           }
         }
       }
@@ -1757,20 +1766,18 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
           owner: l1Address,
         });
         vaultAddr = vault.address;
-        const enc = encryptJsonWithMnemonic(vault.clientSecret, mainMnemonic);
-        // Backup cosigner half encrypted — recover after VPS/cosigner wipe (same vault)
-        const encBackup = encryptJsonWithMnemonic(vault.cosignerRegister, mainMnemonic);
+        // User half only in browser. Cosigner half is sent once to cosigner below, never stored client-side.
+        const enc = await encryptJsonWithMnemonic(vault.clientSecret, mainMnemonic);
         saveTwoPartyClientLocal({
           mainAddress: mainAddr,
           subAddress: sub.address,
           vaultAddress: vault.address,
           index: sub.index,
           encryptedClientSecret: enc,
-          encryptedCosignerBackup: encBackup,
           scheme: vault.scheme,
         });
 
-        // Offline opaque user-vault-share.txt (password AES, WartBunker-style). Client-only.
+        // Offline opaque user-vault-share.txt — user half only (WartBunker-style password blob).
         try {
           let password;
           try {
@@ -1786,13 +1793,12 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
               vaultAddress: vault.address,
               index: sub.index,
               clientSecret: vault.clientSecret,
-              cosignerRegister: vault.cosignerRegister,
               scheme: vault.scheme,
               ownerL1: l1Address,
             });
             const fname = downloadVaultShareBackupFile(plain, password);
             toast.success(
-              `Save offline: ${fname} — password-encrypted blob. Cosigner keeps d_dapp separately.`,
+              `Save offline: ${fname} — user half only. Cosigner half is only on the cosigner (ops backup).`,
               { duration: 10000 },
             );
           } else {
@@ -2321,6 +2327,50 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
    * Render vault card as a function (not an inner component).
    * Inner components remount on every keystroke and close <details> / blur inputs.
    */
+  /** Import/download user half — must be available even when vault is hidden (no vault card body). */
+  const renderVaultShareControls = (sub, { compact = false } = {}) => (
+    <div
+      className="sw-vault-share-backup"
+      style={compact ? { marginTop: '0.5rem' } : undefined}
+    >
+      {!compact && (
+        <p className="wh-hint sw-l1-track-hint" style={{ marginBottom: '0.5rem' }}>
+          <strong>Vault share</strong> — restore an old multi-sig vault (e.g. funded address) with{' '}
+          <code>{VAULT_SHARE_DOWNLOAD_NAME}</code>. Import works before Load; cosigner must still
+          know that vault.
+        </p>
+      )}
+      <div className="sw-row-actions" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+        <label
+          className="btn secondary small"
+          style={{ cursor: loading ? 'not-allowed' : 'pointer', margin: 0 }}
+          title="Import user-vault-share.txt (password) into this browser"
+        >
+          Import vault share…
+          <input
+            type="file"
+            accept=".txt,text/plain,application/json,.json"
+            style={{ display: 'none' }}
+            disabled={loading}
+            onChange={(e) => {
+              importVaultShareBackup(sub, e.target.files);
+              e.target.value = '';
+            }}
+          />
+        </label>
+        <button
+          type="button"
+          className="btn secondary small"
+          onClick={() => downloadVaultShareBackup(sub)}
+          disabled={loading}
+          title="Download password-encrypted user half for this sub’s current local vault"
+        >
+          Download vault share
+        </button>
+      </div>
+    </div>
+  );
+
   const renderVaultCard = (sub) => {
     const vaultAddr = sub.pendingVaultAddress || sub.vaultAddress;
     if (!vaultAddr) {
@@ -2329,15 +2379,21 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
           <div className="sw-card-head">
             <h4 className="sw-card-title">Vault</h4>
           </div>
-          <p className="sw-card-empty-msg">No vault yet — create multi-sig vault to sweep &amp; mint.</p>
-          <button
-            type="button"
-            className="btn primary small"
-            onClick={() => loadOrCreateVault(sub)}
-            disabled={loading || isUnlocking[sub.index]}
-          >
-            Load / create vault
-          </button>
+          <p className="sw-card-empty-msg">
+            No vault shown — Load restores this browser’s multi-sig vault, or Import a saved share
+            for a funded address (then Load).
+          </p>
+          <div className="sw-card-toolbar" style={{ flexWrap: 'wrap', gap: '0.5rem' }}>
+            <button
+              type="button"
+              className="btn primary small"
+              onClick={() => loadOrCreateVault(sub)}
+              disabled={loading || isUnlocking[sub.index]}
+            >
+              Load / create vault
+            </button>
+          </div>
+          {renderVaultShareControls(sub)}
         </div>
       );
     }
@@ -2446,40 +2502,14 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
           </div>
         </div>
 
-        {/* Offline vault-share — opaque password .txt (WartBunker-style); never uploaded */}
+        {/* Offline vault-share — also on empty vault / sub card when hidden */}
         <div className="sw-card-actions sw-vault-share-backup">
           <p className="wh-hint sw-l1-track-hint" style={{ marginBottom: '0.5rem' }}>
             <strong>Vault share backup</strong> — your half of the key is only in this browser.
             Download <code>{VAULT_SHARE_DOWNLOAD_NAME}</code> as an opaque password blob (like{' '}
             <code>warthog_wallet.txt</code>). Cosigner still holds <code>d_dapp</code> separately.
           </p>
-          <div className="sw-row-actions" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-            <button
-              type="button"
-              className="btn secondary small"
-              onClick={() => downloadVaultShareBackup(sub)}
-              disabled={loading}
-              title="Download password-encrypted user-vault-share.txt"
-            >
-              Download vault share
-            </button>
-            <label
-              className="btn secondary small"
-              style={{ cursor: 'pointer', margin: 0 }}
-              title="Import user-vault-share.txt into this browser only"
-            >
-              Import vault share…
-              <input
-                type="file"
-                accept=".txt,text/plain,application/json,.json"
-                style={{ display: 'none' }}
-                onChange={(e) => {
-                  importVaultShareBackup(sub, e.target.files);
-                  e.target.value = '';
-                }}
-              />
-            </label>
-          </div>
+          {renderVaultShareControls(sub, { compact: true })}
         </div>
 
         <details
@@ -3245,7 +3275,7 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                 </div>
               </div>
 
-              <div className="sw-card-toolbar">
+              <div className="sw-card-toolbar" style={{ flexWrap: 'wrap', gap: '0.5rem' }}>
                 <button
                   type="button"
                   className="btn primary small"
@@ -3265,6 +3295,12 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                   </button>
                 )}
               </div>
+              {/* Import must work with vault hidden — share UI was only on vault card before */}
+              {!hasVault && (
+                <div style={{ marginTop: '0.65rem' }}>
+                  {renderVaultShareControls(sub)}
+                </div>
+              )}
 
               <details className="sw-details">
                 <summary>Sub details &amp; list tools</summary>

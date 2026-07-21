@@ -48,15 +48,53 @@ export function formatUnits18(raw, maxFrac = 8) {
 /**
  * @param {object|null} vault — inspect vault payload (WalletIsland state)
  */
+/**
+ * Open / filled / burnable split for wWART capacity claims.
+ * Open = portable not yet withdrawn; filled = claim still Used while ERC-20 on L1;
+ * burnable = min(claim, portable + portal) — filled needs deposit back before burn.
+ */
+function wwartClaimSplit(vault, claim18) {
+  const portable18 = toBigIntSafe(vault.wwartPortable);
+  // Prefer explicit inspect fields when present (authoritative dApp)
+  if (vault.wwartBurnable != null || vault.wwartOpenClaim != null) {
+    const open18 = toBigIntSafe(vault.wwartOpenClaim ?? portable18);
+    const filled18 = toBigIntSafe(
+      vault.wwartFilledClaim ??
+        (claim18 > open18 ? claim18 - open18 : 0n),
+    );
+    const burnable18 = toBigIntSafe(
+      vault.wwartBurnable ??
+        (() => {
+          const portal = toBigIntSafe(vault.wWART);
+          const cover = portable18 + portal;
+          return claim18 < cover ? claim18 : cover;
+        })(),
+    );
+    return { open18, filled18, burnable18, portable18 };
+  }
+  const portal18 = toBigIntSafe(vault.wWART);
+  const open18 = portable18 < claim18 ? portable18 : claim18;
+  const filled18 = claim18 > open18 ? claim18 - open18 : 0n;
+  const cover = portable18 + portal18;
+  const burnable18 = claim18 < cover ? claim18 : cover;
+  return { open18, filled18, burnable18, portable18 };
+}
+
 export function computeWliqMintAvailable(vault) {
   const empty = {
     capacity18: 0n,
     liquid18: 0n,
     claim18: 0n,
     remaining18: 0n,
+    openClaim18: 0n,
+    filledClaim18: 0n,
+    burnableClaim18: 0n,
     capacity: '0',
     liquid: '0',
     claim: '0',
+    openClaim: '0',
+    filledClaim: '0',
+    burnableClaim: '0',
     available: '0',
     hasBacking: false,
     hasLockedWart: false,
@@ -76,14 +114,21 @@ export function computeWliqMintAvailable(vault) {
       const remaining18 =
         capacity18 > claimed18 ? capacity18 - claimed18 : 0n;
       const spoofed = toBigIntSafe(vault.outstandingE8);
+      const split = wwartClaimSplit(vault, claim18);
       return {
         capacity18,
         liquid18,
         claim18,
         remaining18,
+        openClaim18: split.open18,
+        filledClaim18: split.filled18,
+        burnableClaim18: split.burnable18,
         capacity: formatUnits18(capacity18),
         liquid: formatUnits18(liquid18),
         claim: formatUnits18(claim18),
+        openClaim: formatUnits18(split.open18),
+        filledClaim: formatUnits18(split.filled18),
+        burnableClaim: formatUnits18(split.burnable18),
         available: formatUnits18(remaining18),
         hasBacking: capacity18 > 0n,
         hasLockedWart: spoofed > 0n,
@@ -104,15 +149,22 @@ export function computeWliqMintAvailable(vault) {
     const claim18 = toBigIntSafe(vault.l1WwartClaim);
     const claimed18 = liquid18 + claim18;
     const remaining18 = capacity18 > claimed18 ? capacity18 - claimed18 : 0n;
+    const split = wwartClaimSplit(vault, claim18);
 
     return {
       capacity18,
       liquid18,
       claim18,
       remaining18,
+      openClaim18: split.open18,
+      filledClaim18: split.filled18,
+      burnableClaim18: split.burnable18,
       capacity: formatUnits18(capacity18),
       liquid: formatUnits18(liquid18),
       claim: formatUnits18(claim18),
+      openClaim: formatUnits18(split.open18),
+      filledClaim: formatUnits18(split.filled18),
+      burnableClaim: formatUnits18(split.burnable18),
       available: formatUnits18(remaining18),
       hasBacking: capacity18 > 0n,
       hasLockedWart: spoofedE8 > 0n,

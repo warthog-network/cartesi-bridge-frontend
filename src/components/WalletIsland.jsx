@@ -508,6 +508,13 @@ export default function WalletIsland() {
         liquid: pickCapacityClaim('liquid'),
         l1WwartClaim: pickCapacityClaim('l1WwartClaim'),
         wwartPortable: pickPortable(),
+        // Pass through open/filled/burnable when inspect provides them
+        wwartOpenClaim:
+          json?.wwartOpenClaim != null ? String(json.wwartOpenClaim) : undefined,
+        wwartFilledClaim:
+          json?.wwartFilledClaim != null ? String(json.wwartFilledClaim) : undefined,
+        wwartBurnable:
+          json?.wwartBurnable != null ? String(json.wwartBurnable) : undefined,
         mintCapacity18:
           json?.mintCapacity18 != null
             ? String(json.mintCapacity18)
@@ -1033,10 +1040,11 @@ export default function WalletIsland() {
               </div>
             </div>
             <p className="wi-muted" style={{ marginTop: '0.5rem', marginBottom: 0 }}>
-              <strong>Capacity</strong> = locked WART. <strong>Used</strong> = {SHARE_TOKEN.symbol} + wWART
-              claims (mint). Depositing MetaMask wWART back only adds rollup balance —{' '}
-              <strong>Used stays</strong> until you <strong>Burn wWART</strong> on Warthog Home.
-              <strong> Release</strong> (Bridge) unlocks native collateral separately.
+              <strong>Capacity</strong> = locked WART. <strong>Used</strong> = {SHARE_TOKEN.symbol} +
+              wWART claims. <strong>Open</strong> claims (not withdrawn) can burn immediately.{' '}
+              <strong>Filled</strong> claims (ERC-20 already on MetaMask) keep Used until you{' '}
+              <strong>deposit L1 wWART back</strong> and then <strong>Burn wWART claims</strong>.
+              <strong> Release</strong> unlocks native collateral separately.
             </p>
             <ol className="wi-steps">
               <li>
@@ -1047,13 +1055,13 @@ export default function WalletIsland() {
                 <button type="button" className="wi-linkish" onClick={() => setL1Tab('claim')}>
                   Get wWART
                 </button>{' '}
-                to MetaMask
+                to MetaMask (claim becomes <em>filled</em>)
               </li>
               <li>
-                Deposit wWART back (More) → balance only · still Used
+                To free filled capacity: deposit MetaMask wWART → <strong>Burn wWART claims</strong>
               </li>
               <li>
-                <strong>Burn wWART</strong> (Warthog Home) → frees Available
+                Open (unfilled) claims: burn on Warthog Home without deposit
               </li>
               <li>
                 Optional: <strong>Release</strong> locked WART → Vault → main

@@ -245,15 +245,14 @@ export default function PersonalVaultMvp({
         index: sub.index,
         owner: l1Address,
       });
-      const enc = encryptJsonWithMnemonic(vault.clientSecret, mainMnemonic);
-      const encBackup = encryptJsonWithMnemonic(vault.cosignerRegister, mainMnemonic);
+      // User half only in browser. Cosigner half goes to cosigner once below — never stored client-side.
+      const enc = await encryptJsonWithMnemonic(vault.clientSecret, mainMnemonic);
       saveTwoPartyClientLocal({
         mainAddress: mainWallet?.address,
         subAddress: sub.address,
         vaultAddress: vault.address,
         index: sub.index,
         encryptedClientSecret: enc,
-        encryptedCosignerBackup: encBackup,
         scheme: MULTISIG_SCHEME,
       });
       try {
@@ -265,7 +264,6 @@ export default function PersonalVaultMvp({
             vaultAddress: vault.address,
             index: sub.index,
             clientSecret: vault.clientSecret,
-            cosignerRegister: vault.cosignerRegister,
             scheme: MULTISIG_SCHEME,
             ownerL1: l1Address,
           });
