@@ -6,6 +6,81 @@
   align-items: center;
 }
 
+.sw-hidden-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.sw-pill-copy {
+  cursor: pointer;
+  border: 1px solid transparent;
+  background: inherit;
+  font: inherit;
+  color: inherit;
+}
+.sw-pill-copy:hover {
+  border-color: color-mix(in srgb, var(--accent-teal, #00ffcc) 40%, transparent);
+  color: var(--accent-teal, #00ffcc);
+}
+
+.sw-card--sub.is-hidden-sub {
+  opacity: 0.85;
+  border-style: dashed;
+}
+
+.btn.danger.small {
+  background: color-mix(in srgb, #f20544 18%, transparent);
+  border: 1px solid color-mix(in srgb, #f20544 45%, transparent);
+  color: #ffb3c1;
+}
+.btn.danger.small:hover:not(:disabled) {
+  background: color-mix(in srgb, #f20544 28%, transparent);
+}
+
+/* Collapsible panels on sub / vault cards (match WLIQ overview) */
+.sw-details {
+  margin: 0.4rem 0;
+  border: 1px solid #333;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.22);
+  overflow: hidden;
+}
+.sw-details summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #00ffcc;
+  user-select: none;
+}
+.sw-details summary::-webkit-details-marker {
+  display: none;
+}
+.sw-details summary::before {
+  content: '▸ ';
+  opacity: 0.75;
+}
+.sw-details[open] summary::before {
+  content: '▾ ';
+}
+.sw-details-body {
+  padding: 0 0.7rem 0.7rem;
+  border-top: 1px solid #2a2a2a;
+}
+.sw-details--nested {
+  margin-top: 0.45rem;
+  background: rgba(0, 0, 0, 0.15);
+}
+.sw-hint {
+  font-size: 0.75rem;
+  opacity: 0.8;
+  margin: 0.35rem 0 0.5rem;
+  line-height: 1.35;
+}
+
 .status-message {
   width: 100%;
   margin-top: 12px;
@@ -34,13 +109,45 @@
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 0.5rem 1rem;
-  margin-bottom: 0.65rem;
+  gap: 0.35rem 1rem;
+  margin-bottom: 0.55rem;
 }
 
 .subwallet-top h3 {
   margin: 0;
-  font-size: 1.05rem;
+  font-size: 1rem;
+  width: 100%;
+}
+
+.sw-top-lead {
+  margin: 0;
+  width: 100%;
+  font-size: 0.78rem;
+  opacity: 0.7;
+  line-height: 1.35;
+}
+
+/* Vault tab: single full-width vault card (no sub card) */
+.subwallet-section--vault-focus .sw-cards--vault-only {
+  grid-template-columns: 1fr;
+}
+.subwallet-section--vault-focus .sw-card--vault {
+  border-color: color-mix(in srgb, #fdb913 50%, #333);
+  box-shadow: 0 0 0 1px color-mix(in srgb, #fdb913 18%, transparent);
+  max-width: 28rem;
+  margin: 0 auto;
+  width: 100%;
+}
+.subwallet-section--vault-focus .sw-card--vault .sw-card-title {
+  color: #fdb913;
+}
+
+.sw-card-head-right {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  justify-content: flex-end;
 }
 
 .bridge-flow-guide {
@@ -407,6 +514,30 @@
   border-color: color-mix(in srgb, var(--primary-hover, #e79300) 32%, #333);
 }
 
+/* Cross-layer wWART snapshot (vault spoofed · rollup claim · MetaMask) */
+.sw-card--l1-track {
+  margin: 0.35rem 0 0.65rem;
+  border-color: color-mix(in srgb, #00ffcc 28%, #333);
+  background:
+    linear-gradient(
+      145deg,
+      color-mix(in srgb, #00ffcc 7%, rgba(0, 0, 0, 0.35)) 0%,
+      rgba(0, 0, 0, 0.22) 55%,
+      transparent 100%
+    );
+}
+
+.sw-card--l1-track .sw-card-meta {
+  margin-bottom: 0.25rem;
+}
+
+.sw-l1-track-hint {
+  margin: 0.25rem 0 0 !important;
+  font-size: 0.7rem !important;
+  line-height: 1.35;
+  opacity: 0.75;
+}
+
 .sw-card--vault.is-busy {
   opacity: 0.72;
   pointer-events: none;
@@ -461,47 +592,206 @@
   border-color: color-mix(in srgb, #2ecc9a 40%, #333);
 }
 
+/*
+ * Compact stylized key/value — content-width chips (not full-width bars).
+ * Glass chips + accent labels; vault cards get amber tint.
+ */
 .sw-card-meta {
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
-  margin-bottom: 0.45rem;
-  font-size: 0.82rem;
+  gap: 0.32rem;
+  margin: 0 0 0.4rem;
+  width: 100%;
+  padding: 0.38rem 0.45rem;
+  border-radius: 8px;
+  background:
+    linear-gradient(145deg, rgba(0, 255, 204, 0.045) 0%, rgba(0, 0, 0, 0.18) 55%, transparent 100%);
+  border: 1px solid color-mix(in srgb, #00ffcc 12%, rgba(255, 255, 255, 0.06));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.sw-card--vault .sw-card-meta,
+.subwallet-section--vault-focus .sw-card--vault .sw-card-meta {
+  background:
+    linear-gradient(145deg, rgba(253, 185, 19, 0.06) 0%, rgba(0, 0, 0, 0.2) 55%, transparent 100%);
+  border-color: color-mix(in srgb, #fdb913 16%, rgba(255, 255, 255, 0.05));
 }
 
 .sw-meta-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.35rem 0.65rem;
-  align-items: baseline;
+  align-items: center;
+  gap: 0.3rem 0.5rem;
+  min-width: 0;
 }
 
 .sw-meta-k {
-  min-width: 4.5rem;
-  opacity: 0.55;
-  font-size: 0.72rem;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
-  font-weight: 600;
+  color: color-mix(in srgb, #00ffcc 62%, #9a9a9a);
+  line-height: 1.2;
+  padding: 0;
+  margin: 0;
+  background: none;
+  border: none;
+  opacity: 1;
+  min-width: 4.25rem;
+}
+
+/* tiny accent pip before label */
+.sw-meta-k::before {
+  content: '';
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: #00ffcc;
+  box-shadow: 0 0 5px color-mix(in srgb, #00ffcc 70%, transparent);
+  flex-shrink: 0;
+  opacity: 0.9;
+}
+
+.sw-card--vault .sw-meta-k,
+.subwallet-section--vault-focus .sw-card--vault .sw-meta-k {
+  color: color-mix(in srgb, #fdb913 55%, #b0a090);
+}
+
+.sw-card--vault .sw-meta-k::before,
+.subwallet-section--vault-focus .sw-card--vault .sw-meta-k::before {
+  background: #fdb913;
+  box-shadow: 0 0 5px color-mix(in srgb, #fdb913 65%, transparent);
 }
 
 .sw-meta-v {
-  color: #eee;
+  /* content-sized chip — never stretch full row */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  width: auto !important;
+  display: inline-flex !important;
+  align-items: center;
+  gap: 0.25rem;
+  color: #f2f2f2;
+  font-size: 0.74rem;
+  font-weight: 500;
+  line-height: 1.25;
   word-break: break-all;
+  text-align: left;
+  padding: 0.14rem 0.48rem !important;
+  margin: 0 !important;
+  border-radius: 6px !important;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.07) 0%, rgba(255, 255, 255, 0.025) 100%) !important;
+  border: 1px solid rgba(255, 255, 255, 0.11) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 1px 2px rgba(0, 0, 0, 0.25) !important;
+  transform: none !important;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, color 0.15s ease;
 }
 
-.sw-link {
+/* amount / free balance chips pop a bit more */
+.sw-meta-v:not(.mono) {
+  color: #f8fff9;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
+.sw-meta-v.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: #d8fff6;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, #00ffcc 14%, rgba(0, 0, 0, 0.45)) 0%,
+      color-mix(in srgb, #00ffcc 5%, rgba(0, 0, 0, 0.4)) 100%
+    ) !important;
+  border-color: color-mix(in srgb, #00ffcc 28%, transparent) !important;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #00ffcc 18%, transparent),
+    0 0 10px color-mix(in srgb, #00ffcc 8%, transparent) !important;
+}
+
+.sw-card--vault .sw-meta-v.mono,
+.subwallet-section--vault-focus .sw-card--vault .sw-meta-v.mono {
+  color: #fff6e0;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, #fdb913 16%, rgba(0, 0, 0, 0.45)) 0%,
+      color-mix(in srgb, #fdb913 5%, rgba(0, 0, 0, 0.4)) 100%
+    ) !important;
+  border-color: color-mix(in srgb, #fdb913 30%, transparent) !important;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #fdb913 20%, transparent),
+    0 0 10px color-mix(in srgb, #fdb913 8%, transparent) !important;
+}
+
+button.sw-meta-v,
+button.sw-link.sw-meta-v {
+  cursor: pointer;
+  font: inherit;
+  min-height: 0 !important;
+  min-width: 0 !important;
+}
+
+button.sw-meta-v:hover,
+button.sw-link.sw-meta-v:hover {
+  color: #fff !important;
+  border-color: color-mix(in srgb, #00ffcc 55%, transparent) !important;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, #00ffcc 22%, rgba(0, 0, 0, 0.35)) 0%,
+      color-mix(in srgb, #00ffcc 10%, rgba(0, 0, 0, 0.4)) 100%
+    ) !important;
+  text-decoration: none;
+  transform: none !important;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #00ffcc 25%, transparent),
+    0 0 12px color-mix(in srgb, #00ffcc 22%, transparent) !important;
+}
+
+.sw-card--vault button.sw-meta-v:hover,
+.sw-card--vault button.sw-link.sw-meta-v:hover,
+.subwallet-section--vault-focus .sw-card--vault button.sw-meta-v:hover,
+.subwallet-section--vault-focus .sw-card--vault button.sw-link.sw-meta-v:hover {
+  border-color: color-mix(in srgb, #fdb913 55%, transparent) !important;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, #fdb913 22%, rgba(0, 0, 0, 0.35)) 0%,
+      color-mix(in srgb, #fdb913 10%, rgba(0, 0, 0, 0.4)) 100%
+    ) !important;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #fdb913 25%, transparent),
+    0 0 12px color-mix(in srgb, #fdb913 22%, transparent) !important;
+}
+
+/* non-meta links (if any) stay plain */
+.sw-link:not(.sw-meta-v) {
   background: none;
   border: none;
   padding: 0;
-  color: #eee;
+  color: #e8e8e8;
   cursor: pointer;
   font: inherit;
   text-align: left;
+  width: auto !important;
 }
-.sw-link:hover {
+.sw-link:not(.sw-meta-v):hover {
   color: #00ffcc;
   text-decoration: underline;
+  background: none !important;
 }
 
 .sw-live-tag {
@@ -693,4 +983,173 @@
   padding: 0.8rem;
   background: rgba(239, 68, 68, 0.1);
   border-radius: 6px;
+}
+
+/* ── Density: less padding / less “bubbly” ───────────────────────────────── */
+.subwallet-section {
+  font-size: 0.84rem;
+}
+.subwallet-top {
+  margin-bottom: 0.35rem;
+  gap: 0.2rem 0.5rem;
+}
+.subwallet-top h3 {
+  font-size: 0.9rem;
+}
+.sw-top-lead {
+  font-size: 0.72rem;
+  opacity: 0.65;
+  margin: 0 0 0.15rem;
+}
+.subwallet-controls {
+  gap: 0.35rem;
+  margin-bottom: 0.45rem;
+}
+.sw-details {
+  margin: 0.25rem 0;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.18);
+}
+.sw-details summary {
+  padding: 0.32rem 0.5rem;
+  font-size: 0.76rem;
+}
+.sw-details-body {
+  padding: 0.35rem 0.5rem 0.45rem;
+}
+.sw-hint {
+  font-size: 0.7rem;
+  margin: 0.2rem 0 0.3rem;
+  line-height: 1.3;
+  opacity: 0.72;
+}
+.status-message {
+  margin-top: 0.4rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 5px;
+  font-size: 0.78rem;
+  gap: 0.4rem;
+}
+.sw-pager {
+  gap: 0.35rem;
+  margin-bottom: 0.45rem;
+  padding: 0.25rem 0;
+}
+.sw-pager-count {
+  font-size: 0.7rem;
+}
+.sw-pager-select {
+  font-size: 0.75rem !important;
+  padding: 0.3rem 0.4rem !important;
+  min-height: 0 !important;
+}
+.sw-dot {
+  height: 1.3rem;
+  min-width: 1.3rem;
+  padding: 0 0.25rem;
+  font-size: 0.65rem;
+  border-radius: 4px;
+}
+.sw-dot:hover {
+  transform: none;
+}
+.sw-dot.is-active {
+  box-shadow: none;
+}
+.sw-cards {
+  gap: 0.4rem;
+}
+.sw-card {
+  border-radius: 8px;
+  padding: 0.45rem 0.55rem;
+  background: color-mix(in srgb, var(--bg-section, #1a1a1a) 88%, #000);
+}
+.sw-card-head {
+  margin-bottom: 0.3rem;
+  gap: 0.35rem;
+}
+.sw-card-title {
+  font-size: 0.82rem;
+}
+.sw-pill {
+  font-size: 0.62rem;
+  padding: 0.08rem 0.35rem;
+  border-radius: 4px;
+}
+/* density: keep meta chips compact (stylized look preserved above) */
+.sw-card-meta {
+  gap: 0.26rem;
+  margin-bottom: 0.3rem;
+  padding: 0.32rem 0.4rem;
+}
+.sw-meta-k {
+  min-width: 4rem;
+  font-size: 0.6rem;
+}
+.sw-meta-v {
+  font-size: 0.72rem;
+  padding: 0.12rem 0.4rem !important;
+  border-radius: 5px !important;
+}
+.sw-card-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.35rem;
+}
+.action-group,
+.vault-withdraw-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  align-items: center;
+  margin: 0.25rem 0;
+}
+.action-group .input,
+.vault-withdraw-group .input,
+.amount-input {
+  padding: 0.35rem 0.45rem !important;
+  font-size: 0.8rem !important;
+  min-height: 0 !important;
+  border-radius: 6px !important;
+}
+.subwallet-section .btn.small {
+  padding: 0.3rem 0.55rem !important;
+  font-size: 0.72rem !important;
+  border-radius: 6px !important;
+  min-height: 0 !important;
+}
+.sw-tab-empty {
+  font-size: 0.72rem;
+  margin: 0.25rem 0;
+  opacity: 0.7;
+}
+.sw-empty {
+  padding: 0.6rem 0.5rem;
+  font-size: 0.8rem;
+}
+.sw-live-tag {
+  font-size: 0.65rem;
+  opacity: 0.6;
+}
+.bridge-flow-guide summary {
+  font-size: 0.72rem !important;
+  padding: 0.2rem 0 !important;
+}
+.bridge-flow-steps {
+  font-size: 0.72rem;
+  padding-left: 1rem;
+  margin: 0.25rem 0 0;
+  line-height: 1.35;
+}
+.bridge-flow-steps li + li {
+  margin-top: 0.15rem;
+}
+.step-num {
+  margin-right: 0.3rem;
+}
+.subwallet-section--vault-focus .sw-card--vault {
+  box-shadow: none;
+  max-width: 100%;
+  border-radius: 8px;
 }

@@ -1,9 +1,8 @@
 ---
-// src/pages/index.astro
+// Streamlined app shell — primary path only; extras collapsed
 import Header from '../components/Header.astro';
-import DepositBox from '../components/DepositBox.astro';
 import WalletIsland from '../components/WalletIsland.jsx';
-import RatioCalculator from '../components/RatioCalculator.astro';
+import NotesPanel from '../components/NotesPanel.jsx';
 import '../styles/global.css';
 ---
 
@@ -13,16 +12,15 @@ import '../styles/global.css';
     <meta charset="utf-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>WLIQ — Warthog × Cartesi Bridge</title>
+    <title>WART Bridge — Warthog × Cartesi</title>
   </head>
   <body>
     <main class="container app-main">
       <Header />
       <WalletIsland client:load />
-      <DepositBox />
-      <details class="app-extras">
-        <summary>Ratio calculator</summary>
-        <RatioCalculator client:load />
+      <details class="app-extras app-notes">
+        <summary>Changelog</summary>
+        <NotesPanel client:load />
       </details>
     </main>
   </body>
@@ -30,35 +28,58 @@ import '../styles/global.css';
 
 <style is:global>
   .app-main {
-    padding-bottom: 2.5rem;
+    padding-bottom: 2rem;
+    max-width: 42rem;
+  }
+  .container.app-main,
+  .container {
+    max-width: 42rem;
   }
   .app-extras {
-    max-width: 40rem;
-    margin: 0.5rem auto 1.5rem;
-    padding: 0.65rem 0.9rem;
+    max-width: 42rem;
+    width: 100%;
+    box-sizing: border-box;
+    margin: 1rem auto 1.5rem;
+    padding: 0.55rem 0.85rem;
     border-radius: 12px;
-    border: 1px solid #333;
-    background: rgba(0, 0, 0, 0.25);
-    color: #ccc;
-    font-size: 0.85rem;
+    border: 1px solid #2a2a2a;
+    background: rgba(0, 0, 0, 0.3);
+    color: #bbb;
+    font-size: 0.82rem;
+    overflow-x: hidden;
+    min-width: 0;
+  }
+  .app-extras.app-notes,
+  .app-extras.app-notes .notes-panel {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
   .app-extras summary {
     cursor: pointer;
-    color: #00ffcc;
+    color: #888;
     font-weight: 600;
     list-style: none;
+    font-size: 0.8rem;
+  }
+  .app-extras summary:hover {
+    color: #00ffcc;
   }
   .app-extras summary::-webkit-details-marker {
     display: none;
   }
   .app-extras summary::before {
     content: '▸ ';
-    opacity: 0.7;
+    opacity: 0.6;
   }
   .app-extras[open] summary::before {
     content: '▾ ';
   }
   .app-extras[open] {
-    padding-bottom: 1rem;
+    padding-bottom: 0.85rem;
+  }
+  .app-extras[open] summary {
+    color: #00ffcc;
+    margin-bottom: 0.5rem;
   }
 </style>

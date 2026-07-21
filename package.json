@@ -4,12 +4,16 @@
   "version": "0.0.1",
   "scripts": {
     "dev": "astro dev",
-    "build": "astro build",
+    "build": "ASTRO_ADAPTER=node astro build",
+    "build:netlify": "astro build",
     "preview": "astro preview",
-    "astro": "astro"
+    "astro": "astro",
+    "test:2p": "node scripts/test-2p-ecdsa.mjs",
+    "test:policy": "node ../cosigner-node/test-policy.mjs"
   },
   "dependencies": {
     "@astrojs/netlify": "^6.6.3",
+    "@astrojs/node": "^9.5.5",
     "@astrojs/react": "^4.4.2",
     "@noble/curves": "^1.9.0",
     "@scure/bip32": "^2.0.1",

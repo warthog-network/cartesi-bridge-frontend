@@ -2,9 +2,35 @@
  * Shared bridge / rollup config for browser components.
  * GraphQL goes through the Vite `/rollup` proxy when on the frontend dev server.
  *
+ * Network switch (Anvil vs Sepolia): see `networks.js` + PUBLIC_NETWORK.
+ *
  * NOTE: graphql-request uses `new URL(endpoint)` and rejects relative paths like
  * `/rollup/graphql`. Always resolve with getRollupGraphqlUrl() in the browser.
  */
+
+import {
+  getNetwork,
+  getAddresses,
+  getNetworkId,
+  getWwartToken,
+  isOpenMintAllowed,
+  isSepoliaConfigured,
+  ANVIL,
+  SEPOLIA,
+  NETWORKS,
+} from './networks.js';
+
+export {
+  getNetwork,
+  getAddresses,
+  getNetworkId,
+  getWwartToken,
+  isOpenMintAllowed,
+  isSepoliaConfigured,
+  ANVIL,
+  SEPOLIA,
+  NETWORKS,
+};
 
 export const ROLLUP_GRAPHQL_URL =
   (typeof import.meta !== 'undefined' && import.meta.env?.PUBLIC_GRAPHQL_URL) ||
@@ -47,14 +73,21 @@ export function getInspectUrl() {
   return resolveAppUrl(INSPECT_URL);
 }
 
-/** Cartesi CLI 1.5 local Anvil */
+/**
+ * Cartesi L1 addresses for the active network.
+ * Defaults remain CLI 1.5 Anvil (Mode A usability lock).
+ * Prefer getAddresses() for new code.
+ */
 export const LOCAL_ADDRESSES = {
-  dapp: '0xab7528bb862fB57E8A2BCd567a2e929a0Be56a5e',
-  inputBox: '0x59b22D57D4f067708AB0c00552767405926dc768',
-  etherPortal: '0xFfdbe43d4c855BF7e0f105c400A50857f53AB044',
-  erc20Portal: '0x9C21AEb2093C32DDbC53eEF24B873BDCd1aDa1DB',
-  dappAddressRelay: '0xF5DE34d6BbC0446E2a45719E718efEbaaE179daE',
+  dapp: ANVIL.contracts.dapp,
+  inputBox: ANVIL.contracts.inputBox,
+  etherPortal: ANVIL.contracts.etherPortal,
+  erc20Portal: ANVIL.contracts.erc20Portal,
+  dappAddressRelay: ANVIL.contracts.dappAddressRelay,
 };
+
+/** Active-network address book (Anvil or Sepolia placeholders). */
+export const ACTIVE_ADDRESSES = getAddresses();
 
 /** Storage key material for sub-wallet list (not a secret wallet key — list is non-custodial addresses). */
 export function subWalletStorageSecret(mainAddress) {

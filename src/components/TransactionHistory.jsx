@@ -242,112 +242,145 @@ const TransactionHistory = ({ address, node }) => {
 
   return (
     <section className="activity-panel">
-      <div className="activity-head">
-        <h3>
-          Activity
-          {sourceLabel ? (
-            <span className="activity-source"> · {sourceLabel}</span>
-          ) : null}
-        </h3>
-        <button
-          type="button"
-          className="btn primary small"
-          onClick={handleRefresh}
-          disabled={loading || !address}
-        >
-          {loading ? 'Loading…' : 'Refresh'}
-        </button>
-      </div>
-
-      {error && (
-        <div className="activity-error">
-          <strong>Error:</strong> {error}
-        </div>
-      )}
-
-      {!loading && !error && items.length === 0 && (
-        <p className="activity-empty">No transactions found for this address.</p>
-      )}
-
-      {items.length > 0 && (
-        <ul className="activity-list">
-          {items.map((tx, i) => {
-            const dir = tx.direction;
-            const dirClass =
-              dir === 'in' ? 'in' : dir === 'out' ? 'out' : dir === 'self' ? 'self' : '';
-            const title =
-              tx.summary ||
-              `${tx.type || 'tx'} ${dir || ''}`.trim();
-            return (
-              <li key={`${tx.txid || i}-${i}`} className={`activity-row ${dirClass}`}>
-                <div className="activity-row-main">
-                  <span className={`activity-dir ${dirClass}`}>
-                    {dir === 'in' ? '↓ in' : dir === 'out' ? '↑ out' : dir || tx.type || 'tx'}
-                  </span>
-                  <span className="activity-amt">
-                    {formatAmount(tx.amount)} WART
-                  </span>
-                  {tx.fee != null && Number(tx.fee) > 0 && (
-                    <span className="activity-fee">fee {formatAmount(tx.fee)}</span>
-                  )}
-                </div>
-                <div className="activity-row-meta">
-                  <span className="activity-type">{title}</span>
-                  {tx.height != null && <span>h{tx.height}</span>}
-                  {tx.confirmations != null && <span>{tx.confirmations} conf</span>}
-                  {tx.timestamp != null && (
-                    <span className="activity-time">{formatTime(tx.timestamp)}</span>
-                  )}
-                </div>
-                <div className="activity-row-addrs">
-                  {tx.fromAddress ? (
-                    <button
-                      type="button"
-                      className="activity-addr"
-                      title={tx.fromAddress}
-                      onClick={() => navigator.clipboard?.writeText(tx.fromAddress)}
-                    >
-                      from {shortHex(tx.fromAddress)}
-                    </button>
-                  ) : null}
-                  {tx.toAddress ? (
-                    <button
-                      type="button"
-                      className="activity-addr"
-                      title={tx.toAddress}
-                      onClick={() => navigator.clipboard?.writeText(tx.toAddress)}
-                    >
-                      to {shortHex(tx.toAddress)}
-                    </button>
-                  ) : null}
-                  {tx.txid ? (
-                    <button
-                      type="button"
-                      className="activity-addr mono"
-                      title={tx.txid}
-                      onClick={() => navigator.clipboard?.writeText(tx.txid)}
-                    >
-                      {shortHex(tx.txid, 8, 6)}
-                    </button>
-                  ) : null}
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-
-      <div className="activity-pager">
-        {hasMore && items.length > 0 && (
+      <div className="sw-card activity-shell">
+        <div className="sw-card-head">
+          <h4 className="sw-card-title">
+            Activity
+            {sourceLabel ? (
+              <span className="sw-live-tag"> · {sourceLabel}</span>
+            ) : null}
+          </h4>
           <button
             type="button"
-            className="btn secondary small"
-            onClick={handleMore}
-            disabled={loading}
+            className="btn primary small"
+            onClick={handleRefresh}
+            disabled={loading || !address}
           >
-            {loading ? 'Loading…' : 'Load more'}
+            {loading ? 'Loading…' : 'Refresh'}
           </button>
+        </div>
+
+        {error && (
+          <div className="activity-error" role="alert">
+            <strong>Error:</strong> {error}
+          </div>
         )}
+
+        {!loading && !error && items.length === 0 && (
+          <p className="wh-hint activity-empty">No transactions found for this address.</p>
+        )}
+
+        {items.length > 0 && (
+          <ul className="activity-list">
+            {items.map((tx, i) => {
+              const dir = tx.direction;
+              const dirClass =
+                dir === 'in' ? 'in' : dir === 'out' ? 'out' : dir === 'self' ? 'self' : '';
+              const dirLabel =
+                dir === 'in' ? '↓ in' : dir === 'out' ? '↑ out' : dir || tx.type || 'tx';
+              const title =
+                tx.summary ||
+                `${tx.type || 'tx'} ${dir || ''}`.trim();
+              return (
+                <li
+                  key={`${tx.txid || i}-${i}`}
+                  className={`sw-card activity-tx-card ${dirClass ? `is-${dirClass}` : ''}`}
+                >
+                  <div className="sw-card-head">
+                    <h4 className="sw-card-title activity-tx-title">
+                      <span className={`activity-dir-pill ${dirClass}`}>{dirLabel}</span>
+                      <span className="activity-amt-inline">
+                        {formatAmount(tx.amount)} WART
+                      </span>
+                    </h4>
+                    {tx.timestamp != null ? (
+                      <span className="sw-live-tag activity-time-tag">
+                        {formatTime(tx.timestamp)}
+                      </span>
+                    ) : null}
+                  </div>
+
+                  <div className="sw-card-meta">
+                    <div className="sw-meta-row">
+                      <span className="sw-meta-k">Type</span>
+                      <span className="sw-meta-v">{title || '—'}</span>
+                    </div>
+                    {tx.fee != null && Number(tx.fee) > 0 && (
+                      <div className="sw-meta-row">
+                        <span className="sw-meta-k">Fee</span>
+                        <span className="sw-meta-v">{formatAmount(tx.fee)} WART</span>
+                      </div>
+                    )}
+                    {tx.height != null && (
+                      <div className="sw-meta-row">
+                        <span className="sw-meta-k">Height</span>
+                        <span className="sw-meta-v">{tx.height}</span>
+                      </div>
+                    )}
+                    {tx.confirmations != null && (
+                      <div className="sw-meta-row">
+                        <span className="sw-meta-k">Conf</span>
+                        <span className="sw-meta-v">{tx.confirmations}</span>
+                      </div>
+                    )}
+                    {tx.fromAddress ? (
+                      <div className="sw-meta-row">
+                        <span className="sw-meta-k">From</span>
+                        <button
+                          type="button"
+                          className="sw-meta-v mono sw-link"
+                          title={tx.fromAddress}
+                          onClick={() => navigator.clipboard?.writeText(tx.fromAddress)}
+                        >
+                          {shortHex(tx.fromAddress)}
+                        </button>
+                      </div>
+                    ) : null}
+                    {tx.toAddress ? (
+                      <div className="sw-meta-row">
+                        <span className="sw-meta-k">To</span>
+                        <button
+                          type="button"
+                          className="sw-meta-v mono sw-link"
+                          title={tx.toAddress}
+                          onClick={() => navigator.clipboard?.writeText(tx.toAddress)}
+                        >
+                          {shortHex(tx.toAddress)}
+                        </button>
+                      </div>
+                    ) : null}
+                    {tx.txid ? (
+                      <div className="sw-meta-row">
+                        <span className="sw-meta-k">Tx</span>
+                        <button
+                          type="button"
+                          className="sw-meta-v mono sw-link"
+                          title={tx.txid}
+                          onClick={() => navigator.clipboard?.writeText(tx.txid)}
+                        >
+                          {shortHex(tx.txid, 8, 6)}
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        <div className="sw-card-toolbar activity-pager">
+          {hasMore && items.length > 0 && (
+            <button
+              type="button"
+              className="btn secondary small"
+              onClick={handleMore}
+              disabled={loading}
+            >
+              {loading ? 'Loading…' : 'Load more'}
+            </button>
+          )}
+        </div>
       </div>
     </section>
   );

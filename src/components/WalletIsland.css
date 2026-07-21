@@ -2,11 +2,71 @@
 
 .wi-shell {
   width: 100%;
-  max-width: 1100px;
+  max-width: 42rem;
   margin: 0 auto;
-  padding: 0 0.25rem 1.5rem;
+  padding: 0 0 1.25rem;
   color: #fff;
   text-align: left;
+}
+
+.wi-l1-block {
+  margin-top: 1.25rem;
+  padding-top: 0.25rem;
+}
+
+.wi-stat-grid--focus {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.wi-stat-hint {
+  display: block;
+  font-size: 0.65rem;
+  opacity: 0.55;
+  margin-top: 0.15rem;
+}
+
+.wi-steps {
+  margin: 0.85rem 0 0.5rem;
+  padding-left: 1.15rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  opacity: 0.88;
+  color: #ddd;
+}
+.wi-steps li + li {
+  margin-top: 0.35rem;
+}
+.wi-steps strong {
+  color: #00ffcc;
+}
+
+.wi-token-copy {
+  display: block;
+  width: 100%;
+  margin-top: 0.65rem;
+  padding: 0.45rem 0.6rem;
+  border-radius: 10px;
+  border: 1px dashed color-mix(in srgb, #00ffcc 35%, #333);
+  background: transparent;
+  color: #aaa;
+  font-size: 0.72rem;
+  font-family: ui-monospace, Menlo, monospace;
+  cursor: pointer;
+  text-align: left;
+}
+.wi-token-copy:hover {
+  color: #00ffcc;
+  border-color: #00ffcc;
+}
+
+.wi-claim-lead {
+  margin: 0 0 0.75rem;
+  font-size: 0.84rem;
+}
+
+.wi-portal-card--focus {
+  border-color: color-mix(in srgb, #00ffcc 40%, #333);
+  margin-bottom: 0.85rem;
 }
 
 /* ── Connect (logged out) ── */
@@ -83,6 +143,45 @@
 
 .wi-address-chip:hover {
   border-color: #00ffcc;
+}
+
+.wi-token-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.65rem;
+  margin: 0 0 0.65rem;
+  padding: 0.45rem 0.65rem;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, #00ffcc 28%, #333);
+  background: color-mix(in srgb, #00ffcc 8%, rgba(0, 0, 0, 0.35));
+  font-size: 0.78rem;
+}
+.wi-token-bar-label {
+  font-weight: 700;
+  color: #00ffcc;
+  flex-shrink: 0;
+}
+.wi-token-bar-addr {
+  flex: 1 1 12rem;
+  min-width: 0;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: #e9e9e9;
+  font-size: 0.72rem;
+  word-break: break-all;
+  cursor: pointer;
+  padding: 0.15rem 0;
+}
+.wi-token-bar-addr:hover {
+  color: #00ffcc;
+  text-decoration: underline;
+}
+.wi-token-bar-hint {
+  opacity: 0.65;
+  font-size: 0.7rem;
+  flex-shrink: 0;
 }
 
 .wi-header-tools {
@@ -269,6 +368,15 @@
   color: #fff !important;
 }
 
+.wi-linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  color: #00ffcc;
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+}
 .wi-portal-note {
   margin: 0.25rem 0 0;
   font-size: 0.72rem;
@@ -320,3 +428,85 @@
     flex: 1 1 auto;
   }
 }
+
+/* Density */
+.wi-shell { padding-bottom: 0.75rem; }
+.wi-l1-block { margin-top: 0.75rem; }
+.wi-header {
+  gap: 0.35rem;
+  margin-bottom: 0.45rem;
+  padding: 0.45rem 0.55rem;
+  border-radius: 8px;
+}
+.wi-header-main { gap: 0.35rem; }
+.wi-header-label { font-size: 0.62rem; }
+.wi-address-chip {
+  padding: 0.22rem 0.5rem;
+  font-size: 0.72rem;
+  border-radius: 6px;
+}
+.wi-header-tools { gap: 0.3rem; }
+.wi-header-tools .btn.small {
+  padding: 0.28rem 0.5rem !important;
+  font-size: 0.72rem !important;
+  border-radius: 6px !important;
+}
+.wi-l1-tabs { gap: 0.25rem; margin-bottom: 0.4rem; }
+.wi-panel {
+  padding: 0.5rem 0.55rem;
+  border-radius: 8px;
+  margin-bottom: 0.2rem;
+}
+.wi-stat-grid {
+  gap: 0.3rem;
+}
+.wi-stat {
+  padding: 0.4rem 0.45rem;
+  border-radius: 6px;
+  gap: 0.08rem;
+}
+.wi-stat-k { font-size: 0.65rem; }
+.wi-stat-v { font-size: 0.85rem; }
+.wi-stat-hint { font-size: 0.6rem; margin-top: 0.05rem; }
+.wi-steps {
+  margin: 0.5rem 0 0.35rem;
+  padding-left: 1rem;
+  font-size: 0.74rem;
+  line-height: 1.35;
+}
+.wi-steps li + li { margin-top: 0.2rem; }
+.wi-token-copy {
+  margin-top: 0.4rem;
+  padding: 0.3rem 0.45rem;
+  border-radius: 6px;
+  font-size: 0.68rem;
+}
+.wi-claim-lead { margin: 0 0 0.45rem; font-size: 0.78rem; }
+.wi-portal-card {
+  border-radius: 8px;
+  padding: 0.45rem 0.55rem;
+}
+.wi-portal-title { font-size: 0.8rem; margin-bottom: 0.3rem; }
+.wi-portal-note { font-size: 0.7rem; margin: 0.25rem 0; line-height: 1.3; }
+.wi-portal-row { gap: 0.3rem; }
+.wi-portal-grid { gap: 0.4rem; }
+.wi-muted { font-size: 0.74rem; }
+.wi-connect-card {
+  margin: 0.75rem auto;
+  padding: 0.85rem 0.9rem;
+  border-radius: 10px;
+}
+.wi-guide {
+  margin-top: 0.4rem;
+  border-radius: 6px;
+}
+.wi-guide summary {
+  padding: 0.3rem 0.45rem;
+  font-size: 0.74rem;
+}
+.voucher-exec-card {
+  border-radius: 8px !important;
+  padding: 0.45rem 0.55rem !important;
+}
+.voucher-exec-title { font-size: 0.88rem !important; }
+.voucher-exec-sub { font-size: 0.72rem !important; }

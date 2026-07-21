@@ -1,11 +1,13 @@
 // src/components/WarthogWallet.jsx — streamlined Warthog native wallet shell
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import CryptoJS from 'crypto-js';
 import { toast } from 'react-hot-toast';
+import { Settings, LayoutGrid } from 'lucide-react';
 import TransactionHistory from './TransactionHistory';
 import SubWallet from './SubWallet';
 import PersonalVaultMvp from './PersonalVaultMvp';
 import '../styles/warthog.css';
+import '../styles/subWallet.css';
 import {
   createWarthogApi,
   parseRecipientAddress,
@@ -39,6 +41,7 @@ import { resolveLiveNode, persistSelectedNode } from '../utils/nodeFailover.js';
 import { normalizeTxLookup, getTxConfirmationStatus } from '../utils/txProof.js';
 import { subWalletStorageSecret } from '../utils/bridgeConfig.js';
 import { SHARE_TOKEN } from '../utils/tokenNames.js';
+import { LOCAL_WWART } from '../utils/localTokens.js';
 import {
   listWalletEntries,
   getNamedWalletCipher,
@@ -64,30 +67,104 @@ const NODE_OPTIONS = [
   })),
 ];
 
-const AUTH_TABS = [
-  { id: 'saved', label: 'Saved' },
-  { id: 'derive', label: 'Seed phrase' },
-  { id: 'create', label: 'Create' },
-  { id: 'import', label: 'Private key' },
-  { id: 'login', label: 'Wallet file' },
-];
+/** Password field matching WartBunker BalanceCardAccess (prod login). */
+function PasswordField({
+  id,
+  label,
+  value,
+  onChange,
+  onKeyDown,
+  placeholder,
+  autoComplete = 'current-password',
+  autoFocus = false,
+  disabled = false,
+}) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div className="bca-field">
+      <label htmlFor={id} className="bca-label">
+        {label}
+      </label>
+      <div className="bca-password-wrap">
+        <input
+          id={id}
+          type={visible ? 'text' : 'password'}
+          value={value}
+          onChange={onChange}
+          onKeyDown={onKeyDown}
+          placeholder={placeholder}
+          className="input bca-password-input"
+          autoComplete={autoComplete}
+          autoFocus={autoFocus}
+          disabled={disabled}
+        />
+        <button
+          type="button"
+          className="bca-password-toggle"
+          onClick={() => setVisible((v) => !v)}
+          aria-label={visible ? 'Hide password' : 'Show password'}
+          tabIndex={-1}
+        >
+          {visible ? 'Hide' : 'Show'}
+        </button>
+      </div>
+    </div>
+  );
+}
 
 /** Known throwaway phrase for local UI / bridge testing only — never use with real funds. */
 const TEST_SEED_PHRASE =
   'demise wear federal fan flee oven plug accident know buffalo kingdom orange';
 
 const APP_TABS = [
-  { id: 'overview', label: 'Overview' },
+  { id: 'overview', label: 'Home' },
+  { id: 'subwallets', label: 'Sub wallets' },
   { id: 'send', label: 'Send' },
-  { id: 'subwallets', label: 'Sub-wallets' },
   { id: 'vault', label: 'Vault' },
-  { id: 'activity', label: 'Activity' },
+  { id: 'activity', label: 'History' },
 ];
 
 function shortHex(value, head = 8, tail = 6) {
   if (!value || typeof value !== 'string') return '—';
   if (value.length <= head + tail + 3) return value;
   return `${value.slice(0, head)}…${value.slice(-tail)}`;
+}
+
+/**
+ * Warthog main address — same compact meta-row chip as vault/sub addresses.
+ * Cyan chip; truncated on small screens; click to copy.
+ */
+function MainAddressRow({
+  address,
+  compact = false,
+  isSmallScreen = false,
+  copied = false,
+  onCopied,
+  label = 'Main address',
+  className = '',
+}) {
+  if (!address) return null;
+  const display = copied
+    ? 'Copied!'
+    : compact || isSmallScreen
+      ? shortHex(address, 6, 4)
+      : shortHex(address, 10, 8);
+  return (
+    <div className={`wh-meta-row${className ? ` ${className}` : ''}`}>
+      <span className="wh-meta-k">{label}</span>
+      <button
+        type="button"
+        className="wh-address-chip"
+        title={address}
+        onClick={() => {
+          navigator.clipboard?.writeText(address);
+          if (typeof onCopied === 'function') onCopied();
+        }}
+      >
+        {display}
+      </button>
+    </div>
+  );
 }
 
 const WarthogWallet = ({
@@ -101,6 +178,8 @@ const WarthogWallet = ({
   /** Cartesi L1 vault inspect snapshot from WalletIsland */
   l1Vault = null,
   onRefreshL1Vault,
+  /** Optimistic capacity update after mint_liquid / mint_wwart */
+  onOptimisticShareMint,
 }) => {
   const [deferredPrompt, setDeferredPrompt] = useState(null);
   const [walletData, setWalletData] = useState(null);
@@ -125,15 +204,18 @@ const WarthogWallet = ({
   const [nonceInput, setNonceInput] = useState('');
   const [wordCount, setWordCount] = useState('12');
   const [pathType, setPathType] = useState('hardened');
+  /** Guided access path: hub | login | create | have | derive | import | load (WartBunker BCA) */
+  const [accessPath, setAccessPath] = useState('hub');
+  /** @deprecated kept for save-modal / legacy handlers that still read walletAction */
   const [walletAction, setWalletAction] = useState(() =>
-    typeof window !== 'undefined' && listWalletEntries().length > 0 ? 'saved' : 'derive',
+    typeof window !== 'undefined' && listWalletEntries().length > 0 ? 'saved' : 'create',
   );
   const [error, setError] = useState(null);
   const [password, setPassword] = useState('');
   const [saveWalletConsent, setSaveWalletConsent] = useState(false);
-  // Prefer Saved list on first paint (not the separate "Unlock saved wallet" card)
   const [showPasswordPrompt, setShowPasswordPrompt] = useState(false);
   const [uploadedFile, setUploadedFile] = useState(null);
+  const [walletFileDragActive, setWalletFileDragActive] = useState(false);
   const [isWalletProcessed, setIsWalletProcessed] = useState(false);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   /** Named wallet currently selected for unlock / active session tag */
@@ -161,10 +243,15 @@ const WarthogWallet = ({
   const [showManageSaved, setShowManageSaved] = useState(false);
   const [selectedNode, setSelectedNode] = useState(() => {
     if (typeof window !== 'undefined') {
+      // Prefer stored pick; fall back to official DeFi testnet
       return localStorage.getItem('selectedNode') || DEFAULT_NODE_URL;
     }
     return DEFAULT_NODE_URL;
   });
+  const [showNodeMenu, setShowNodeMenu] = useState(false);
+  const nodeMenuRef = useRef(null);
+  const [showSectionMenu, setShowSectionMenu] = useState(false);
+  const sectionMenuRef = useRef(null);
   const [showDownloadPrompt, setShowDownloadPrompt] = useState(false);
   const [sending, setSending] = useState(false);
   const [walletBusy, setWalletBusy] = useState(false);
@@ -186,10 +273,73 @@ const WarthogWallet = ({
   const [overviewTab, setOverviewTab] = useState('account');
   const [copiedAddress, setCopiedAddress] = useState(false);
   const [mintWliqAmt, setMintWliqAmt] = useState('10');
+  /** 'wliq' | 'wwart' — share claim vs portable mock wWART against same capacity */
+  const [mintTokenChoice, setMintTokenChoice] = useState('wliq');
+  /** Live MetaMask ERC-20 wWART (mock) — separate from rollup claims */
+  const [mmWwartBal, setMmWwartBal] = useState(null);
+  const [burnWwartAmt, setBurnWwartAmt] = useState('');
+
+  // Load MetaMask wWART whenever liquid/vault/bridge surfaces may need it
+  useEffect(() => {
+    let cancelled = false;
+    const needMm =
+      overviewTab === 'liquid' || appTab === 'vault' || appTab === 'subwallets' || appTab === 'overview';
+    if (!needMm) return undefined;
+    (async () => {
+      try {
+        if (!LOCAL_WWART?.address || typeof window === 'undefined' || !window.ethereum) return;
+        const { BrowserProvider, Contract, formatUnits } = await import('ethers-v6');
+        const provider = new BrowserProvider(window.ethereum);
+        const accounts = await provider.send('eth_accounts', []);
+        if (!accounts?.length) return;
+        const token = new Contract(
+          LOCAL_WWART.address,
+          ['function balanceOf(address) view returns (uint256)'],
+          provider,
+        );
+        const bal = await token.balanceOf(accounts[0]);
+        if (!cancelled) setMmWwartBal(formatUnits(bal, 18));
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [l1Vault?.l1WwartClaim, l1Vault?.mintRemaining18, overviewTab, appTab]);
 
   useEffect(() => {
     localStorage.setItem('selectedNode', selectedNode);
   }, [selectedNode]);
+
+  // Close node gear / section menus on outside click / Escape
+  useEffect(() => {
+    if (!showNodeMenu && !showSectionMenu) return undefined;
+    const onPointer = (e) => {
+      if (showNodeMenu && nodeMenuRef.current && !nodeMenuRef.current.contains(e.target)) {
+        setShowNodeMenu(false);
+      }
+      if (
+        showSectionMenu &&
+        sectionMenuRef.current &&
+        !sectionMenuRef.current.contains(e.target)
+      ) {
+        setShowSectionMenu(false);
+      }
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        setShowNodeMenu(false);
+        setShowSectionMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', onPointer);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointer);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [showNodeMenu, showSectionMenu]);
 
   useEffect(() => {
     const handleBeforeInstallPrompt = (e) => {
@@ -279,11 +429,13 @@ const WarthogWallet = ({
   }, [wallet?.address]);
 
   useEffect(() => {
-    if (!wallet?.address || subWallets.length === 0) return;
+    if (!wallet?.address) return;
     try {
       const secret = subWalletStorageSecret(wallet.address);
+      const key = `warthogSubWallets:${wallet.address.toLowerCase()}`;
+      // Persist empty list too (so Remove last sub / Clear hidden actually sticks)
       const encrypted = CryptoJS.AES.encrypt(JSON.stringify(subWallets), secret).toString();
-      localStorage.setItem(`warthogSubWallets:${wallet.address.toLowerCase()}`, encrypted);
+      localStorage.setItem(key, encrypted);
     } catch (err) {
       console.error('Failed to persist subWallets:', err);
     }
@@ -678,31 +830,38 @@ const WarthogWallet = ({
 
   const importFromPrivateKey = async (privKey) => importWarthogWallet(privKey);
 
-  const handleWalletAction = async () => {
+  const handleWalletAction = async (forcedAction) => {
+    const action = typeof forcedAction === 'string' ? forcedAction : walletAction;
+    setWalletAction(action);
     setError(null);
     setIsWalletProcessed(false);
 
-    if (walletAction === 'login' && !uploadedFile) {
-      setError('Upload warthog_wallet.txt, or switch to Seed phrase login');
-      return;
-    }
-
-    if (walletAction === 'login') {
+    if (action === 'saved') {
       await loadWallet();
       return;
     }
 
-    if (walletAction === 'derive' && !mnemonic.trim()) {
+    if (action === 'login' && !uploadedFile) {
+      setError('Upload warthog_wallet.txt, or use another restore path');
+      return;
+    }
+
+    if (action === 'login') {
+      await loadWallet();
+      return;
+    }
+
+    if (action === 'derive' && !mnemonic.trim()) {
       setError('Please enter your 12 or 24-word seed phrase');
       return;
     }
 
-    if (walletAction === 'import' && !privateKeyInput) {
+    if (action === 'import' && !privateKeyInput) {
       setError('Please enter a private key');
       return;
     }
 
-    if (walletAction === 'derive') {
+    if (action === 'derive') {
       const words = mnemonic.trim().split(/\s+/).filter(Boolean);
       const expectedWordCount = Number(wordCount);
       if (words.length !== expectedWordCount) {
@@ -716,21 +875,21 @@ const WarthogWallet = ({
     setWalletBusy(true);
     try {
       let data;
-      if (walletAction === 'create') {
+      if (action === 'create') {
         data = await generateWallet(Number(wordCount), pathType);
-      } else if (walletAction === 'derive') {
+      } else if (action === 'derive') {
         data = await deriveWallet(mnemonic, Number(wordCount), pathType);
-      } else if (walletAction === 'import') {
+      } else if (action === 'import') {
         data = await importFromPrivateKey(privateKeyInput);
       } else {
-        setError(`Unknown wallet action: ${walletAction}`);
+        setError(`Unknown wallet action: ${action}`);
         return;
       }
 
       await activateWallet(data);
       setWalletData(data);
       // Only show backup modal when we have new material worth backing up
-      if (data.mnemonic || walletAction === 'import' || walletAction === 'create') {
+      if (data.mnemonic || action === 'import' || action === 'create') {
         setShowModal(true);
         setConsentToClose(false);
       }
@@ -738,7 +897,7 @@ const WarthogWallet = ({
       setPrivateKeyInput('');
     } catch (err) {
       const raw = err?.message || String(err);
-      let errorMessage = raw || `Failed to ${walletAction} wallet`;
+      let errorMessage = raw || `Failed to ${action} wallet`;
       if (/invalid mnemonic|invalid phrase|checksum|BIP39|word list/i.test(raw)) {
         errorMessage = `Invalid seed phrase. Check spelling, word count, and derivation path (hardened vs non-hardened).`;
       }
@@ -906,317 +1065,439 @@ const WarthogWallet = ({
     }
   };
 
-  const selectAuthTab = (id) => {
-    setWalletAction(id);
-    setError(null);
-    setMnemonic('');
-    setPrivateKeyInput('');
-    setUploadedFile(null);
-    setPassword('');
-    setConfirmPassword('');
-    setIsWalletProcessed(false);
-    if (id === 'saved') refreshSavedList();
-  };
-
   const networkBadgeClass = isDefiNode(selectedNode)
     ? 'network-badge network-badge--defi'
     : 'network-badge network-badge--main';
 
-  const renderSavedWalletPicker = () => (
-    <>
-      {savedEntries.length === 0 ? (
-        <p className="wh-muted">
-          No named wallets in this browser yet. Log in with a seed, then save with a name + password
-          (same idea as WartBunker).
-        </p>
-      ) : (
-        <>
-          <p className="wh-muted" style={{ marginBottom: '0.5rem' }}>
-            Select a saved account, enter its password, unlock.
-          </p>
-          <div className="wh-saved-list" role="listbox" aria-label="Saved wallets">
-            {savedEntries.map((entry) => (
-              <button
-                key={entry.id}
-                type="button"
-                role="option"
-                aria-selected={selectedSavedId === entry.id}
-                className={`wh-saved-card ${selectedSavedId === entry.id ? 'is-selected' : ''}`}
-                onClick={() => {
-                  setSelectedSavedId(entry.id);
-                  setWalletName(entry.kind === 'named' ? entry.id : '');
-                  setError(null);
-                }}
-              >
-                <span className="wh-saved-card__name">{entry.label}</span>
-                <span className="wh-saved-card__meta">
-                  {entry.kind === 'legacy' ? 'legacy slot' : 'named'}
-                </span>
-              </button>
-            ))}
-          </div>
-          <div className="form-group">
-            <label>Password</label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="Decrypt password"
-              className="input"
-              onKeyDown={(e) => e.key === 'Enter' && loadWallet()}
-              autoComplete="current-password"
-            />
-          </div>
-          <div className="button-group">
-            <button
-              type="button"
-              className="btn primary small"
-              onClick={loadWallet}
-              disabled={!selectedSavedId || !password}
-            >
-              Unlock
-            </button>
-            {selectedSavedId && (
-              <button
-                type="button"
-                className="btn danger small"
-                onClick={() => removeSavedWallet(selectedSavedId)}
-                title="Permanently delete this encrypted copy from the browser"
-              >
-                Delete saved
-              </button>
-            )}
-          </div>
-        </>
-      )}
-    </>
-  );
+  const hasSavedWallets = savedEntries.length > 0;
 
-  /* ─── Auth / unlock gate ─── */
+  const goAccessPath = (next) => {
+    setAccessPath(next);
+    setError(null);
+    setPassword('');
+    setConfirmPassword('');
+    setMnemonic('');
+    setPrivateKeyInput('');
+    setUploadedFile(null);
+    setWalletFileDragActive(false);
+    setIsWalletProcessed(false);
+    // keep walletAction in sync for existing create/derive/import/load handlers
+    const map = {
+      login: 'saved',
+      create: 'create',
+      derive: 'derive',
+      import: 'import',
+      load: 'login',
+      have: walletAction,
+      hub: walletAction,
+    };
+    if (map[next]) setWalletAction(map[next]);
+    if (next === 'login' || next === 'hub') refreshSavedList();
+    if (next === 'login' && savedEntries.length > 0 && !selectedSavedId) {
+      setSelectedSavedId(savedEntries[0].id);
+    }
+  };
+
+  const acceptWalletFile = (file) => {
+    if (!file) return;
+    setUploadedFile(file);
+    setError(null);
+  };
+
+  const pathTitle = {
+    hub: hasSavedWallets ? 'Welcome back' : 'Get started',
+    login: 'Unlock wallet',
+    create: 'Create wallet',
+    have: 'Restore wallet',
+    derive: 'Seed phrase',
+    import: 'Private key',
+    load: 'Wallet file',
+  }[accessPath] || 'Wallet';
+
+  const pathHint = {
+    hub: hasSavedWallets
+      ? 'Unlock a wallet saved in this browser, or start another path.'
+      : 'Create a new wallet, or restore one you already have.',
+    login: 'Choose a saved wallet and enter its password.',
+    create: 'Generate keys in this browser. You’ll back up the seed next.',
+    have: 'How do you want to restore access?',
+    derive: 'Enter the 12 or 24 word phrase for this wallet.',
+    import: 'Paste the 64-character private key.',
+    load: 'Open an encrypted warthog_wallet.txt file.',
+  }[accessPath] || '';
+
+  const showAccessBack = accessPath !== 'hub';
+  const accessBackTarget = ['derive', 'import', 'load'].includes(accessPath) ? 'have' : 'hub';
+
+  /* ─── Auth gate — WartBunker BalanceCardAccess (prod) guided hub ─── */
   const renderAuthGate = () => (
-    <div className="wh-auth">
-      {showPasswordPrompt && !wallet && (
-        <div className="wh-card wh-card--unlock">
-          <h3>Unlock saved wallet</h3>
-          <p className="wh-muted">
-            {selectedSavedId && selectedSavedId !== '__legacy__'
-              ? `Account “${selectedSavedId}”`
-              : selectedSavedId === '__legacy__'
-                ? 'Legacy default wallet'
-                : 'Encrypted wallet found in this browser'}
-          </p>
-          {savedEntries.length > 1 && (
-            <div className="form-group">
-              <label>Account</label>
-              <select
-                className="input"
-                value={selectedSavedId}
-                onChange={(e) => {
-                  const id = e.target.value;
-                  setSelectedSavedId(id);
-                  setWalletName(id === '__legacy__' ? '' : id);
-                }}
-              >
-                {savedEntries.map((e) => (
-                  <option key={e.id} value={e.id}>
-                    {e.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-          <div className="form-group">
-            <label>Password</label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="Decrypt password"
-              className="input"
-              onKeyDown={(e) => e.key === 'Enter' && loadWallet()}
-            />
-          </div>
-          <div className="form-group">
-            <label>Or upload wallet file</label>
-            <input type="file" accept=".txt" onChange={handleFileUpload} className="input" />
-          </div>
-          <div className="button-group">
-            <button type="button" onClick={loadWallet} className="btn primary small">
-              Unlock
-            </button>
+    <div className="bca">
+      <div className="bca-head">
+        {showAccessBack ? (
+          <button
+            type="button"
+            className="bca-back"
+            onClick={() => goAccessPath(accessBackTarget)}
+            disabled={walletBusy}
+          >
+            ← Back
+          </button>
+        ) : (
+          <span className="bca-kicker">No wallet open</span>
+        )}
+        <h3 className="bca-title">{pathTitle}</h3>
+        <p className="bca-hint">{pathHint}</p>
+      </div>
+
+      {accessPath === 'hub' && (
+        <div className="bca-paths">
+          {hasSavedWallets && (
             <button
               type="button"
-              onClick={() => {
-                setShowPasswordPrompt(false);
-                setPassword('');
-                setUploadedFile(null);
-                setWalletAction(savedEntries.length ? 'saved' : 'derive');
-              }}
-              className="btn secondary small"
+              className="bca-path bca-path--primary"
+              onClick={() => goAccessPath('login')}
             >
-              Use another method
+              <span className="bca-path__label">Unlock saved wallet</span>
+              <span className="bca-path__meta">
+                {savedEntries.length} in this browser
+              </span>
             </button>
-            {selectedSavedId && (
-              <button
-                type="button"
-                className="btn danger small"
-                onClick={() => removeSavedWallet(selectedSavedId)}
-              >
-                Delete saved
-              </button>
-            )}
-          </div>
+          )}
+          <button
+            type="button"
+            className={`bca-path${hasSavedWallets ? '' : ' bca-path--primary'}`}
+            onClick={() => goAccessPath('create')}
+          >
+            <span className="bca-path__label">Create new wallet</span>
+            <span className="bca-path__meta">Fresh seed phrase</span>
+          </button>
+          <button type="button" className="bca-path" onClick={() => goAccessPath('have')}>
+            <span className="bca-path__label">
+              {hasSavedWallets ? 'Other restore options' : 'I already have a wallet'}
+            </span>
+            <span className="bca-path__meta">Seed, key, or file</span>
+          </button>
         </div>
       )}
 
-      {(!showPasswordPrompt || wallet) && !isLoggedIn && (
-        <div className="wh-card">
-          <div className="wh-auth-tabs" role="tablist">
-            {AUTH_TABS.map((tab) => (
-              <button
-                key={tab.id}
-                type="button"
-                role="tab"
-                aria-selected={walletAction === tab.id}
-                className={`wh-auth-tab ${walletAction === tab.id ? 'is-active' : ''}`}
-                onClick={() => selectAuthTab(tab.id)}
-              >
-                {tab.label}
-              </button>
-            ))}
+      {accessPath === 'have' && (
+        <div className="bca-paths">
+          {hasSavedWallets && (
+            <button type="button" className="bca-path" onClick={() => goAccessPath('login')}>
+              <span className="bca-path__label">Saved in this browser</span>
+              <span className="bca-path__meta">
+                {savedEntries.length} wallet{savedEntries.length === 1 ? '' : 's'}
+              </span>
+            </button>
+          )}
+          <button type="button" className="bca-path" onClick={() => goAccessPath('derive')}>
+            <span className="bca-path__label">Seed phrase</span>
+            <span className="bca-path__meta">12 or 24 words</span>
+          </button>
+          <button type="button" className="bca-path" onClick={() => goAccessPath('import')}>
+            <span className="bca-path__label">Private key</span>
+            <span className="bca-path__meta">64-character hex</span>
+          </button>
+          <button type="button" className="bca-path" onClick={() => goAccessPath('load')}>
+            <span className="bca-path__label">Encrypted file</span>
+            <span className="bca-path__meta">warthog_wallet.txt</span>
+          </button>
+        </div>
+      )}
+
+      {accessPath === 'login' && (
+        <div className="bca-form">
+          <div className="bca-field">
+            <span className="bca-label">Wallet</span>
+            <div className="bca-paths" role="listbox" aria-label="Saved wallets">
+              {savedEntries.map((entry) => {
+                const selected = selectedSavedId === entry.id;
+                return (
+                  <button
+                    key={entry.id}
+                    type="button"
+                    role="option"
+                    aria-selected={selected}
+                    className={`bca-path${selected ? ' bca-path--primary' : ''}`}
+                    onClick={() => {
+                      setSelectedSavedId(entry.id);
+                      setWalletName(entry.kind === 'named' ? entry.id : '');
+                      setError(null);
+                    }}
+                    disabled={walletBusy}
+                  >
+                    <span className="bca-path__label" style={{ fontFamily: 'ui-monospace, monospace' }}>
+                      {entry.label}
+                    </span>
+                    <span className="bca-path__meta">
+                      {selected ? 'Selected' : entry.kind === 'legacy' ? 'Legacy slot' : 'Saved in this browser'}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
+          <PasswordField
+            id="bca-login-pw"
+            label="Password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && loadWallet()}
+            placeholder="Wallet password"
+            autoFocus
+            disabled={walletBusy}
+          />
+          <button
+            type="button"
+            className="btn primary bca-cta"
+            disabled={walletBusy || !password || !selectedSavedId}
+            onClick={loadWallet}
+          >
+            {walletBusy ? 'Unlocking…' : 'Unlock'}
+          </button>
+          {selectedSavedId && (
+            <button
+              type="button"
+              className="bca-back"
+              style={{ marginTop: '0.35rem' }}
+              onClick={() => removeSavedWallet(selectedSavedId)}
+              disabled={walletBusy}
+            >
+              Delete selected from this browser
+            </button>
+          )}
+        </div>
+      )}
 
-          <div className="wh-auth-panel">
-            {walletAction === 'saved' && renderSavedWalletPicker()}
+      {accessPath === 'create' && (
+        <div className="bca-form">
+          <div className="bca-field">
+            <label className="bca-label" htmlFor="bca-words">
+              Word count
+            </label>
+            <select
+              id="bca-words"
+              className="input"
+              value={wordCount}
+              onChange={(e) => setWordCount(e.target.value)}
+              disabled={walletBusy}
+            >
+              <option value="12">12 words</option>
+              <option value="24">24 words</option>
+            </select>
+          </div>
+          <div className="bca-field">
+            <label className="bca-label" htmlFor="bca-path">
+              Path
+            </label>
+            <select
+              id="bca-path"
+              className="input"
+              value={pathType}
+              onChange={(e) => setPathType(e.target.value)}
+              disabled={walletBusy}
+            >
+              <option value="hardened">Hardened BIP44</option>
+              <option value="non-hardened">Non-hardened</option>
+            </select>
+          </div>
+          <button
+            type="button"
+            className="btn primary bca-cta"
+            disabled={walletBusy}
+            onClick={() => handleWalletAction('create')}
+          >
+            {walletBusy ? 'Generating…' : 'Create wallet'}
+          </button>
+        </div>
+      )}
 
-            {walletAction === 'derive' && (
-              <>
-                <div className="form-group">
-                  <label>Seed phrase (12 or 24 words)</label>
-                  <textarea
-                    value={mnemonic}
-                    onChange={(e) => setMnemonic(e.target.value)}
-                    placeholder="Paste words separated by spaces"
-                    className="input wh-seed-input"
-                    rows={3}
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                </div>
-                <button
-                  type="button"
-                  className="btn danger small"
-                  onClick={() => {
-                    setMnemonic(TEST_SEED_PHRASE);
-                    setWordCount('12');
-                    setPathType('hardened');
-                    setError(null);
-                  }}
-                >
-                  Fill test seed
-                </button>
-                <div className="wh-row-2">
-                  <div className="form-group">
-                    <label>Word count</label>
-                    <select value={wordCount} onChange={(e) => setWordCount(e.target.value)} className="input">
-                      <option value="12">12 words</option>
-                      <option value="24">24 words</option>
-                    </select>
-                  </div>
-                  {wordCount === '12' && (
-                    <div className="form-group">
-                      <label>Derivation path</label>
-                      <select value={pathType} onChange={(e) => setPathType(e.target.value)} className="input">
-                        <option value="hardened">Hardened m/44&apos;/2070&apos;/0&apos;/0/0</option>
-                        <option value="non-hardened">Non-hardened m/44&apos;/2070&apos;/0/0/0</option>
-                      </select>
-                    </div>
-                  )}
-                </div>
-                <p className="wh-hint">
-                  Unlocks this session immediately. Optional encrypted backup afterward. Wrong path → wrong address — try the other if balance looks empty.
-                  Test seed hardened address starts with <code>0b5de62d…</code>.
-                </p>
-              </>
-            )}
-
-            {walletAction === 'create' && (
-              <>
-                <p className="wh-muted">Generate a fresh seed and address. Write the seed down before you continue.</p>
-                <div className="wh-row-2">
-                  <div className="form-group">
-                    <label>Word count</label>
-                    <select value={wordCount} onChange={(e) => setWordCount(e.target.value)} className="input">
-                      <option value="12">12 words</option>
-                      <option value="24">24 words</option>
-                    </select>
-                  </div>
-                  {wordCount === '12' && (
-                    <div className="form-group">
-                      <label>Derivation path</label>
-                      <select value={pathType} onChange={(e) => setPathType(e.target.value)} className="input">
-                        <option value="hardened">Hardened (recommended)</option>
-                        <option value="non-hardened">Non-hardened</option>
-                      </select>
-                    </div>
-                  )}
-                </div>
-              </>
-            )}
-
-            {walletAction === 'import' && (
-              <div className="form-group">
-                <label>Private key (64 hex chars)</label>
-                <input
-                  type="password"
-                  value={privateKeyInput}
-                  onChange={(e) => setPrivateKeyInput(e.target.value.replace(/\s/g, ''))}
-                  placeholder="Hex private key"
-                  className="input"
-                  autoComplete="off"
-                />
-              </div>
-            )}
-
-            {walletAction === 'login' && (
-              <>
-                <div className="form-group">
-                  <label>Wallet file (warthog_wallet.txt)</label>
-                  <input type="file" accept=".txt" onChange={handleFileUpload} className="input" />
-                  {uploadedFile && <p className="wh-hint">File loaded — enter password and unlock.</p>}
-                </div>
-                <div className="form-group">
-                  <label>Password</label>
-                  <input
-                    type="password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="Decrypt password"
-                    className="input"
-                  />
-                </div>
-              </>
-            )}
-
-            {walletAction !== 'saved' && (
-              <button
-                type="button"
-                onClick={handleWalletAction}
-                className="btn primary small wh-primary-cta"
+      {accessPath === 'derive' && (
+        <div className="bca-form">
+          <div className="bca-field">
+            <label className="bca-label" htmlFor="bca-seed">
+              Seed phrase
+            </label>
+            <textarea
+              id="bca-seed"
+              className="input bca-seed"
+              rows={3}
+              value={mnemonic}
+              onChange={(e) => setMnemonic(e.target.value)}
+              placeholder="12 or 24 words"
+              disabled={walletBusy}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+          <button
+            type="button"
+            className="bca-back"
+            disabled={walletBusy}
+            onClick={() => {
+              setMnemonic(TEST_SEED_PHRASE);
+              setWordCount('12');
+              setPathType('hardened');
+              setError(null);
+            }}
+          >
+            Fill demo test seed (lab only)
+          </button>
+          <div className="bca-row-2">
+            <div className="bca-field">
+              <label className="bca-label" htmlFor="bca-dwords">
+                Words
+              </label>
+              <select
+                id="bca-dwords"
+                className="input"
+                value={wordCount}
+                onChange={(e) => setWordCount(e.target.value)}
                 disabled={walletBusy}
               >
-                {walletBusy
-                  ? 'Working…'
-                  : walletAction === 'create'
-                    ? 'Create wallet'
-                    : walletAction === 'derive'
-                      ? 'Log in with seed'
-                      : walletAction === 'import'
-                        ? 'Import key'
-                        : 'Unlock file'}
-              </button>
-            )}
+                <option value="12">12</option>
+                <option value="24">24</option>
+              </select>
+            </div>
+            <div className="bca-field">
+              <label className="bca-label" htmlFor="bca-dpath">
+                Path
+              </label>
+              <select
+                id="bca-dpath"
+                className="input"
+                value={pathType}
+                onChange={(e) => setPathType(e.target.value)}
+                disabled={walletBusy}
+              >
+                <option value="hardened">BIP44</option>
+                <option value="non-hardened">Non-hardened</option>
+              </select>
+            </div>
           </div>
+          <button
+            type="button"
+            className="btn primary bca-cta"
+            disabled={walletBusy || !mnemonic.trim()}
+            onClick={() => handleWalletAction('derive')}
+          >
+            {walletBusy ? 'Working…' : 'Recover wallet'}
+          </button>
+        </div>
+      )}
+
+      {accessPath === 'import' && (
+        <div className="bca-form">
+          <div className="bca-field">
+            <label className="bca-label" htmlFor="bca-pk">
+              Private key
+            </label>
+            <input
+              id="bca-pk"
+              type="text"
+              className="input bca-seed"
+              value={privateKeyInput}
+              onChange={(e) => setPrivateKeyInput(e.target.value.trim())}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleWalletAction('import');
+              }}
+              placeholder="64-character hex"
+              disabled={walletBusy}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+          <button
+            type="button"
+            className="btn primary bca-cta"
+            disabled={walletBusy || !privateKeyInput}
+            onClick={() => handleWalletAction('import')}
+          >
+            {walletBusy ? 'Working…' : 'Import wallet'}
+          </button>
+        </div>
+      )}
+
+      {accessPath === 'load' && (
+        <div className="bca-form">
+          <div className="bca-field">
+            <span className="bca-label">Wallet file</span>
+            <div
+              className={`bca-dropzone${walletFileDragActive ? ' bca-dropzone--active' : ''}${
+                uploadedFile ? ' bca-dropzone--ready' : ''
+              }`}
+              onDragEnter={(e) => {
+                e.preventDefault();
+                setWalletFileDragActive(true);
+              }}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setWalletFileDragActive(true);
+              }}
+              onDragLeave={(e) => {
+                e.preventDefault();
+                setWalletFileDragActive(false);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                setWalletFileDragActive(false);
+                acceptWalletFile(e.dataTransfer.files?.[0] ?? null);
+              }}
+            >
+              <input
+                id="bca-file"
+                type="file"
+                accept=".txt,text/plain"
+                className="sr-only"
+                disabled={walletBusy}
+                onChange={(e) => {
+                  acceptWalletFile(e.target.files?.[0] ?? null);
+                  e.target.value = '';
+                }}
+              />
+              {uploadedFile ? (
+                <div className="bca-drop-inner">
+                  <p className="bca-drop-name">{uploadedFile.name}</p>
+                  <label htmlFor="bca-file" className="bca-drop-browse">
+                    Choose a different file
+                  </label>
+                </div>
+              ) : (
+                <div className="bca-drop-inner">
+                  <p className="bca-drop-prompt">Drag your encrypted wallet file here</p>
+                  <p className="bca-drop-or">or</p>
+                  <label htmlFor="bca-file" className="bca-drop-browse">
+                    Browse for file
+                  </label>
+                </div>
+              )}
+            </div>
+          </div>
+          <PasswordField
+            id="bca-file-pw"
+            label="File password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') handleWalletAction('login');
+            }}
+            placeholder="Encryption password"
+            disabled={walletBusy}
+          />
+          <button
+            type="button"
+            className="btn primary bca-cta"
+            disabled={walletBusy || !password || !uploadedFile}
+            onClick={() => handleWalletAction('login')}
+          >
+            {walletBusy ? 'Unlocking…' : 'Open file'}
+          </button>
+        </div>
+      )}
+
+      {error && !showModal && (
+        <div className="bca-error" role="alert">
+          {error}
         </div>
       )}
     </div>
@@ -1227,92 +1508,171 @@ const WarthogWallet = ({
     <div className="wh-dash">
       <header className="wh-header">
         <div className="wh-header-main">
-          <div className="wh-balance-block">
-            <span className="wh-balance-label">
-              {mempoolBalance && Number(mempoolBalance) > 0 ? 'Spendable' : 'Balance'}
-            </span>
-            <span className="wh-balance-value">
-              {balance !== null ? `${balance} WART` : '…'}
-              {isRefreshingBalance && <span className="wh-pulse" />}
-            </span>
-            {mempoolBalance && Number(mempoolBalance) > 0 && (
-              <span className="wh-balance-mempool" title="Reserved by unconfirmed mempool txs">
-                {mempoolBalance} mempool
+          <div className="wh-header-left">
+            <div className="wh-balance-block">
+              <span className="wh-balance-label">
+                {mempoolBalance && Number(mempoolBalance) > 0 ? 'Spendable' : 'Balance'}
               </span>
-            )}
-          </div>
-          <div className="wh-header-id-col">
+              <span className="wh-balance-value">
+                {balance !== null ? `${balance} WART` : '…'}
+                {isRefreshingBalance && <span className="wh-pulse" />}
+              </span>
+              {mempoolBalance && Number(mempoolBalance) > 0 && (
+                <span className="wh-balance-mempool" title="Reserved by unconfirmed mempool txs">
+                  {mempoolBalance} mempool
+                </span>
+              )}
+            </div>
             {walletName ? (
               <span className="wh-wallet-name" title="Saved account name">
                 {walletName}
               </span>
             ) : null}
-            <button
-              type="button"
-              className="wh-address-chip"
-              title={wallet.address}
-              onClick={() => {
-                navigator.clipboard?.writeText(wallet.address);
+            <MainAddressRow
+              address={wallet.address}
+              isSmallScreen={isSmallScreen767}
+              compact
+              copied={copiedAddress}
+              onCopied={() => {
                 setCopiedAddress(true);
                 setTimeout(() => setCopiedAddress(false), 1200);
               }}
-            >
-              {copiedAddress ? 'Copied!' : shortHex(wallet.address, 10, 8)}
-            </button>
+            />
+          </div>
+          <div className="wh-header-icons">
+            {/* Section nav — grid icon (not gear) */}
+            <div className="wh-section-menu" ref={sectionMenuRef}>
+              <button
+                type="button"
+                className={`wh-section-btn${showSectionMenu ? ' is-open' : ''}`}
+                aria-label="Sections"
+                aria-expanded={showSectionMenu}
+                aria-haspopup="menu"
+                title={`Section · ${APP_TABS.find((t) => t.id === appTab)?.label || 'Home'}`}
+                onClick={() => {
+                  setShowSectionMenu((v) => !v);
+                  setShowNodeMenu(false);
+                }}
+              >
+                <LayoutGrid size={16} strokeWidth={2.25} aria-hidden />
+              </button>
+              {showSectionMenu && (
+                <div className="wh-section-dropdown" role="menu" aria-label="Main sections">
+                  <div className="wh-node-menu-head">
+                    <span className="wh-node-menu-title">Go to</span>
+                    <span className="wh-section-current">
+                      {APP_TABS.find((t) => t.id === appTab)?.label || 'Home'}
+                    </span>
+                  </div>
+                  {APP_TABS.map((tab) => {
+                    const needsSeed = tab.id === 'subwallets' || tab.id === 'vault';
+                    const disabled = needsSeed && !wallet.mnemonic;
+                    const active = appTab === tab.id;
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        role="menuitem"
+                        disabled={disabled}
+                        className={`wh-section-item${active ? ' is-active' : ''}`}
+                        title={
+                          disabled
+                            ? 'Seed phrase required'
+                            : tab.id === 'vault'
+                              ? 'WART multi-sig vaults only'
+                              : tab.id === 'subwallets'
+                                ? 'Sub-wallets · fund & sweep'
+                                : undefined
+                        }
+                        onClick={() => {
+                          if (disabled) return;
+                          setAppTab(tab.id);
+                          setShowSectionMenu(false);
+                        }}
+                      >
+                        <span>{tab.label}</span>
+                        {active ? <span className="wh-section-check" aria-hidden>✓</span> : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Node settings — gear */}
+            <div className="wh-header-node" ref={nodeMenuRef}>
+              <button
+                type="button"
+                className={`wh-node-gear${showNodeMenu ? ' is-open' : ''}`}
+                aria-label="Node settings"
+                aria-expanded={showNodeMenu}
+                aria-haspopup="true"
+                title={`${isDefiNode(selectedNode) ? 'DeFi' : 'Mainnet'} · change node`}
+                onClick={() => {
+                  setShowNodeMenu((v) => !v);
+                  setShowSectionMenu(false);
+                }}
+              >
+                <Settings size={16} strokeWidth={2.25} aria-hidden />
+                <span
+                  className={`wh-node-gear-dot ${isDefiNode(selectedNode) ? 'is-defi' : 'is-main'}`}
+                />
+              </button>
+              {showNodeMenu && (
+                <div className="wh-node-menu" role="dialog" aria-label="RPC node">
+                  <div className="wh-node-menu-head">
+                    <span className="wh-node-menu-title">RPC node</span>
+                    <span className={networkBadgeClass}>
+                      {isDefiNode(selectedNode) ? 'DeFi' : 'Mainnet'}
+                    </span>
+                  </div>
+                  <select
+                    value={selectedNode}
+                    onChange={(e) => {
+                      setSelectedNode(e.target.value);
+                      setShowNodeMenu(false);
+                    }}
+                    className="input wh-node-select"
+                    aria-label="RPC node"
+                    autoFocus
+                  >
+                    {NODE_OPTIONS.map((node) => (
+                      <option key={node.url} value={node.url}>
+                        {node.name}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="wh-node-menu-hint">Default: DeFi Testnet (Official)</p>
+                </div>
+              )}
+            </div>
           </div>
         </div>
         <div className="wh-header-tools">
-          <span className={networkBadgeClass}>
-            {isDefiNode(selectedNode) ? 'DeFi' : 'Mainnet'}
-          </span>
-          <select
-            value={selectedNode}
-            onChange={(e) => setSelectedNode(e.target.value)}
-            className="input wh-node-select"
-            title="RPC node"
-          >
-            {NODE_OPTIONS.map((node) => (
-              <option key={node.url} value={node.url}>
-                {node.name}
-              </option>
-            ))}
-          </select>
-          <button
-            type="button"
-            className="btn primary small"
-            onClick={() => fetchBalanceAndNonce(wallet.address)}
-            disabled={isRefreshingBalance}
-          >
-            Refresh
-          </button>
-          <button type="button" className="btn secondary small" onClick={() => setShowDownloadPrompt(true)}>
-            Backup
-          </button>
-          <button type="button" className="btn danger small" onClick={clearWallet}>
-            Lock
-          </button>
+          <div className="wh-header-actions" role="group" aria-label="Wallet actions">
+            <button
+              type="button"
+              className="btn primary small"
+              onClick={() => fetchBalanceAndNonce(wallet.address)}
+              disabled={isRefreshingBalance}
+            >
+              Refresh
+            </button>
+            <button type="button" className="btn secondary small" onClick={() => setShowDownloadPrompt(true)}>
+              Backup
+            </button>
+            <button type="button" className="btn danger small" onClick={clearWallet}>
+              Lock
+            </button>
+          </div>
         </div>
       </header>
 
-      <nav className="wh-app-tabs" role="tablist" aria-label="Main">
-        {APP_TABS.map((tab) => {
-          const disabled = tab.id === 'subwallets' && !wallet.mnemonic;
-          return (
-            <button
-              key={tab.id}
-              type="button"
-              role="tab"
-              disabled={disabled}
-              title={disabled ? 'Seed phrase required for sub-wallets' : undefined}
-              aria-selected={appTab === tab.id}
-              className={`wh-app-tab ${appTab === tab.id ? 'is-active' : ''}`}
-              onClick={() => !disabled && setAppTab(tab.id)}
-            >
-              {tab.label}
-            </button>
-          );
-        })}
-      </nav>
+      <div className="wh-section-bar" aria-live="polite">
+        <span className="wh-section-bar-label">
+          {APP_TABS.find((t) => t.id === appTab)?.label || 'Home'}
+        </span>
+      </div>
 
       <div className="wh-panel">
         {appTab === 'overview' && (
@@ -1338,22 +1698,18 @@ const WarthogWallet = ({
 
             {overviewTab === 'account' && (
               <div className="wh-card wh-card--inset">
+                <div className="sw-card-meta" style={{ marginBottom: '0.55rem' }}>
+                  <MainAddressRow
+                    address={wallet.address}
+                    isSmallScreen={isSmallScreen767}
+                    copied={copiedAddress}
+                    onCopied={() => {
+                      setCopiedAddress(true);
+                      setTimeout(() => setCopiedAddress(false), 1200);
+                    }}
+                  />
+                </div>
                 <div className="wh-stat-grid">
-                  <div className="wh-stat">
-                    <span className="wh-stat-label">Address</span>
-                    <button
-                      type="button"
-                      className="wh-stat-value mono wh-linkish"
-                      title="Copy address"
-                      onClick={() => {
-                        navigator.clipboard?.writeText(wallet.address);
-                        setCopiedAddress(true);
-                        setTimeout(() => setCopiedAddress(false), 1200);
-                      }}
-                    >
-                      {copiedAddress ? 'Copied!' : wallet.address}
-                    </button>
-                  </div>
                   <div className="wh-stat">
                     <span className="wh-stat-label">Nonce</span>
                     <span className="wh-stat-value">{nextNonce ?? '—'}</span>
@@ -1379,148 +1735,404 @@ const WarthogWallet = ({
             {overviewTab === 'liquid' && (() => {
               const mintCap = computeWliqMintAvailable(l1Vault);
               const liquidNum = Number(mintCap.liquid);
+              const claimNum = Number(mintCap.claim || 0);
+              const usedNum = liquidNum + claimNum;
+              const refreshAll = () => {
+                if (typeof onRefreshL1Vault === 'function') onRefreshL1Vault();
+                (async () => {
+                  try {
+                    if (!LOCAL_WWART?.address || !window.ethereum) return;
+                    const { BrowserProvider, Contract, formatUnits } = await import('ethers-v6');
+                    const provider = new BrowserProvider(window.ethereum);
+                    const signer = await provider.getSigner();
+                    const me = await signer.getAddress();
+                    const token = new Contract(
+                      LOCAL_WWART.address,
+                      ['function balanceOf(address) view returns (uint256)'],
+                      provider,
+                    );
+                    const bal = await token.balanceOf(me);
+                    setMmWwartBal(formatUnits(bal, 18));
+                  } catch {
+                    /* */
+                  }
+                })();
+              };
               return (
               <div className="wh-card wh-card--inset">
-                <div className="wh-stat-grid" style={{ marginBottom: '0.65rem' }}>
+                {/* Compact summary — always visible */}
+                <div className="wh-stat-grid" style={{ marginBottom: '0.5rem' }}>
                   <div className="wh-stat">
-                    <span className="wh-stat-label">Available to mint</span>
+                    <span className="wh-stat-label">Available</span>
+                    <span className="wh-stat-value">{mintCap.available}</span>
+                  </div>
+                  <div className="wh-stat">
+                    <span className="wh-stat-label">Used</span>
                     <span className="wh-stat-value">
-                      {mintCap.available} {SHARE_TOKEN.symbol}
+                      {usedNum.toLocaleString(undefined, { maximumFractionDigits: 4 })}
                     </span>
                   </div>
                   <div className="wh-stat">
-                    <span className="wh-stat-label">Your balance</span>
-                    <span className="wh-stat-value">
-                      {mintCap.liquid} {SHARE_TOKEN.symbol}
-                    </span>
-                  </div>
-                  <div className="wh-stat">
-                    <span className="wh-stat-label">Backing capacity</span>
-                    <span className="wh-stat-value">
-                      {mintCap.capacity} {SHARE_TOKEN.symbol}
-                    </span>
+                    <span className="wh-stat-label">Capacity</span>
+                    <span className="wh-stat-value">{mintCap.capacity}</span>
                   </div>
                 </div>
-                <p className="wh-muted">
-                  {mintCap.hasBacking
-                    ? `Mint up to available (capacity − already minted). Backing from spoofed wWART / L1 portals.`
-                    : `No vault backing yet — rollup allows a small demo mint (≤ 1 ${SHARE_TOKEN.symbol}). Sweep sub → vault first for real capacity.`}
-                  {' '}
-                  {typeof onRefreshL1Vault === 'function' && (
-                    <button
-                      type="button"
-                      className="wh-linkish"
-                      onClick={() => onRefreshL1Vault()}
-                      disabled={propLoading}
-                    >
-                      Refresh vault
-                    </button>
+                <div className="wh-inline-burn" style={{ marginBottom: '0.5rem' }}>
+                  <button
+                    type="button"
+                    className="btn secondary small"
+                    onClick={refreshAll}
+                    disabled={propLoading}
+                  >
+                    Refresh
+                  </button>
+                  {!mintCap.hasBacking && (
+                    <span className="wh-hint">Lock WART first (sub → vault sweep)</span>
                   )}
-                </p>
-                <div className="wh-inline-burn">
-                  <input
-                    type="number"
-                    step="any"
-                    min="0"
-                    placeholder={
-                      mintCap.hasBacking
-                        ? `Max ${mintCap.available}`
-                        : `Mint ${SHARE_TOKEN.symbol}`
-                    }
-                    value={mintWliqAmt}
-                    onChange={(e) => setMintWliqAmt(e.target.value)}
-                    className="input"
-                  />
-                  <button
-                    type="button"
-                    className="btn secondary small"
-                    disabled={!mintCap.hasBacking || mintCap.remaining18 <= 0n}
-                    title="Fill available mint amount"
-                    onClick={() => setMintWliqAmt(mintCap.available)}
-                  >
-                    Max
-                  </button>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      if (!mintWliqAmt || Number(mintWliqAmt) <= 0) return;
-                      if (
-                        mintCap.hasBacking &&
-                        Number(mintWliqAmt) > Number(mintCap.available) + 1e-12
-                      ) {
-                        toast.error(
-                          `Only ${mintCap.available} ${SHARE_TOKEN.symbol} available to mint`,
-                        );
-                        setMintWliqAmt(mintCap.available);
-                        return;
-                      }
-                      try {
-                        await send({
-                          type: 'mint_liquid',
-                          amount: String(mintWliqAmt).trim(),
-                        });
-                        toast.success(`Mint submitted — ${mintWliqAmt} ${SHARE_TOKEN.symbol}`);
-                      } catch (e) {
-                        toast.error(e?.message || 'Mint failed');
-                      }
-                      if (typeof onRefreshL1Vault === 'function') {
-                        setTimeout(() => onRefreshL1Vault(), 4000);
-                      }
-                    }}
-                    className="btn primary small"
-                    disabled={
-                      propLoading ||
-                      !mintWliqAmt ||
-                      Number(mintWliqAmt) <= 0 ||
-                      (mintCap.hasBacking && mintCap.remaining18 <= 0n)
-                    }
-                  >
-                    Mint {SHARE_TOKEN.symbol}
-                  </button>
                 </div>
-                {mintCap.hasBacking && mintCap.remaining18 <= 0n && (
-                  <p className="wh-hint">
-                    Fully minted against current backing — burn {SHARE_TOKEN.symbol} or add more
-                    vault collateral to mint again.
-                  </p>
-                )}
-                <div className="wh-inline-burn">
-                  <input
-                    type="number"
-                    step="any"
-                    min="0"
-                    placeholder={
-                      liquidNum > 0
-                        ? `Burn ≤ ${mintCap.liquid}`
-                        : `Burn ${SHARE_TOKEN.symbol}`
-                    }
-                    value={burnAmt}
-                    onChange={(e) => setBurnAmt(e.target.value)}
-                    className="input"
-                  />
-                  <button
-                    type="button"
-                    className="btn secondary small"
-                    disabled={mintCap.liquid18 <= 0n}
-                    onClick={() => setBurnAmt(mintCap.liquid)}
-                  >
-                    Max
-                  </button>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      if (!burnAmt) return;
-                      await send({ type: 'burn_liquid', amount: burnAmt });
-                      if (typeof onRefreshL1Vault === 'function') {
-                        setTimeout(() => onRefreshL1Vault(), 4000);
-                      }
-                    }}
-                    className="btn danger small"
-                    disabled={!burnAmt || propLoading || mintCap.liquid18 <= 0n}
-                  >
-                    Burn {SHARE_TOKEN.symbol}
-                  </button>
-                </div>
+
+                <details className="wh-details">
+                  <summary>Capacity details</summary>
+                  <div className="wh-details-body">
+                    <p className="wh-hint">
+                      Shared pool: locked WART → capacity. Mint uses capacity (Used ↑). Depositing
+                      MetaMask wWART back is inventory only (Used unchanged). Burn frees Available.
+                      Release locked WART (Bridge) is optional and separate from burn.
+                    </p>
+                    <div className="wh-stat-grid">
+                      <div className="wh-stat">
+                        <span className="wh-stat-label">WLIQ held</span>
+                        <span className="wh-stat-value">{mintCap.liquid}</span>
+                      </div>
+                      <div className="wh-stat">
+                        <span className="wh-stat-label">wWART claims</span>
+                        <span className="wh-stat-value">{mintCap.claim || '0'}</span>
+                      </div>
+                      <div className="wh-stat">
+                        <span className="wh-stat-label">MetaMask wWART</span>
+                        <span className="wh-stat-value">
+                          {mmWwartBal != null
+                            ? Number(mmWwartBal).toLocaleString(undefined, {
+                                maximumFractionDigits: 4,
+                              })
+                            : '—'}
+                        </span>
+                      </div>
+                      <div className="wh-stat">
+                        <span className="wh-stat-label">Locked WART?</span>
+                        <span className="wh-stat-value">
+                          {mintCap.hasLockedWart ? 'yes' : 'no'}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </details>
+
+                <details className="wh-details">
+                  <summary>Mint (uses capacity)</summary>
+                  <div className="wh-details-body">
+                    <div className="wh-inline-burn" style={{ marginBottom: '0.5rem', gap: '0.5rem' }}>
+                      <span className="wh-hint">Mint as:</span>
+                      <button
+                        type="button"
+                        className={`btn small ${mintTokenChoice === 'wliq' ? 'primary' : 'secondary'}`}
+                        onClick={() => setMintTokenChoice('wliq')}
+                      >
+                        {SHARE_TOKEN.symbol}
+                      </button>
+                      <button
+                        type="button"
+                        className={`btn small ${mintTokenChoice === 'wwart' ? 'primary' : 'secondary'}`}
+                        onClick={() => setMintTokenChoice('wwart')}
+                      >
+                        wWART
+                      </button>
+                    </div>
+                    <p className="wh-hint">
+                      {mintTokenChoice === 'wwart'
+                        ? 'Needs locked WART. Shares available capacity with WLIQ. Caps to available; mirrors to MetaMask after rollup accept.'
+                        : `${SHARE_TOKEN.symbol} share only (no MetaMask token). Same capacity pool.`}
+                    </p>
+                    <div className="wh-inline-burn">
+                      <input
+                        type="number"
+                        step="any"
+                        min="0"
+                        placeholder={
+                          mintCap.hasBacking ? `Max ${mintCap.available}` : 'No capacity'
+                        }
+                        value={mintWliqAmt}
+                        onChange={(e) => setMintWliqAmt(e.target.value)}
+                        className="input"
+                      />
+                      <button
+                        type="button"
+                        className="btn secondary small"
+                        disabled={!mintCap.hasBacking || mintCap.remaining18 <= 0n}
+                        onClick={() => setMintWliqAmt(mintCap.available)}
+                      >
+                        Max
+                      </button>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          if (!mintWliqAmt || Number(mintWliqAmt) <= 0) return;
+                          try {
+                            const isWwart = mintTokenChoice === 'wwart';
+                            let amtStr = String(mintWliqAmt).trim();
+                            if (!mintCap.hasBacking || mintCap.remaining18 <= 0n) {
+                              toast.error(
+                                'No capacity — lock WART first. WLIQ/wWART share one pool.',
+                              );
+                              return;
+                            }
+                            if (isWwart && !mintCap.hasLockedWart) {
+                              toast.error(
+                                'wWART needs locked Warthog WART (sweep sub → vault first).',
+                              );
+                              return;
+                            }
+                            if (Number(amtStr) > Number(mintCap.available) + 1e-12) {
+                              amtStr = mintCap.available;
+                              setMintWliqAmt(amtStr);
+                              toast(`Capped to ${amtStr} available`, { duration: 4000 });
+                            }
+                            if (!amtStr || Number(amtStr) <= 0) {
+                              toast.error('Nothing available to mint');
+                              return;
+                            }
+                            // Optimistic once BEFORE send so refresh after tx cannot double-add.
+                            if (typeof onOptimisticShareMint === 'function') {
+                              onOptimisticShareMint({
+                                kind: isWwart ? 'wwart' : 'wliq',
+                                amountHuman: amtStr,
+                                direction: 'mint',
+                              });
+                            }
+                            try {
+                              await send(
+                                isWwart
+                                  ? {
+                                      type: 'mint_wwart',
+                                      amount: amtStr,
+                                      // Bind claim to live L1 token so redeploys invalidate old capacity use
+                                      tokenAddress: LOCAL_WWART?.address || undefined,
+                                    }
+                                  : {
+                                      type: 'mint_liquid',
+                                      amount: amtStr,
+                                    },
+                              );
+                            } catch (sendErr) {
+                              // Reverse optimistic bump
+                              if (typeof onOptimisticShareMint === 'function') {
+                                onOptimisticShareMint({
+                                  kind: isWwart ? 'wwart' : 'wliq',
+                                  amountHuman: amtStr,
+                                  direction: 'burn',
+                                });
+                              }
+                              throw sendErr;
+                            }
+                            if (!isWwart) {
+                              toast.success(`Minted ${amtStr} ${SHARE_TOKEN.symbol} · capacity used`);
+                            } else {
+                              // Product path: rollup claim only. L1 ERC-20 arrives via voucher /
+                              // authorized minter — never open-mint from the connected wallet.
+                              let l1Note = `Claim +${amtStr} wWART (capacity used).`;
+                              const allowOpen =
+                                LOCAL_WWART?.openMint === true && LOCAL_WWART?.address;
+                              if (allowOpen && window.ethereum) {
+                                try {
+                                  const { BrowserProvider, Contract, parseUnits, formatUnits } =
+                                    await import('ethers-v6');
+                                  const provider = new BrowserProvider(window.ethereum);
+                                  const signer = await provider.getSigner();
+                                  const me = await signer.getAddress();
+                                  const token = new Contract(
+                                    LOCAL_WWART.address,
+                                    [
+                                      'function mint(address to, uint256 amount) external',
+                                      'function balanceOf(address) view returns (uint256)',
+                                    ],
+                                    signer,
+                                  );
+                                  const tx = await token.mint(me, parseUnits(amtStr, 18));
+                                  await tx.wait();
+                                  const bal = await token.balanceOf(me);
+                                  setMmWwartBal(formatUnits(bal, 18));
+                                  l1Note += ` MetaMask ${formatUnits(bal, 18)}.`;
+                                } catch (l1e) {
+                                  console.warn('[mint_wwart] L1 mirror failed', l1e);
+                                  l1Note += ' MetaMask mint failed.';
+                                }
+                              } else {
+                                l1Note +=
+                                  ' Not in MetaMask yet — L1 portals → Withdraw voucher, then Vouchers tab → Execute on L1.';
+                              }
+                              toast.success(l1Note, { duration: 9000 });
+                            }
+                          } catch (e) {
+                            toast.error(e?.message || 'Mint failed');
+                          }
+                          setTimeout(refreshAll, 5000);
+                        }}
+                        className="btn primary small"
+                        disabled={
+                          propLoading ||
+                          !mintWliqAmt ||
+                          Number(mintWliqAmt) <= 0 ||
+                          mintCap.remaining18 <= 0n
+                        }
+                      >
+                        Mint {mintTokenChoice === 'wwart' ? 'wWART' : SHARE_TOKEN.symbol}
+                      </button>
+                    </div>
+                  </div>
+                </details>
+
+                <details className="wh-details">
+                  <summary>
+                    Burn WLIQ (free capacity) · held {mintCap.liquid}
+                  </summary>
+                  <div className="wh-details-body">
+                    <p className="wh-hint">
+                      Burns rollup {SHARE_TOKEN.symbol} and frees shared capacity for new WLIQ or wWART mints.
+                    </p>
+                    <div className="wh-inline-burn">
+                      <input
+                        type="number"
+                        step="any"
+                        min="0"
+                        placeholder={liquidNum > 0 ? `Burn ≤ ${mintCap.liquid}` : 'No WLIQ'}
+                        value={burnAmt}
+                        onChange={(e) => setBurnAmt(e.target.value)}
+                        className="input"
+                      />
+                      <button
+                        type="button"
+                        className="btn secondary small"
+                        disabled={mintCap.liquid18 <= 0n}
+                        onClick={() => setBurnAmt(mintCap.liquid)}
+                      >
+                        Max
+                      </button>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          if (!burnAmt) return;
+                          try {
+                            if (typeof onOptimisticShareMint === 'function') {
+                              onOptimisticShareMint({
+                                kind: 'wliq',
+                                amountHuman: burnAmt,
+                                direction: 'burn',
+                              });
+                            }
+                            try {
+                              await send({ type: 'burn_liquid', amount: burnAmt });
+                            } catch (sendErr) {
+                              if (typeof onOptimisticShareMint === 'function') {
+                                onOptimisticShareMint({
+                                  kind: 'wliq',
+                                  amountHuman: burnAmt,
+                                  direction: 'mint',
+                                });
+                              }
+                              throw sendErr;
+                            }
+                            toast.success(`Burned ${burnAmt} ${SHARE_TOKEN.symbol} · capacity freed`);
+                          } catch (e) {
+                            toast.error(e?.message || 'Burn failed');
+                          }
+                          setTimeout(refreshAll, 4000);
+                        }}
+                        className="btn danger small"
+                        disabled={!burnAmt || propLoading || mintCap.liquid18 <= 0n}
+                      >
+                        Burn {SHARE_TOKEN.symbol}
+                      </button>
+                    </div>
+                  </div>
+                </details>
+
+                <details className="wh-details">
+                  <summary>
+                    Burn wWART claims (free capacity) · claims {mintCap.claim || '0'}
+                  </summary>
+                  <div className="wh-details-body">
+                    <p className="wh-hint">
+                      Backend frees <strong>Used</strong> capacity when you burn the claim.
+                      Depositing MetaMask wWART first only restores rollup balance — it does not
+                      free Available. After burn you may optionally <strong>Release</strong>{' '}
+                      locked WART on Bridge (unlock collateral → Vault → main).
+                    </p>
+                    <div className="wh-inline-burn">
+                      <input
+                        type="number"
+                        step="any"
+                        min="0"
+                        placeholder={
+                          claimNum > 0 ? `Burn ≤ ${mintCap.claim}` : 'No wWART claims'
+                        }
+                        value={burnWwartAmt}
+                        onChange={(e) => setBurnWwartAmt(e.target.value)}
+                        className="input"
+                      />
+                      <button
+                        type="button"
+                        className="btn secondary small"
+                        disabled={claimNum <= 0}
+                        onClick={() => setBurnWwartAmt(mintCap.claim || '0')}
+                      >
+                        Max
+                      </button>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          if (!burnWwartAmt || Number(burnWwartAmt) <= 0) return;
+                          let amt = String(burnWwartAmt).trim();
+                          if (Number(amt) > claimNum + 1e-12) {
+                            amt = mintCap.claim;
+                            setBurnWwartAmt(amt);
+                          }
+                          try {
+                            if (typeof onOptimisticShareMint === 'function') {
+                              onOptimisticShareMint({
+                                kind: 'wwart',
+                                amountHuman: amt,
+                                direction: 'burn',
+                              });
+                            }
+                            try {
+                              await send({ type: 'burn_wwart', amount: amt });
+                            } catch (sendErr) {
+                              if (typeof onOptimisticShareMint === 'function') {
+                                onOptimisticShareMint({
+                                  kind: 'wwart',
+                                  amountHuman: amt,
+                                  direction: 'mint',
+                                });
+                              }
+                              throw sendErr;
+                            }
+                            toast.success(
+                              `Burned ${amt} wWART claim · capacity freed (same pool as WLIQ)`,
+                              { duration: 6000 },
+                            );
+                          } catch (e) {
+                            toast.error(e?.message || 'Burn wWART failed');
+                          }
+                          setTimeout(refreshAll, 4000);
+                        }}
+                        className="btn danger small"
+                        disabled={!burnWwartAmt || propLoading || claimNum <= 0}
+                      >
+                        Burn wWART claims
+                      </button>
+                    </div>
+                  </div>
+                </details>
               </div>
               );
             })()}
@@ -1592,6 +2204,27 @@ const WarthogWallet = ({
                     </button>
                   )}
                 </div>
+
+                {wallet.mnemonic && (
+                  <details className="wh-tools-exp" style={{ marginTop: '1rem' }}>
+                    <summary>Experimental: personal asset vault</summary>
+                    <p className="wh-hint">
+                      Separate from WART multi-sig vaults (use the <strong>Vault</strong> tab for those).
+                    </p>
+                    <PersonalVaultMvp
+                      mainWallet={wallet}
+                      mainMnemonic={wallet.mnemonic}
+                      selectedNode={selectedNode}
+                      l1Address={l1Address}
+                      send={send}
+                      sendTransaction={handleSendTransaction}
+                      getWartTxProof={getWartTxProof}
+                      fetchBalanceAndNonce={fetchBalanceAndNonce}
+                      loading={propLoading}
+                      setLoading={propSetLoading}
+                    />
+                  </details>
+                )}
               </div>
             )}
           </div>
@@ -1674,7 +2307,7 @@ const WarthogWallet = ({
           </div>
         )}
 
-        {appTab === 'subwallets' && wallet.mnemonic && (
+        {(appTab === 'subwallets' || appTab === 'vault') && wallet.mnemonic && (
           <SubWallet
             mainWallet={wallet}
             mainMnemonic={wallet.mnemonic}
@@ -1701,38 +2334,37 @@ const WarthogWallet = ({
             setWartFee={setFee}
             getWartTxProof={getWartTxProof}
             sentTransactions={sentTransactions}
+            focusMode={appTab === 'vault' ? 'vault' : 'bridge'}
+            l1Vault={l1Vault}
+            mmWwartBal={mmWwartBal}
+            onRefreshL1Vault={onRefreshL1Vault}
+            onRefreshMmWwart={async () => {
+              try {
+                if (!LOCAL_WWART?.address || !window.ethereum) return;
+                const { BrowserProvider, Contract, formatUnits } = await import('ethers-v6');
+                const provider = new BrowserProvider(window.ethereum);
+                const accounts = await provider.send('eth_accounts', []);
+                if (!accounts?.length) return;
+                const token = new Contract(
+                  LOCAL_WWART.address,
+                  ['function balanceOf(address) view returns (uint256)'],
+                  provider,
+                );
+                const bal = await token.balanceOf(accounts[0]);
+                setMmWwartBal(formatUnits(bal, 18));
+              } catch {
+                /* ignore */
+              }
+            }}
           />
         )}
 
-        {appTab === 'subwallets' && !wallet.mnemonic && (
+        {(appTab === 'subwallets' || appTab === 'vault') && !wallet.mnemonic && (
           <div className="wh-card wh-card--inset">
             <p className="wh-muted" style={{ marginBottom: 0 }}>
-              Sub-wallets need a seed-based wallet. Log in with a seed phrase (not private-key-only import).
+              Bridge vaults need a seed-based wallet. Log in with a seed phrase (not private-key-only
+              import).
             </p>
-          </div>
-        )}
-
-        {appTab === 'vault' && (
-          <div className="wh-panel-stack">
-            <p className="wh-hint" style={{ marginTop: 0 }}>
-              Native token + personal vault wizard. For the bridge multi-sig vault, use{' '}
-              <button type="button" className="wh-linkish" onClick={() => setAppTab('subwallets')}>
-                Sub-wallets
-              </button>
-              .
-            </p>
-            <PersonalVaultMvp
-              mainWallet={wallet}
-              mainMnemonic={wallet.mnemonic}
-              selectedNode={selectedNode}
-              l1Address={l1Address}
-              send={send}
-              sendTransaction={handleSendTransaction}
-              getWartTxProof={getWartTxProof}
-              fetchBalanceAndNonce={fetchBalanceAndNonce}
-              loading={propLoading}
-              setLoading={propSetLoading}
-            />
           </div>
         )}
 
@@ -1741,41 +2373,68 @@ const WarthogWallet = ({
             <TransactionHistory address={wallet.address} node={selectedNode} />
 
             {sentTransactions.length > 0 && (
-              <div className="wh-card wh-card--inset">
-                <div className="wh-section-head">
-                  <h3>Session sends {isPollingTx && <span className="wh-pulse" />}</h3>
+              <div className="sw-card activity-shell">
+                <div className="sw-card-head">
+                  <h4 className="sw-card-title">
+                    Session sends
+                    {isPollingTx ? <span className="wh-pulse" /> : null}
+                  </h4>
                   <button type="button" onClick={updateTxStatuses} className="btn secondary small">
                     Refresh status
                   </button>
                 </div>
-                <ul className="wh-tx-list">
+                <ul className="activity-list">
                   {sentTransactions.map((tx, index) => (
-                    <li key={index} className="tx-log-item">
-                      <p>
-                        <strong>{tx.amount}</strong> WART →{' '}
-                        <button
-                          type="button"
-                          className="wh-linkish"
-                          onClick={() => copyToClipboard(tx.toAddr, setCopiedToAddr)}
-                        >
-                          {isSmallScreen767 ? shortHex(tx.toAddr) : tx.toAddr}
-                          {copiedToAddr === tx.toAddr ? ' ✓' : ''}
-                        </button>
-                      </p>
-                      <p className="wh-muted">
-                        {tx.timestamp} · nonce {tx.nonce} · {tx.status}
-                        {tx.confirmations ? ` (${tx.confirmations} conf)` : ''}
-                      </p>
-                      <p>
-                        <button
-                          type="button"
-                          className="wh-linkish mono"
-                          onClick={() => copyToClipboard(tx.txHash, setCopiedTxId)}
-                        >
-                          {shortHex(tx.txHash, 12, 8)}
-                          {copiedTxId === tx.txHash ? ' ✓' : ''}
-                        </button>
-                      </p>
+                    <li key={index} className="sw-card activity-tx-card">
+                      <div className="sw-card-meta">
+                        <div className="sw-meta-row">
+                          <span className="sw-meta-k">Amount</span>
+                          <span className="sw-meta-v">{tx.amount} WART</span>
+                        </div>
+                        <div className="sw-meta-row">
+                          <span className="sw-meta-k">To</span>
+                          <button
+                            type="button"
+                            className="sw-meta-v mono sw-link"
+                            title={tx.toAddr}
+                            onClick={() => copyToClipboard(tx.toAddr, setCopiedToAddr)}
+                          >
+                            {shortHex(tx.toAddr)}
+                            {copiedToAddr === tx.toAddr ? ' ✓' : ''}
+                          </button>
+                        </div>
+                        <div className="sw-meta-row">
+                          <span className="sw-meta-k">Status</span>
+                          <span className="sw-meta-v">
+                            {tx.status}
+                            {tx.confirmations ? ` · ${tx.confirmations} conf` : ''}
+                          </span>
+                        </div>
+                        <div className="sw-meta-row">
+                          <span className="sw-meta-k">Nonce</span>
+                          <span className="sw-meta-v">{tx.nonce ?? '—'}</span>
+                        </div>
+                        {tx.timestamp ? (
+                          <div className="sw-meta-row">
+                            <span className="sw-meta-k">When</span>
+                            <span className="sw-meta-v">{tx.timestamp}</span>
+                          </div>
+                        ) : null}
+                        {tx.txHash ? (
+                          <div className="sw-meta-row">
+                            <span className="sw-meta-k">Tx</span>
+                            <button
+                              type="button"
+                              className="sw-meta-v mono sw-link"
+                              title={tx.txHash}
+                              onClick={() => copyToClipboard(tx.txHash, setCopiedTxId)}
+                            >
+                              {shortHex(tx.txHash, 10, 8)}
+                              {copiedTxId === tx.txHash ? ' ✓' : ''}
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
                     </li>
                   ))}
                 </ul>
@@ -1783,14 +2442,27 @@ const WarthogWallet = ({
             )}
 
             {failedTransactions.length > 0 && (
-              <div className="wh-card wh-card--inset">
-                <h3>Failed this session</h3>
-                <ul className="wh-tx-list">
+              <div className="sw-card activity-shell">
+                <div className="sw-card-head">
+                  <h4 className="sw-card-title">Failed this session</h4>
+                </div>
+                <ul className="activity-list">
                   {failedTransactions.map((tx, index) => (
-                    <li key={index} className="tx-log-item">
-                      <p>
-                        {tx.amount} → {shortHex(tx.toAddr)} · {tx.error}
-                      </p>
+                    <li key={index} className="sw-card activity-tx-card is-out">
+                      <div className="sw-card-meta">
+                        <div className="sw-meta-row">
+                          <span className="sw-meta-k">Amount</span>
+                          <span className="sw-meta-v">{tx.amount} WART</span>
+                        </div>
+                        <div className="sw-meta-row">
+                          <span className="sw-meta-k">To</span>
+                          <span className="sw-meta-v mono">{shortHex(tx.toAddr)}</span>
+                        </div>
+                        <div className="sw-meta-row">
+                          <span className="sw-meta-k">Error</span>
+                          <span className="sw-meta-v">{tx.error || '—'}</span>
+                        </div>
+                      </div>
                     </li>
                   ))}
                 </ul>
@@ -1804,10 +2476,12 @@ const WarthogWallet = ({
 
   return (
     <div className="warthog-section">
-      <div className="wh-title-row">
-        <h2>Warthog Wallet</h2>
-        <p className="wh-subtitle">Native WART · sub-wallets · personal vaults</p>
-      </div>
+      {isLoggedIn && (
+        <div className="wh-title-row">
+          <h2>Warthog Wallet</h2>
+          <p className="wh-subtitle">Native WART · bridge vaults · multi-sig</p>
+        </div>
+      )}
 
       {deferredPrompt && (
         <button type="button" onClick={handleInstallClick} className="btn primary small wh-install">
@@ -1818,7 +2492,7 @@ const WarthogWallet = ({
       {!isLoggedIn && renderAuthGate()}
       {isLoggedIn && wallet && renderDashboard()}
 
-      {error && (
+      {error && isLoggedIn && (
         <div className="error" role="alert">
           <strong>Error:</strong> {error}
         </div>
@@ -1831,6 +2505,17 @@ const WarthogWallet = ({
             <p className="wh-muted">
               Encrypts keys into this browser under a name (like WartBunker). Also download a file if you want.
             </p>
+            <div className="sw-card-meta" style={{ marginBottom: '0.75rem' }}>
+              <MainAddressRow
+                address={wallet.address}
+                isSmallScreen={isSmallScreen767}
+                copied={copiedAddress}
+                onCopied={() => {
+                  setCopiedAddress(true);
+                  setTimeout(() => setCopiedAddress(false), 1200);
+                }}
+              />
+            </div>
             <div className="form-group">
               <label>Wallet name</label>
               <input
@@ -1962,7 +2647,17 @@ const WarthogWallet = ({
                 <p className="wh-seed-text">{walletData.mnemonic}</p>
               </div>
             )}
-            <p className="mono wh-muted">Address: {walletData.address}</p>
+            <div className="sw-card-meta" style={{ marginBottom: '0.65rem' }}>
+              <MainAddressRow
+                address={walletData.address}
+                isSmallScreen={isSmallScreen767}
+                copied={copiedAddress}
+                onCopied={() => {
+                  setCopiedAddress(true);
+                  setTimeout(() => setCopiedAddress(false), 1200);
+                }}
+              />
+            </div>
             <details className="wh-advanced">
               <summary>Show private / public keys</summary>
               <p className="mono">

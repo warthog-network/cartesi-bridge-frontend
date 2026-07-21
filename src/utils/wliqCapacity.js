@@ -1,7 +1,14 @@
 /**
- * Mirror cartesi-bridge-backend backingCapacity18 / mint remaining.
- * Inspect payload: liquid (18-dec wei string), wWART (E8), CTSI (18-dec),
- * usdc (6-dec), eth (human ether string via formatEther).
+ * Mirror cartesi-bridge-backend backingCapacity18 / shareClaimed18.
+ *
+ * Capacity (shared by WLIQ + wWART claims):
+ *   spoofedOutstandingE8 * 1e10  + CTSI + ethWei + usdc*1e12
+ * Claimed:
+ *   liquid + l1WwartClaim
+ * Available:
+ *   capacity − claimed
+ *
+ * Inspect may send mintCapacity18 / mintRemaining18 directly (preferred).
  */
 
 function toBigIntSafe(v) {
@@ -9,7 +16,6 @@ function toBigIntSafe(v) {
   if (typeof v === 'bigint') return v;
   const s = String(v).trim();
   if (!s || s === '0') return 0n;
-  // human decimal → 18-dec wei
   if (s.includes('.')) {
     const [w, f = ''] = s.split('.');
     const frac = (f + '000000000000000000').slice(0, 18);
@@ -41,40 +47,76 @@ export function formatUnits18(raw, maxFrac = 8) {
 
 /**
  * @param {object|null} vault — inspect vault payload (WalletIsland state)
- * @returns {{ capacity18: bigint, liquid18: bigint, remaining18: bigint, capacity: string, liquid: string, available: string, hasBacking: boolean }}
  */
 export function computeWliqMintAvailable(vault) {
   const empty = {
     capacity18: 0n,
     liquid18: 0n,
+    claim18: 0n,
     remaining18: 0n,
     capacity: '0',
     liquid: '0',
+    claim: '0',
     available: '0',
     hasBacking: false,
+    hasLockedWart: false,
+    spoofedOutstandingE8: 0n,
   };
   if (!vault) return empty;
 
   try {
-    const wWART = toBigIntSafe(vault.wWART); // E8
-    const CTSI = toBigIntSafe(vault.CTSI); // 18-dec
-    const usdc = toBigIntSafe(vault.usdc); // 6-dec
-    // eth is human string from formatEther on inspect
+    // Prefer server capacity when present, but ALWAYS derive Used/Available from
+    // liquid + l1WwartClaim (not stale mintRemaining18 / mintClaimed18). Those
+    // can lag or disagree after optimistic updates.
+    if (vault.mintCapacity18 != null) {
+      const capacity18 = toBigIntSafe(vault.mintCapacity18);
+      const liquid18 = toBigIntSafe(vault.liquid);
+      const claim18 = toBigIntSafe(vault.l1WwartClaim);
+      const claimed18 = liquid18 + claim18;
+      const remaining18 =
+        capacity18 > claimed18 ? capacity18 - claimed18 : 0n;
+      const spoofed = toBigIntSafe(vault.outstandingE8);
+      return {
+        capacity18,
+        liquid18,
+        claim18,
+        remaining18,
+        capacity: formatUnits18(capacity18),
+        liquid: formatUnits18(liquid18),
+        claim: formatUnits18(claim18),
+        available: formatUnits18(remaining18),
+        hasBacking: capacity18 > 0n,
+        hasLockedWart: spoofed > 0n,
+        spoofedOutstandingE8: spoofed,
+      };
+    }
+
+    const spoofedE8 = toBigIntSafe(vault.outstandingE8);
+    const CTSI = toBigIntSafe(vault.CTSI);
+    const usdc = toBigIntSafe(vault.usdc);
     const ethWei = toBigIntSafe(vault.eth);
 
+    // Capacity from locked spoofed WART + L1 portals (not raw wWART field)
     const capacity18 =
-      wWART * 10n ** 10n + CTSI + ethWei + usdc * 10n ** 12n;
+      spoofedE8 * 10n ** 10n + CTSI + ethWei + usdc * 10n ** 12n;
+
     const liquid18 = toBigIntSafe(vault.liquid);
-    const remaining18 = capacity18 > liquid18 ? capacity18 - liquid18 : 0n;
+    const claim18 = toBigIntSafe(vault.l1WwartClaim);
+    const claimed18 = liquid18 + claim18;
+    const remaining18 = capacity18 > claimed18 ? capacity18 - claimed18 : 0n;
 
     return {
       capacity18,
       liquid18,
+      claim18,
       remaining18,
       capacity: formatUnits18(capacity18),
       liquid: formatUnits18(liquid18),
+      claim: formatUnits18(claim18),
       available: formatUnits18(remaining18),
       hasBacking: capacity18 > 0n,
+      hasLockedWart: spoofedE8 > 0n,
+      spoofedOutstandingE8: spoofedE8,
     };
   } catch {
     return empty;

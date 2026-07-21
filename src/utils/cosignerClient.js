@@ -35,6 +35,8 @@ export const registerDappShare = registerMultiSigVault;
 
 /**
  * 2P-ECDSA round: send R1 + hash; receive r + ciphertext (never private key).
+ * Destination binding: pass transfer preimage fields so cosigner re-hashes and
+ * checks toAddress ∈ registered allowedTo (main wallet).
  */
 export async function multiSigSignPartial({
   vaultAddress,
@@ -44,6 +46,11 @@ export async function multiSigSignPartial({
   hashHex,
   amountE8 = null,
   force = false,
+  toAddress = null,
+  feeE8 = null,
+  pinHash = null,
+  pinHeight = null,
+  nonceId = null,
 }) {
   return cosignerFetch({
     method: 'POST',
@@ -55,6 +62,11 @@ export async function multiSigSignPartial({
       R1Hex,
       hashHex,
       ...(amountE8 != null ? { amountE8: String(amountE8) } : {}),
+      ...(toAddress != null ? { toAddress: String(toAddress) } : {}),
+      ...(feeE8 != null ? { feeE8: String(feeE8) } : {}),
+      ...(pinHash != null ? { pinHash: String(pinHash) } : {}),
+      ...(pinHeight != null ? { pinHeight: Number(pinHeight) } : {}),
+      ...(nonceId != null ? { nonceId: Number(nonceId) } : {}),
       force,
     },
   });

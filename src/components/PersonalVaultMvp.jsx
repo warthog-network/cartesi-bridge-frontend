@@ -243,12 +243,14 @@ export default function PersonalVaultMvp({
         owner: l1Address,
       });
       const enc = encryptJsonWithMnemonic(vault.clientSecret, mainMnemonic);
+      const encBackup = encryptJsonWithMnemonic(vault.cosignerRegister, mainMnemonic);
       saveTwoPartyClientLocal({
         mainAddress: mainWallet?.address,
         subAddress: sub.address,
         vaultAddress: vault.address,
         index: sub.index,
         encryptedClientSecret: enc,
+        encryptedCosignerBackup: encBackup,
         scheme: MULTISIG_SCHEME,
       });
       await registerMultiSigVault({
@@ -256,6 +258,8 @@ export default function PersonalVaultMvp({
         owner: l1Address.toLowerCase(),
         subAddress: sub.address,
         index: sub.index,
+        mainAddress: mainWallet?.address,
+        allowedTo: mainWallet?.address ? [mainWallet.address] : [],
       });
 
       await send({

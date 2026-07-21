@@ -180,12 +180,18 @@ function storageKey(mainAddress, subAddress) {
   return `${USER_STORE_PREFIX}${m}:${s}`;
 }
 
+/**
+ * Persist client secret + optional encrypted cosignerRegister backup.
+ * Backup lets us re-register d_dapp after cosigner store wipe (same vault address).
+ * Still encrypted with mnemonic — not plaintext on disk.
+ */
 export function saveTwoPartyClientLocal({
   mainAddress,
   subAddress,
   vaultAddress,
   index,
   encryptedClientSecret,
+  encryptedCosignerBackup = null,
   scheme = MULTISIG_SCHEME,
 }) {
   if (typeof localStorage === 'undefined') return;
@@ -196,10 +202,22 @@ export function saveTwoPartyClientLocal({
       subAddress: String(subAddress).replace(/^0x/i, '').toLowerCase(),
       index: Number(index),
       encryptedClientSecret,
+      encryptedCosignerBackup: encryptedCosignerBackup || null,
       scheme,
       savedAt: Date.now(),
     }),
   );
+}
+
+/** Re-register cosigner from browser backup after Unknown vault. */
+export function restoreCosignerRegisterFromLocal(mainAddress, subAddress, mnemonic) {
+  const local = loadTwoPartyClientLocal(mainAddress, subAddress);
+  if (!local?.encryptedCosignerBackup) return null;
+  try {
+    return decryptJsonWithMnemonic(local.encryptedCosignerBackup, mnemonic);
+  } catch {
+    return null;
+  }
 }
 
 export function loadTwoPartyClientLocal(mainAddress, subAddress) {

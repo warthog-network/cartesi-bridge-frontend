@@ -140,146 +140,117 @@
 }
 
 /* ── Activity tab ── */
+/* History tab — same card / meta-row language as vault & sub */
 .activity-panel {
   text-align: left;
   color: var(--text-primary, #fff);
 }
 
-.activity-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-  margin-bottom: 0.75rem;
-}
-
-.activity-head h3 {
+.activity-shell {
   margin: 0;
-  font-size: 1.05rem;
-  color: #ffecb3;
-}
-
-.activity-source {
-  font-size: 0.75rem;
-  font-weight: 500;
-  opacity: 0.65;
-  color: #00ffcc;
 }
 
 .activity-error {
-  padding: 0.55rem 0.75rem;
-  border-radius: 8px;
+  padding: 0.4rem 0.55rem;
+  border-radius: 6px;
   border: 1px solid color-mix(in srgb, #e74c3c 50%, #333);
   background: color-mix(in srgb, #e74c3c 12%, transparent);
   color: #ffb4b4;
-  font-size: 0.85rem;
-  margin-bottom: 0.75rem;
+  font-size: 0.78rem;
+  margin: 0.35rem 0 0.5rem;
 }
 
 .activity-empty {
-  opacity: 0.7;
-  font-size: 0.9rem;
-  margin: 0.5rem 0;
+  margin: 0.35rem 0 0.15rem !important;
 }
 
 .activity-list {
   list-style: none;
-  margin: 0;
+  margin: 0.35rem 0 0;
   padding: 0;
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
-  max-height: min(60vh, 520px);
+  max-height: min(62vh, 560px);
   overflow-y: auto;
 }
 
-.activity-row {
-  border: 1px solid #333;
-  border-radius: 10px;
-  padding: 0.5rem 0.65rem;
-  background: rgba(0, 0, 0, 0.28);
-  font-size: 0.82rem;
+.activity-tx-card {
+  margin: 0 !important;
+  padding: 0.45rem 0.55rem !important;
+  border-radius: 8px !important;
 }
 
-.activity-row.in {
-  border-color: color-mix(in srgb, #00ffcc 30%, #333);
-}
-.activity-row.out {
-  border-color: color-mix(in srgb, #e79300 28%, #333);
+.activity-tx-card.is-in {
+  border-color: color-mix(in srgb, #00ffcc 32%, #333) !important;
 }
 
-.activity-row-main {
-  display: flex;
+.activity-tx-card.is-out {
+  border-color: color-mix(in srgb, #fdb913 30%, #333) !important;
+}
+
+.activity-tx-card .sw-card-head {
+  margin-bottom: 0.3rem;
+  gap: 0.35rem;
+}
+
+.activity-tx-title {
+  display: inline-flex !important;
   flex-wrap: wrap;
-  align-items: baseline;
-  gap: 0.45rem 0.75rem;
-}
-
-.activity-dir {
-  font-weight: 700;
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-  opacity: 0.85;
-}
-.activity-dir.in {
-  color: #00ffcc;
-}
-.activity-dir.out {
-  color: #fdb913;
-}
-
-.activity-amt {
-  font-weight: 600;
-  color: #fff;
-}
-
-.activity-fee {
-  opacity: 0.55;
-  font-size: 0.75rem;
-}
-
-.activity-row-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem 0.65rem;
-  margin-top: 0.25rem;
-  opacity: 0.7;
-  font-size: 0.75rem;
-}
-
-.activity-type {
-  color: #ffecb3;
-  opacity: 1;
-}
-
-.activity-row-addrs {
-  display: flex;
-  flex-wrap: wrap;
+  align-items: center;
   gap: 0.35rem 0.5rem;
-  margin-top: 0.3rem;
 }
 
-.activity-addr {
-  background: transparent;
-  border: 1px solid #333;
-  border-radius: 999px;
-  color: #bbb;
-  font-size: 0.72rem;
-  padding: 0.15rem 0.5rem;
-  cursor: pointer;
-  font-family: inherit;
+.activity-dir-pill {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.35);
+  color: #ddd;
 }
-.activity-addr:hover {
-  border-color: #00ffcc;
+
+.activity-dir-pill.in {
+  color: #041412;
+  background: linear-gradient(135deg, #00ffcc, #00b399);
+  border-color: transparent;
+}
+
+.activity-dir-pill.out {
+  color: #1a1000;
+  background: linear-gradient(135deg, #fdb913, #e79300);
+  border-color: transparent;
+}
+
+.activity-amt-inline {
+  font-size: 0.82rem;
+  font-weight: 700;
   color: #fff;
+  font-variant-numeric: tabular-nums;
 }
-.activity-addr.mono {
-  font-family: ui-monospace, monospace;
+
+.activity-time-tag {
+  font-size: 0.62rem !important;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+
+.activity-tx-card .sw-card-meta {
+  margin-bottom: 0;
 }
 
 .activity-pager {
-  margin-top: 0.75rem;
+  margin-top: 0.45rem;
+}
+
+/* Session send / fail cards inherit activity list density */
+.warthog-section .activity-list .sw-card {
+  background: color-mix(in srgb, var(--bg-section, #1a1a1a) 70%, transparent);
 }
 
 /* ── Streamlined shell (auth + dashboard tabs) ── */
@@ -476,17 +447,253 @@
 
 .warthog-section .wh-header-main {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
+  flex-wrap: nowrap;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 0.75rem;
 }
 
-.warthog-section .wh-header-id-col {
+.warthog-section .wh-header-left {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.25rem;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.warthog-section .wh-header-left .wh-meta-row {
+  justify-content: flex-start;
+}
+
+/* Top-right icon cluster: section grid + node gear */
+.warthog-section .wh-header-icons {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 0.35rem;
+  flex: 0 0 auto;
+  z-index: 6;
+}
+
+/* Gear icon → node menu (top right) */
+.warthog-section .wh-header-node {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 0.2rem;
+  flex: 0 0 auto;
+  z-index: 5;
+}
+
+/* Shared compact icon button shell (section grid + node gear) */
+.warthog-section button.wh-node-gear,
+.warthog-section button.wh-section-btn {
+  position: relative;
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  width: 2rem !important;
+  height: 2rem !important;
+  min-width: 2rem !important;
+  min-height: 2rem !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border-radius: 8px !important;
+  border: 1px solid color-mix(in srgb, #00ffcc 30%, rgba(255, 255, 255, 0.12)) !important;
+  background: rgba(0, 0, 0, 0.4) !important;
+  color: #00ffcc !important;
+  box-shadow: none !important;
+  cursor: pointer;
+  transform: none !important;
+}
+
+/* Section nav uses grid icon — slightly warmer border so it reads apart from gear */
+.warthog-section button.wh-section-btn {
+  border-color: color-mix(in srgb, #fdb913 35%, rgba(255, 255, 255, 0.12)) !important;
+  color: #fdb913 !important;
+}
+
+.warthog-section button.wh-node-gear:hover,
+.warthog-section button.wh-node-gear.is-open {
+  border-color: color-mix(in srgb, #00ffcc 55%, transparent) !important;
+  background: color-mix(in srgb, #00ffcc 12%, rgba(0, 0, 0, 0.45)) !important;
+  color: #b8fff0 !important;
+  box-shadow: 0 0 10px color-mix(in srgb, #00ffcc 18%, transparent) !important;
+  transform: none !important;
+}
+
+.warthog-section button.wh-section-btn:hover,
+.warthog-section button.wh-section-btn.is-open {
+  border-color: color-mix(in srgb, #fdb913 55%, transparent) !important;
+  background: color-mix(in srgb, #fdb913 14%, rgba(0, 0, 0, 0.45)) !important;
+  color: #ffe08a !important;
+  box-shadow: 0 0 10px color-mix(in srgb, #fdb913 20%, transparent) !important;
+  transform: none !important;
+}
+
+.warthog-section .wh-section-menu {
+  position: relative;
+  flex: 0 0 auto;
+  z-index: 6;
+}
+
+.warthog-section .wh-section-dropdown {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  width: min(12.5rem, calc(100vw - 2rem));
+  padding: 0.4rem 0.35rem 0.4rem;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, #fdb913 30%, #333);
+  background: linear-gradient(
+    160deg,
+    color-mix(in srgb, #0a0a0a 94%, #fdb913),
+    #0a0a0a 55%
+  );
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  z-index: 25;
+}
+
+.warthog-section .wh-section-current {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #fdb913;
+  opacity: 0.9;
+}
+
+.warthog-section button.wh-section-item {
+  display: flex !important;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100% !important;
+  margin: 0 !important;
+  padding: 0.4rem 0.55rem !important;
+  border-radius: 6px !important;
+  border: 1px solid transparent !important;
+  background: transparent !important;
+  color: #e8e8e8 !important;
+  font-size: 0.82rem !important;
+  font-weight: 600 !important;
+  text-align: left !important;
+  cursor: pointer;
+  box-shadow: none !important;
+  transform: none !important;
+  min-height: 0 !important;
+}
+
+.warthog-section button.wh-section-item:hover:not(:disabled) {
+  background: color-mix(in srgb, #fdb913 12%, transparent) !important;
+  border-color: color-mix(in srgb, #fdb913 28%, transparent) !important;
+  color: #fff !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+.warthog-section button.wh-section-item.is-active {
+  background: color-mix(in srgb, #fdb913 16%, rgba(0, 0, 0, 0.35)) !important;
+  border-color: color-mix(in srgb, #fdb913 40%, transparent) !important;
+  color: #ffe8a8 !important;
+}
+
+.warthog-section button.wh-section-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.warthog-section .wh-section-check {
+  color: #fdb913;
+  font-size: 0.75rem;
+}
+
+/* Slim current-section label under header (replaces full tab strip) */
+.warthog-section .wh-section-bar {
+  display: flex;
+  align-items: center;
+  margin: 0 0 0.45rem;
+  min-height: 0;
+}
+
+.warthog-section .wh-section-bar-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, #fdb913 70%, #aaa);
+}
+
+.warthog-section .wh-node-gear-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+
+.warthog-section .wh-node-gear-dot.is-defi {
+  background: #00ffcc;
+  box-shadow: 0 0 6px color-mix(in srgb, #00ffcc 70%, transparent);
+}
+
+.warthog-section .wh-node-gear-dot.is-main {
+  background: #fdb913;
+  box-shadow: 0 0 6px color-mix(in srgb, #fdb913 70%, transparent);
+}
+
+.warthog-section .wh-node-menu {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  width: min(16.5rem, calc(100vw - 2rem));
+  padding: 0.55rem 0.6rem 0.5rem;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, #00ffcc 28%, #333);
+  background: linear-gradient(
+    160deg,
+    color-mix(in srgb, #0a0a0a 94%, #00ffcc),
+    #0a0a0a 55%
+  );
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  z-index: 20;
+}
+
+.warthog-section .wh-node-menu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.warthog-section .wh-node-menu-title {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, #00ffcc 70%, #aaa);
+}
+
+.warthog-section .wh-node-menu .network-badge {
+  font-size: 0.62rem;
+  padding: 0.15rem 0.45rem;
+}
+
+.warthog-section .wh-node-menu-hint {
+  margin: 0;
+  font-size: 0.65rem;
+  opacity: 0.55;
+  line-height: 1.3;
 }
 
 .warthog-section .wh-wallet-name {
@@ -601,16 +808,90 @@
   line-height: 1.3;
 }
 
+/* Main address — same compact chip language as vault/sub meta, cyan kept */
 .warthog-section .wh-address-chip {
-  background: rgba(0, 0, 0, 0.35);
-  border: 1px solid rgba(0, 255, 204, 0.35);
-  color: #00ffcc;
-  border-radius: 999px;
-  padding: 0.4rem 0.85rem;
-  font-size: 0.8rem;
-  font-family: ui-monospace, monospace;
+  flex: 0 1 auto;
+  display: inline-flex !important;
+  align-items: center;
+  width: auto !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  max-width: 100%;
+  margin: 0 !important;
+  padding: 0.14rem 0.48rem !important;
+  border-radius: 6px !important;
+  border: 1px solid color-mix(in srgb, #00ffcc 28%, transparent) !important;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, #00ffcc 14%, rgba(0, 0, 0, 0.45)) 0%,
+      color-mix(in srgb, #00ffcc 5%, rgba(0, 0, 0, 0.4)) 100%
+    ) !important;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #00ffcc 18%, transparent),
+    0 0 10px color-mix(in srgb, #00ffcc 8%, transparent) !important;
+  color: #00ffcc !important;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
   cursor: pointer;
-  margin: 0;
+  word-break: break-all;
+  text-align: left;
+  transform: none !important;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, color 0.15s ease;
+}
+
+.warthog-section .wh-address-chip:hover {
+  color: #b8fff0 !important;
+  border-color: color-mix(in srgb, #00ffcc 55%, transparent) !important;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, #00ffcc 22%, rgba(0, 0, 0, 0.35)) 0%,
+      color-mix(in srgb, #00ffcc 10%, rgba(0, 0, 0, 0.4)) 100%
+    ) !important;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #00ffcc 25%, transparent),
+    0 0 12px color-mix(in srgb, #00ffcc 22%, transparent) !important;
+  transform: none !important;
+  text-decoration: none;
+}
+
+/* Label + chip row — mirrors .sw-meta-row for main address */
+.warthog-section .wh-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0.5rem;
+  min-width: 0;
+}
+
+.warthog-section .wh-meta-k {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, #00ffcc 62%, #9a9a9a);
+  line-height: 1.2;
+  min-width: 4.25rem;
+}
+
+.warthog-section .wh-meta-k::before {
+  content: '';
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: #00ffcc;
+  box-shadow: 0 0 5px color-mix(in srgb, #00ffcc 70%, transparent);
+  flex-shrink: 0;
+  opacity: 0.9;
 }
 
 .warthog-section .wh-header-tools {
@@ -620,10 +901,32 @@
   gap: 0.45rem;
 }
 
+/* Refresh · Backup · Lock always share one horizontal row */
+.warthog-section .wh-header-actions {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.35rem;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.warthog-section .wh-header-actions .btn,
+.warthog-section .wh-header-actions .btn.small {
+  flex: 1 1 0;
+  width: auto !important;
+  min-width: 0;
+  margin: 0 !important;
+  white-space: nowrap;
+}
+
 .warthog-section .wh-node-select {
-  max-width: min(100%, 220px);
-  font-size: 0.8rem !important;
-  padding: 0.4rem 0.55rem !important;
+  max-width: 100%;
+  width: 100%;
+  font-size: 0.78rem !important;
+  padding: 0.35rem 0.5rem !important;
+  margin: 0 !important;
 }
 
 .warthog-section .wh-panel {
@@ -852,13 +1155,22 @@
     grid-template-columns: 1fr;
   }
 
-  .warthog-section .wh-header-tools .btn {
-    flex: 1 1 auto;
+  .warthog-section .wh-header-main {
+    flex-wrap: nowrap;
+    gap: 0.5rem;
   }
 
-  .warthog-section .wh-node-select {
-    max-width: 100%;
+  .warthog-section .wh-header-node {
+    margin-left: auto;
+  }
+
+  .warthog-section .wh-header-tools {
+    width: 100%;
+  }
+
+  .warthog-section .wh-header-actions {
     flex: 1 1 100%;
+    width: 100%;
   }
 }
 
@@ -918,7 +1230,7 @@
  * Fallback for bare <button> only — never tabs (wh-app-tab / wh-auth-tab).
  * Old rule painted every non-.btn control as square yellow (Overview/Send/…).
  */
-.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab) {
+.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):not(.login-method-tab):not(.login-wallet-row):not(.login-password-toggle):not(.login-delete-link):not(.login-test-seed):not(.bca-path):not(.bca-back):not(.bca-password-toggle):not(.bca-cta):not(.sw-link):not(.sw-meta-v):not(.sw-pill-copy):not(.wh-address-chip):not(.wh-node-gear):not(.wh-section-btn):not(.wh-section-item) {
   background: linear-gradient(135deg, #00ffcc, #00b399);
   color: #041412;
   font-family: 'Montserrat', sans-serif;
@@ -934,14 +1246,14 @@
   box-shadow: 0 0 16px color-mix(in srgb, #00ffcc 22%, transparent);
 }
 
-.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):hover {
+.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):not(.login-method-tab):not(.login-wallet-row):not(.login-password-toggle):not(.login-delete-link):not(.login-test-seed):not(.bca-path):not(.bca-back):not(.bca-password-toggle):not(.bca-cta):not(.sw-link):not(.sw-meta-v):not(.sw-pill-copy):not(.wh-address-chip):not(.wh-node-gear):not(.wh-section-btn):not(.wh-section-item):hover {
   transform: translateY(-1px);
   box-shadow: 0 8px 22px color-mix(in srgb, #00ffcc 35%, transparent);
   background: linear-gradient(135deg, #00ffcc, #00b399);
   color: #041412;
 }
 
-.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):disabled {
+.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):not(.login-method-tab):not(.login-wallet-row):not(.login-password-toggle):not(.login-delete-link):not(.login-test-seed):not(.bca-path):not(.bca-back):not(.bca-password-toggle):not(.bca-cta):not(.sw-link):not(.sw-meta-v):not(.sw-pill-copy):not(.wh-address-chip):not(.wh-node-gear):not(.wh-section-btn):not(.wh-section-item):disabled {
   background: #555;
   color: #aaa;
   cursor: not-allowed;
@@ -1124,11 +1436,23 @@
     padding: 8px;
   }
 
-  .warthog-section button:not(.wh-app-tab):not(.wh-auth-tab) {
+  .warthog-section button:not(.wh-app-tab):not(.wh-auth-tab):not(.login-method-tab):not(.login-wallet-row):not(.login-password-toggle):not(.login-delete-link):not(.login-test-seed):not(.bca-path):not(.bca-back):not(.bca-password-toggle):not(.bca-cta):not(.login-primary-cta):not(.sw-link):not(.sw-meta-v):not(.sw-pill-copy):not(.wh-address-chip):not(.wh-node-gear):not(.wh-section-btn):not(.wh-section-item) {
     width: 100%;
     margin-right: 0;
     padding: 12px;
     font-size: 14px;
+  }
+
+  .warthog-section button.wh-node-gear,
+  .warthog-section button.wh-section-btn {
+    width: 2rem !important;
+    height: 2rem !important;
+    padding: 0 !important;
+  }
+
+  .warthog-section button.wh-section-item {
+    width: 100% !important;
+    padding: 0.4rem 0.55rem !important;
   }
 
   /* Keep tab row horizontal pills on mobile */
@@ -1164,4 +1488,489 @@
     margin-top: 24px;
     margin-bottom: 24px;
   }
+}
+
+/* Collapsible capacity / mint / burn panels */
+.warthog-section .wh-details {
+  margin: 0.45rem 0;
+  border: 1px solid #333;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.22);
+  overflow: hidden;
+}
+.warthog-section .wh-details summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 0.55rem 0.75rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #00ffcc;
+  user-select: none;
+}
+.warthog-section .wh-details summary::-webkit-details-marker {
+  display: none;
+}
+.warthog-section .wh-details summary::before {
+  content: '▸ ';
+  opacity: 0.75;
+}
+.warthog-section .wh-details[open] summary::before {
+  content: '▾ ';
+}
+.warthog-section .wh-details-body {
+  padding: 0 0.75rem 0.75rem;
+  border-top: 1px solid #2a2a2a;
+}
+
+/* ── WartBunker BalanceCardAccess (prod) guided wallet login ─────────────── */
+
+.warthog-section .bca {
+  margin: 0 auto;
+  max-width: min(28rem, 100%);
+  text-align: left;
+  padding: 0.15rem 0 1rem;
+}
+
+.warthog-section .bca-head {
+  margin-bottom: 0.9rem;
+}
+
+.warthog-section .bca-kicker {
+  display: block;
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #71717a;
+  margin-bottom: 0.35rem;
+}
+
+.warthog-section button.bca-back {
+  width: auto !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  margin: 0 0 0.4rem !important;
+  padding: 0 !important;
+  font-size: 0.75rem !important;
+  font-weight: 500 !important;
+  color: #a1a1aa !important;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  transform: none !important;
+  cursor: pointer;
+  font-family: inherit;
+}
+.warthog-section button.bca-back:hover:not(:disabled) {
+  color: #FDB913 !important;
+  background: transparent !important;
+  transform: none !important;
+}
+
+.warthog-section .bca-title {
+  margin: 0 0 0.25rem !important;
+  font-size: 1.05rem !important;
+  font-weight: 600 !important;
+  color: #fafafa !important;
+  letter-spacing: -0.02em;
+}
+
+.warthog-section .bca-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  color: #71717a;
+}
+
+.warthog-section .bca-paths {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.warthog-section button.bca-path {
+  width: 100% !important;
+  min-height: 0 !important;
+  margin: 0 !important;
+  padding: 0.75rem 0.85rem !important;
+  text-align: left !important;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: flex-start !important;
+  gap: 0.15rem !important;
+  border-radius: 0.75rem !important;
+  background: rgba(24, 24, 27, 0.55) !important;
+  color: #e4e4e7 !important;
+  border: 1px solid rgba(63, 63, 70, 0.85) !important;
+  box-shadow: none !important;
+  transform: none !important;
+  cursor: pointer;
+  font-family: inherit;
+}
+.warthog-section button.bca-path:hover:not(:disabled) {
+  border-color: rgba(113, 113, 122, 0.9) !important;
+  background: rgba(39, 39, 42, 0.65) !important;
+  color: #fafafa !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+.warthog-section button.bca-path.bca-path--primary,
+.warthog-section button.bca-path.bca-path--primary:hover {
+  border-color: rgba(253, 185, 19, 0.55) !important;
+  background: rgba(253, 185, 19, 0.08) !important;
+}
+.warthog-section button.bca-path.bca-path--primary:hover {
+  border-color: rgba(253, 185, 19, 0.75) !important;
+  background: rgba(253, 185, 19, 0.12) !important;
+}
+
+.warthog-section .bca-path__label {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.warthog-section .bca-path__meta {
+  font-size: 0.7rem;
+  color: #71717a;
+  font-weight: 400;
+}
+.warthog-section button.bca-path--primary .bca-path__meta {
+  color: rgba(253, 185, 19, 0.75);
+}
+
+.warthog-section .bca-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+.warthog-section .bca-field {
+  min-width: 0;
+}
+.warthog-section .bca-label {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #a1a1aa;
+  margin-bottom: 0.35rem;
+}
+.warthog-section .bca-row-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.warthog-section .bca-password-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.warthog-section .bca-password-input {
+  padding-right: 3.25rem !important;
+}
+.warthog-section button.bca-password-toggle {
+  position: absolute !important;
+  right: 0.4rem !important;
+  top: 50% !important;
+  transform: translateY(-50%) !important;
+  width: auto !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  margin: 0 !important;
+  padding: 0.2rem 0.4rem !important;
+  font-size: 0.625rem !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.04em !important;
+  text-transform: uppercase !important;
+  background: transparent !important;
+  color: #a1a1aa !important;
+  border: none !important;
+  box-shadow: none !important;
+  cursor: pointer;
+}
+.warthog-section button.bca-password-toggle:hover {
+  color: #f4f4f5 !important;
+  background: transparent !important;
+  transform: translateY(-50%) !important;
+}
+
+.warthog-section .bca-dropzone {
+  border-radius: 0.75rem;
+  border: 1px dashed #52525b;
+  background: rgba(24, 24, 27, 0.45);
+  padding: 1.35rem 1rem;
+  text-align: center;
+  transition: border-color 0.15s, background-color 0.15s;
+  min-height: 7rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.warthog-section .bca-dropzone--active {
+  border-color: #E79300;
+  background: rgba(231, 147, 0, 0.1);
+}
+.warthog-section .bca-dropzone--ready {
+  border-style: solid;
+  border-color: rgba(253, 185, 19, 0.45);
+  background: rgba(253, 185, 19, 0.06);
+}
+.warthog-section .bca-drop-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.35rem;
+}
+.warthog-section .bca-drop-name {
+  margin: 0;
+  font-size: 0.875rem;
+  color: #FDB913;
+  font-weight: 500;
+  word-break: break-all;
+}
+.warthog-section .bca-drop-prompt {
+  margin: 0;
+  font-size: 0.875rem;
+  color: #d4d4d8;
+}
+.warthog-section .bca-drop-or {
+  margin: 0;
+  font-size: 0.7rem;
+  color: #71717a;
+}
+.warthog-section .bca-drop-browse {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #FDB913;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.warthog-section .bca-drop-browse:hover {
+  color: #ffd24d;
+}
+
+.warthog-section .bca-seed {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+  font-size: 0.8125rem !important;
+  resize: vertical;
+  min-height: 4.5rem;
+}
+
+.warthog-section button.bca-cta {
+  width: 100% !important;
+  margin: 0.15rem 0 0 !important;
+  min-height: 2.6rem !important;
+  font-weight: 600 !important;
+  border-radius: 0.65rem !important;
+}
+
+.warthog-section .bca-error {
+  margin-top: 0.75rem;
+  padding-left: 0.65rem;
+  border-left: 2px solid #ef4444;
+  font-size: 0.8125rem;
+  color: #fca5a5;
+  word-break: break-word;
+}
+
+.warthog-section .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 688px) {
+  .warthog-section button.bca-path,
+  .warthog-section button.bca-cta,
+  .warthog-section button.bca-back,
+  .warthog-section button.bca-password-toggle {
+    width: auto !important;
+  }
+  .warthog-section button.bca-path,
+  .warthog-section button.bca-cta {
+    width: 100% !important;
+  }
+}
+
+/* ── Density pass: tighter chrome ────────────────────────────────────────── */
+.warthog-section {
+  font-size: 0.84rem;
+}
+.warthog-section .wh-title-row {
+  margin-bottom: 0.45rem;
+}
+.warthog-section .wh-title-row h2 {
+  font-size: 1.05rem !important;
+  margin: 0 !important;
+}
+.warthog-section .wh-subtitle {
+  font-size: 0.72rem;
+  margin: 0.15rem 0 0 !important;
+  opacity: 0.65;
+}
+.warthog-section .wh-card {
+  border-radius: 8px !important;
+  padding: 0.55rem 0.65rem !important;
+  margin-bottom: 0.5rem !important;
+}
+.warthog-section .wh-card--inset {
+  padding: 0.5rem 0.6rem !important;
+}
+.warthog-section .wh-header {
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: 8px;
+}
+.warthog-section .wh-header-main {
+  gap: 0.45rem;
+}
+.warthog-section .wh-header-tools {
+  gap: 0.3rem;
+}
+.warthog-section .wh-header-actions {
+  gap: 0.28rem;
+}
+.warthog-section .wh-header-tools .btn.small,
+.warthog-section .wh-header-actions .btn.small,
+.warthog-section .wh-app-tabs .wh-app-tab,
+.warthog-section button.wh-app-tab {
+  padding: 0.28rem 0.65rem !important;
+  font-size: 0.74rem !important;
+  border-radius: 6px !important;
+  box-shadow: none !important;
+}
+.warthog-section .wh-app-tabs {
+  gap: 0.25rem;
+  margin-bottom: 0.5rem;
+}
+.warthog-section .wh-app-tab.is-active,
+.warthog-section button.wh-app-tab.is-active {
+  box-shadow: none !important;
+}
+.warthog-section .wh-panel,
+.warthog-section .wh-panel-stack {
+  gap: 0.4rem;
+}
+.warthog-section .wh-stat-grid {
+  gap: 0.3rem;
+}
+.warthog-section .wh-stat {
+  padding: 0.35rem 0.45rem;
+  border-radius: 6px;
+  gap: 0.1rem;
+}
+.warthog-section .wh-stat-label,
+.warthog-section .wh-stat-k {
+  font-size: 0.65rem;
+}
+.warthog-section .wh-stat-value,
+.warthog-section .wh-stat-v {
+  font-size: 0.82rem;
+}
+.warthog-section .wh-balance-value {
+  font-size: 1.25rem !important;
+}
+.warthog-section .wh-balance-label {
+  font-size: 0.65rem;
+}
+.warthog-section .wh-address-chip {
+  padding: 0.12rem 0.4rem !important;
+  font-size: 0.68rem;
+  border-radius: 5px !important;
+}
+.warthog-section .wh-meta-k {
+  min-width: 4rem;
+  font-size: 0.6rem;
+}
+.warthog-section .form-group {
+  margin-bottom: 0.55rem !important;
+}
+.warthog-section .form-group label {
+  font-size: 0.72rem !important;
+  margin-bottom: 0.25rem !important;
+}
+.warthog-section .input,
+.warthog-section input.input,
+.warthog-section select.input,
+.warthog-section textarea.input {
+  padding: 0.4rem 0.5rem !important;
+  font-size: 0.8rem !important;
+  border-radius: 6px !important;
+  min-height: 0 !important;
+}
+.warthog-section .btn.small {
+  padding: 0.3rem 0.55rem !important;
+  font-size: 0.72rem !important;
+  border-radius: 6px !important;
+}
+.warthog-section .wh-hint,
+.warthog-section .wh-muted {
+  font-size: 0.72rem !important;
+  margin-bottom: 0.4rem !important;
+  line-height: 1.35;
+}
+.warthog-section .sw-action-tabs {
+  gap: 0.25rem;
+  margin-bottom: 0.4rem;
+}
+.warthog-section .sw-action-tab {
+  padding: 0.28rem 0.55rem !important;
+  font-size: 0.72rem !important;
+  border-radius: 6px !important;
+}
+.warthog-section .wh-inline-burn {
+  gap: 0.3rem;
+}
+.warthog-section .wh-divider {
+  margin: 0.55rem 0;
+  opacity: 0.4;
+}
+.warthog-section .bca {
+  max-width: min(26rem, 100%);
+  padding: 0 0 0.5rem;
+}
+.warthog-section .bca-head {
+  margin-bottom: 0.55rem;
+}
+.warthog-section .bca-title {
+  font-size: 0.95rem !important;
+}
+.warthog-section .bca-hint {
+  font-size: 0.74rem;
+}
+.warthog-section .bca-paths {
+  gap: 0.3rem;
+}
+.warthog-section button.bca-path {
+  padding: 0.5rem 0.6rem !important;
+  border-radius: 6px !important;
+  gap: 0.08rem !important;
+}
+.warthog-section .bca-path__label {
+  font-size: 0.8rem;
+}
+.warthog-section .bca-path__meta {
+  font-size: 0.65rem;
+}
+.warthog-section .bca-form {
+  gap: 0.55rem;
+}
+.warthog-section .bca-label {
+  font-size: 0.7rem;
+  margin-bottom: 0.25rem;
+}
+.warthog-section button.bca-cta {
+  min-height: 2.2rem !important;
+  border-radius: 6px !important;
+  margin-top: 0.1rem !important;
+}
+.warthog-section .bca-dropzone {
+  min-height: 4.5rem;
+  padding: 0.75rem 0.65rem;
+  border-radius: 6px;
 }

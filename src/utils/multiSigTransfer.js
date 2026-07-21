@@ -126,7 +126,7 @@ export async function multiSigTransferWart({
   });
 
   const { k1Hex, R1Hex } = clientSignRound1();
-  // amountE8 lets cosigner allow partial release: freeable = burned − signed
+  // amountE8 + destination preimage: cosigner re-hashes and enforces allowedTo (main)
   const partial = await multiSigSignPartial({
     vaultAddress: vaultNorm,
     owner,
@@ -134,6 +134,11 @@ export async function multiSigTransferWart({
     R1Hex,
     hashHex,
     amountE8: wartE8.toString(),
+    toAddress: toNorm,
+    feeE8: feeE8.toString(),
+    pinHash,
+    pinHeight,
+    nonceId,
     force: false,
   });
 

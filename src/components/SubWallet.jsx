@@ -4,7 +4,7 @@ import { gql, GraphQLClient } from 'graphql-request';
 import { keccak256, toUtf8Bytes, toUtf8String } from 'ethers-v6';
 import { Toaster, toast } from 'react-hot-toast';
 import '../styles/subWallet.css';
-import { createWarthogApi } from '../utils/warthogClient.js';
+import { createWarthogApi, signAndSubmitTransaction } from '../utils/warthogClient.js';
 import { getTxConfirmationStatus } from '../utils/txProof.js';
 import { getRollupGraphqlUrl, getInspectUrl } from '../utils/bridgeConfig.js';
 import { deriveSubWallet, deriveSubPrivateKey } from '../utils/subWalletDerive.js';
@@ -15,11 +15,25 @@ import {
   saveTwoPartyClientLocal,
   loadTwoPartyClientLocal,
   clearTwoPartyClientLocal,
+  restoreCosignerRegisterFromLocal,
   MULTISIG_SCHEME,
 } from '../utils/twoPartyEcdsa.js';
-import { registerMultiSigVault } from '../utils/cosignerClient.js';
+import { registerMultiSigVault, cosignerStatus } from '../utils/cosignerClient.js';
 import { multiSigTransferWart } from '../utils/multiSigTransfer.js';
+import { deriveVaultWallet } from '../utils/vaultDerive.js';
+import { getSmartNonce, bumpNonceAfterSuccess } from '../utils/cancelLimitOrder.js';
+import { computeWliqMintAvailable } from '../utils/wliqCapacity.js';
 const API_URL = '/api/proxy';
+
+/** Module-level so SubWallet re-renders do not remount / reset dots interval. */
+function LoadingDots() {
+  const [dots, setDots] = useState(1);
+  useEffect(() => {
+    const interval = setInterval(() => setDots((prev) => (prev % 3) + 1), 500);
+    return () => clearInterval(interval);
+  }, []);
+  return <span>{'.'.repeat(dots)}</span>;
+}
 
 function SubWallet({
   mainWallet,
@@ -38,6 +52,14 @@ function SubWallet({
   setSubIndex,
   getWartTxProof,
   sentTransactions, // NEW
+  /** 'bridge' = fund/sweep path · 'vault' = multi-sig vault focus (Vault tab) */
+  focusMode = 'bridge',
+  /** L1 rollup vault inspect snapshot (claimable wWART, outstanding, etc.) */
+  l1Vault = null,
+  /** Live MetaMask ERC-20 wWART balance (string human units) */
+  mmWwartBal = null,
+  onRefreshL1Vault,
+  onRefreshMmWwart,
 }) {
   const [subError, setSubError] = useState(null);
   const [subDeposits, setSubDeposits] = useState({});
@@ -55,6 +77,9 @@ function SubWallet({
   // Vault → main withdraw (after unlock)
   const [vaultWithdrawAmounts, setVaultWithdrawAmounts] = useState({});
   const [isVaultWithdrawing, setIsVaultWithdrawing] = useState({});
+  // Controlled <details> open flags per sub (survive re-renders; default closed)
+  // { [subIndex]: { vaultMain?: boolean, burn?: boolean, details?: boolean } }
+  const [openVaultPanels, setOpenVaultPanels] = useState({});
   // Partial spoofed wWART burn (E8 outstanding tracked on sub.mintedE8)
   const [burnAmounts, setBurnAmounts] = useState({});
 
@@ -72,22 +97,29 @@ function SubWallet({
   // Action tabs (same pattern as Overview / Send / Sub-wallets app tabs)
   const [subActionTab, setSubActionTab] = useState('fund'); // fund | sweep
   const [vaultActionTab, setVaultActionTab] = useState('withdraw'); // burn | withdraw
+  /** Include subs marked hidden (stuck old vaults) in the carousel */
+  const [showHiddenSubs, setShowHiddenSubs] = useState(false);
 
   // Screen size state
   const [isSmallScreen, setIsSmallScreen] = useState(window.innerWidth <= 688);
 
-  // Keep carousel index in range when subs are added/removed
+  // Keep carousel index in range when visible subs change
   useEffect(() => {
-    if (subWallets.length === 0) {
+    const n = showHiddenSubs
+      ? subWallets.length
+      : subWallets.filter((s) => !s.hidden).length;
+    if (n === 0) {
       setActiveSubPos(0);
       return;
     }
-    setActiveSubPos((pos) => Math.min(Math.max(0, pos), subWallets.length - 1));
-  }, [subWallets.length]);
+    setActiveSubPos((pos) => Math.min(Math.max(0, pos), n - 1));
+  }, [subWallets, showHiddenSubs]);
 
-  // Pick sensible vault action tab only when switching which sub is focused
+  // Pick sensible vault action tab only when switching which sub is focused.
+  // Keep vault details / release / withdraw panels closed by default.
   useEffect(() => {
-    const sub = subWallets[activeSubPos];
+    const list = showHiddenSubs ? subWallets : subWallets.filter((s) => !s.hidden);
+    const sub = list[activeSubPos];
     if (!sub) return;
     try {
       const out = BigInt(sub.mintedE8 || '0');
@@ -96,9 +128,9 @@ function SubWallet({
     } catch {
       setVaultActionTab('withdraw');
     }
-    setSubActionTab('fund');
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on sub switch
-  }, [activeSubPos]);
+    setSubActionTab(focusMode === 'vault' ? 'sweep' : 'fund');
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on sub / mode switch
+  }, [activeSubPos, focusMode]);
 
   // Absolute URL required — relative `/rollup/graphql` throws in graphql-request
   const client = useMemo(() => new GraphQLClient(getRollupGraphqlUrl()), []);
@@ -117,7 +149,7 @@ function SubWallet({
           delete newState[subIndex];
           return newState;
         });
-        toast.success('Step 3 done: deposit confirmed — ready for Sweep to vault (mints spoofed wWART).');
+        toast.success('Step 3 done: deposit confirmed — ready for Sweep to vault (locks WART as capacity).');
       }
     });
   }, [sentTransactions, activeDepositTxs, setSubWallets]);
@@ -131,20 +163,83 @@ function SubWallet({
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Animated dots
-  const LoadingDots = () => {
-    const [dots, setDots] = useState(1);
-    useEffect(() => {
-      const interval = setInterval(() => setDots((prev) => (prev % 3) + 1), 500);
-      return () => clearInterval(interval);
-    }, []);
-    return <span>{'.'.repeat(dots)}</span>;
+  // NOTE: do not define child components inside SubWallet — each re-render remounts them
+  // and collapses <details> / steals input focus (Vault → main typing bug).
+
+  const copyToClipboard = (text, label = 'Copied') => {
+    const s = String(text ?? '');
+    if (!s) return toast.error('Nothing to copy');
+    navigator.clipboard
+      .writeText(s)
+      .then(() => toast.success(`${label}: ${s.length > 24 ? s.slice(0, 12) + '…' : s}`))
+      .catch(() => toast.error('Failed to copy'));
   };
 
-  const copyToClipboard = (text) => {
-    navigator.clipboard.writeText(text)
-      .then(() => toast.success('Address copied to clipboard!'))
-      .catch(() => toast.error('Failed to copy address'));
+  /** Visible list (hidden stuck vaults stay in storage until removed). */
+  const baseVisibleSubs = useMemo(
+    () => (showHiddenSubs ? subWallets : subWallets.filter((s) => !s.hidden)),
+    [subWallets, showHiddenSubs],
+  );
+  const hiddenCount = useMemo(
+    () => subWallets.filter((s) => s.hidden).length,
+    [subWallets],
+  );
+
+  const hideSubWallet = (sub) => {
+    setSubWallets((prev) =>
+      prev.map((s) => (s.index === sub.index ? { ...s, hidden: true } : s)),
+    );
+    toast.success(`Hid sub #${sub.index} from list (still in storage — unhide or remove)`);
+  };
+
+  const unhideSubWallet = (sub) => {
+    setSubWallets((prev) =>
+      prev.map((s) => (s.index === sub.index ? { ...s, hidden: false } : s)),
+    );
+    toast.success(`Sub #${sub.index} visible again`);
+  };
+
+  /** Remove from UI list permanently (does not move on-chain funds). */
+  const removeSubWallet = (sub) => {
+    const vaultBal = Number(sub.vaultBalance || sub.vaultSpendable || 0);
+    const subBal = Number(sub.balance || 0);
+    const stuck =
+      vaultBal > 0 ||
+      subBal > 0 ||
+      (sub.mintedE8 && BigInt(sub.mintedE8 || '0') > 0n);
+    const msg = stuck
+      ? `Remove sub #${sub.index} from UI?\n\nNote: on-chain balances are NOT moved. Stuck multi-sig vault funds stay on-chain.\nAddress: ${String(sub.address).slice(0, 12)}…`
+      : `Remove sub #${sub.index} from this list?`;
+    if (typeof window !== 'undefined' && !window.confirm(msg)) return;
+
+    setSubWallets((prev) => prev.filter((s) => s.index !== sub.index));
+    // Clear related UI state
+    setSubDeposits((prev) => {
+      const n = { ...prev };
+      delete n[sub.index];
+      return n;
+    });
+    setVaultWithdrawAmounts((prev) => {
+      const n = { ...prev };
+      delete n[sub.index];
+      return n;
+    });
+    toast.success(`Removed sub #${sub.index} from UI`);
+  };
+
+  const clearAllHiddenSubs = () => {
+    const hidden = subWallets.filter((s) => s.hidden);
+    if (!hidden.length) return toast('No hidden subs');
+    if (
+      typeof window !== 'undefined' &&
+      !window.confirm(
+        `Permanently remove ${hidden.length} hidden sub-wallet(s) from the UI list?\nOn-chain funds are not moved.`,
+      )
+    ) {
+      return;
+    }
+    setSubWallets((prev) => prev.filter((s) => !s.hidden));
+    toast.success(`Cleared ${hidden.length} hidden sub(s) from UI`);
   };
 
   const fetchCartesiSalt = async (userMainAddress) => {
@@ -183,7 +278,19 @@ function SubWallet({
       setSubWallets((prev) => [...prev, newSub]);
       setSubIndex((prev) => prev + 1);
 
-      toast.success('Sub-wallet created!');
+      // Copy index for easy paste into notes / regen
+      try {
+        await navigator.clipboard.writeText(String(derived.index));
+        toast.success(
+          `Sub-wallet created · index ${derived.index} (copied) · ${String(derived.address).slice(0, 10)}…`,
+          { duration: 6000 },
+        );
+      } catch {
+        toast.success(
+          `Sub-wallet created · index ${derived.index} — click index to copy`,
+          { duration: 6000 },
+        );
+      }
       await refreshSubBalance(derived.address);
     } catch (err) {
       console.error(err);
@@ -542,7 +649,7 @@ function SubWallet({
       const sweepProof = await getWartTxProof(sweepTxHash);
       if (!sweepProof) throw new Error('Empty sweep proof from node');
 
-      toast.loading('MetaMask sweep_lock (mint spoofed wWART 1:1)…', { id: toastId });
+      toast.loading('MetaMask sweep_lock (lock WART 1:1)…', { id: toastId });
       // Backend accepts without prior sub_lock (direct-sweep path)
       await postSweepLock(sub, vaultAddress, sweepProof, toastId);
     } catch (err) {
@@ -573,22 +680,44 @@ function SubWallet({
 
     const completed = await pollForLockNotice(sub.address, 90000);
     if (completed) {
-      // pollForLockNotice returns boolean — re-fetch last sweep_locked for mintedE8
-      let mintedFromNotice = null;
+      // Rebuild outstanding from ALL notices for this sub — never add latest notice
+      // onto existing mintedE8 (retry / double-poll used to double locked amount, e.g. 16→32).
+      let outstandingFromNotices = null;
       try {
         const gqlClient = new GraphQLClient(getRollupGraphqlUrl());
         const { notices } = await gqlClient.request(gql`
-          { notices(last: 15) { edges { node { payload } } } }
+          { notices(last: 80) { edges { node { payload } } } }
         `);
         const subNorm = String(sub.address).replace(/^0x/i, '').toLowerCase();
-        const hits = (notices?.edges || [])
-          .map((e) => parseNoticePayload(e.node.payload))
-          .filter(
-            (n) =>
-              n?.type === 'sweep_locked' &&
-              String(n.subAddress || '').replace(/^0x/i, '').toLowerCase() === subNorm,
-          );
-        if (hits[0]?.mintedE8 != null) mintedFromNotice = String(hits[0].mintedE8);
+        let minted = 0n;
+        let burned = 0n;
+        for (const e of notices?.edges || []) {
+          const n = parseNoticePayload(e.node.payload);
+          if (!n?.type) continue;
+          const nSub = String(n.subAddress || '')
+            .replace(/^0x/i, '')
+            .toLowerCase();
+          if (nSub && nSub !== subNorm) continue;
+          if (n.type === 'sweep_locked' && n.mintedE8 != null) {
+            try {
+              minted += BigInt(String(n.mintedE8));
+            } catch {
+              /* */
+            }
+          } else if (
+            (n.type === 'spoofed_wwart_burned' || n.type === 'subwallet_unlocked') &&
+            n.burnedE8 != null
+          ) {
+            // Only attribute burns that target this sub when subAddress present
+            if (nSub && nSub !== subNorm) continue;
+            try {
+              burned += BigInt(String(n.burnedE8));
+            } catch {
+              /* */
+            }
+          }
+        }
+        outstandingFromNotices = (minted > burned ? minted - burned : 0n).toString();
       } catch {
         /* ignore */
       }
@@ -596,16 +725,14 @@ function SubWallet({
       setSubWallets((prev) =>
         prev.map((s) => {
           if (s.index !== sub.index) return s;
-          let nextMinted = s.mintedE8 || '0';
-          try {
-            const add = BigInt(mintedFromNotice || '0');
-            nextMinted = (BigInt(s.mintedE8 || '0') + add).toString();
-          } catch {
-            if (mintedFromNotice) nextMinted = mintedFromNotice;
-          }
+          // Prefer notice rebuild; fall back to previous outstanding (do not add)
+          const nextMinted =
+            outstandingFromNotices != null
+              ? outstandingFromNotices
+              : s.mintedE8 || '0';
           return {
             ...s,
-            locked: true,
+            locked: BigInt(nextMinted || '0') > 0n,
             locking: false,
             vaultAddress: vaultAddress,
             pendingVaultAddress: vaultAddress,
@@ -630,7 +757,7 @@ function SubWallet({
         /* ignore */
       }
       toast.success(
-        'Step 4 done: locked. Spoofed wWART minted — burn any amount to unlock partially.',
+        'Step 4 done: locked. WART is locked as collateral — release any amount to unlock partially.',
         { id: toastId, duration: 7000 },
       );
     } else {
@@ -683,21 +810,26 @@ function SubWallet({
   };
 
   /**
-   * 2P-ECDSA multi-sig withdraw — full private key never assembled.
-   * Live-refetches vault balance first (UI cache is often stale after burns/sweeps).
+   * Withdraw vault → main.
+   * 1) Multi-sig 2P path when cosigner still has this vault
+   * 2) Legacy mnemonic-derived vault (vaultDerive) if address matches
+   *
+   * Note: "Force UI unlock" only clears local lock flags — it does not move keys
+   * or restore cosigner shares. After rollup wipe, multi-sig still needs cosigner.
    */
   const withdrawVaultToMain = async (sub) => {
     const vaultAddr = (sub.vaultAddress || sub.pendingVaultAddress || '')
       .toString()
       .replace(/^0x/i, '')
       .toLowerCase();
-    if (!vaultAddr) return toast.error('No multi-sig vault — Load / create vault first');
-    if (!mainMnemonic) return toast.error('Mnemonic required to decrypt 2P client secret');
-    if (!l1Address) return toast.error('Connect MetaMask (L1) — cosigner checks owner');
+    if (!vaultAddr) return toast.error('No vault address — Load / create vault first');
+    if (!mainMnemonic) return toast.error('Mnemonic required for vault spend');
     if (!address && !mainWallet?.address) {
       return toast.error('Main Warthog address required as recipient');
     }
 
+    // Force UI unlock only clears UI; if mintedE8 still set, user may still hit freeable checks.
+    // Treat explicit full free as spendable when live balance exists and user cleared UI lock.
     const outstandingE8 = BigInt(sub.mintedE8 || '0');
     const mainAddr = mainWallet?.address || address;
 
@@ -722,6 +854,12 @@ function SubWallet({
         ),
       );
 
+      if (Number(liveSpendable) <= 0 && Number(liveTotal) <= 0) {
+        throw new Error(
+          'Vault balance is 0 on Warthog — nothing to withdraw (funds may already be moved or wrong address).',
+        );
+      }
+
       let freeable = liveSpendable;
       if (outstandingE8 > 0n) {
         try {
@@ -734,7 +872,8 @@ function SubWallet({
       }
       if (outstandingE8 > 0n && Number(freeable) <= 0) {
         throw new Error(
-          'Nothing freeable yet — burn spoofed wWART first (1:1 releases vault WART while residual stays locked).',
+          'Nothing withdrawable yet — release locked WART first, or use Force UI unlock only after rollup wipe (then locked should be 0 in UI). ' +
+            'Force unlock does not move coins by itself.',
         );
       }
 
@@ -756,36 +895,164 @@ function SubWallet({
       if (outstandingE8 > 0n && Number(amount) > Number(freeable)) {
         setVaultWithdrawAmounts((prev) => ({ ...prev, [sub.index]: freeable }));
         throw new Error(
-          `Only ${freeable} WART freeable (live free ${liveSpendable} − outstanding ${e8ToWartDisplay(outstandingE8)}).`,
+          `Only ${freeable} WART withdrawable (in vault ${liveSpendable} − locked collateral ${e8ToWartDisplay(outstandingE8)}).`,
         );
       }
 
+      // --- Try multi-sig first ---
       const local = loadTwoPartyClientLocal(mainWallet?.address || address, sub.address);
-      if (!local?.encryptedClientSecret) {
+      let multiSigTried = false;
+      let multiSigErr = null;
+
+      if (local?.encryptedClientSecret && l1Address) {
+        multiSigTried = true;
+        try {
+          // Preflight: cosigner must know this vault (shares often lost on VPS redeploy)
+          let needRestore = false;
+          try {
+            await cosignerStatus(vaultAddr);
+          } catch (e) {
+            const msg = String(e?.message || e);
+            if (/unknown vault|404|not found/i.test(msg)) {
+              needRestore = true;
+            } else {
+              throw e;
+            }
+          }
+
+          // Unknown vault → re-push d_dapp from encrypted browser backup (if we have it)
+          if (needRestore) {
+            const backup = restoreCosignerRegisterFromLocal(
+              mainWallet?.address || address,
+              sub.address,
+              mainMnemonic,
+            );
+            if (backup?.dappShareHex && backup?.ckey) {
+              toast.loading('Cosigner lost vault — restoring share from browser backup…', {
+                id: toastId,
+              });
+              await registerMultiSigVault({
+                ...backup,
+                vaultAddress: vaultAddr,
+                owner: l1Address.toLowerCase(),
+                subAddress: sub.address,
+                index: sub.index,
+                mainAddress: mainAddr,
+                allowedTo: [mainAddr],
+              });
+              toast.loading('Cosigner restored — signing multi-sig…', { id: toastId });
+            } else {
+              throw new Error(
+                'COSIGNER_MISSING: Cosigner says Unknown vault (no d_dapp for this address). ' +
+                  'This browser has no encrypted cosigner backup either (vault created before backup feature). ' +
+                  'Multi-sig cannot sign this address. Will try legacy secret-derived key next — ' +
+                  'if this was a 2P multi-sig vault, funds need an old cosigner backup file.',
+              );
+            }
+          }
+
+          const clientSecret = decryptJsonWithMnemonic(
+            local.encryptedClientSecret,
+            mainMnemonic,
+          );
+          toast.loading('Co-signer pin check + 2P-ECDSA multi-sig…', { id: toastId });
+          const result = await multiSigTransferWart({
+            nodeBase: selectedNode,
+            vaultAddress: vaultAddr,
+            toAddress: mainAddr,
+            amountWart: amount,
+            ownerL1: l1Address,
+            subAddress: sub.address,
+            clientSecret,
+          });
+
+          const txHash = result.txHash;
+          if (!txHash) throw new Error('No tx hash from multi-sig submit');
+
+          toast.success(`Multi-sig vault → main: ${String(txHash).slice(0, 12)}…`, {
+            id: toastId,
+            duration: 6000,
+          });
+          setVaultWithdrawAmounts((prev) => ({ ...prev, [sub.index]: '' }));
+
+          const refreshed = await fetchBalanceAndNonce(vaultAddr, true);
+          setSubWallets((prev) =>
+            prev.map((s) =>
+              s.index === sub.index
+                ? {
+                    ...s,
+                    vaultBalance: refreshed.balance || refreshed.spendable || '0',
+                    vaultSpendable: refreshed.spendable || refreshed.balance || '0',
+                    vaultBalanceAt: Date.now(),
+                  }
+                : s,
+            ),
+          );
+          return;
+        } catch (e) {
+          multiSigErr = e;
+          console.warn('[vault withdraw] multi-sig failed', e);
+          const m = String(e?.message || e);
+          // Always fall through to legacy on Unknown vault / missing cosigner
+          if (
+            !/COSIGNER_MISSING|Unknown vault|unknown vault|Missing 2P|recreate multi-sig|Destination not allowed|hashHex does not match|no encrypted cosigner backup/i.test(
+              m,
+            )
+          ) {
+            if (
+              /freeable|outstanding|Insufficient|Pin held|Pin:|amountE8|Nothing freeable|Mnemonic|owner mismatch/i.test(
+                m,
+              )
+            ) {
+              throw e;
+            }
+          }
+        }
+      }
+
+      // --- Legacy secret-derived vault (vaultDerive) ---
+      toast.loading('Trying legacy mnemonic vault key…', { id: toastId });
+      const derived = deriveVaultWallet({
+        mnemonic: mainMnemonic,
+        subAddress: sub.address,
+        index: sub.index,
+      });
+      const derivedAddr = String(derived.address).replace(/^0x/i, '').toLowerCase();
+      const vaultNorm = vaultAddr.length === 48 ? vaultAddr.slice(0, 40) : vaultAddr;
+      const derNorm = derivedAddr.length === 48 ? derivedAddr.slice(0, 40) : derivedAddr;
+
+      if (derNorm !== vaultNorm && derivedAddr !== vaultAddr) {
+        const hint = multiSigErr
+          ? ` Multi-sig failed: ${String(multiSigErr.message || multiSigErr).slice(0, 160)}`
+          : multiSigTried
+            ? ''
+            : ' No 2P client secret on this browser.';
         throw new Error(
-          'Missing 2P client secret on this browser — recreate multi-sig vault here',
+          `Cannot spend this vault. Address is not your legacy secret-derived vault for sub #${sub.index}, ` +
+            `and multi-sig cosigner cannot help (often after VPS redeploy / Force UI unlock alone). ` +
+            `Derived would be ${derivedAddr.slice(0, 12)}… but vault is ${vaultAddr.slice(0, 12)}….` +
+            hint +
+            ` If this was multi-sig and cosigner lost d_dapp, funds need cosigner backup — creating a NEW vault will not recover the old address.`,
         );
       }
-      const clientSecret = decryptJsonWithMnemonic(
-        local.encryptedClientSecret,
-        mainMnemonic,
-      );
 
-      toast.loading('Co-signer pin check + 2P-ECDSA multi-sig…', { id: toastId });
-      const result = await multiSigTransferWart({
-        nodeBase: selectedNode,
-        vaultAddress: vaultAddr,
-        toAddress: mainAddr,
-        amountWart: amount,
-        ownerL1: l1Address,
-        subAddress: sub.address,
-        clientSecret,
+      const api = await createWarthogApi(selectedNode);
+      const nonceId = getSmartNonce(vaultAddr, 0);
+      toast.loading('Signing legacy vault → main…', { id: toastId });
+      const { nonce, data } = await signAndSubmitTransaction(api, {
+        privateKey: derived.privateKey,
+        nonceId,
+        buildSpec: {
+          type: 'WART_TRANSFER',
+          toAddress: mainAddr,
+          amount: String(amount).trim(),
+        },
       });
+      bumpNonceAfterSuccess(vaultAddr, nonce, 0);
+      const txHash = data?.txHash || data?.hash;
+      if (!txHash) throw new Error('Node accepted legacy transfer but no tx hash returned');
 
-      const txHash = result.txHash;
-      if (!txHash) throw new Error('No tx hash from multi-sig submit');
-
-      toast.success(`Multi-sig vault → main: ${String(txHash).slice(0, 12)}…`, {
+      toast.success(`Legacy vault → main: ${String(txHash).slice(0, 12)}…`, {
         id: toastId,
         duration: 6000,
       });
@@ -983,13 +1250,18 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
   };
 
   /**
-   * Freeable native WART after partial burns (1:1 collateral).
-   * freeable ≈ min(vaultBalance, max(0, vaultBalance − outstanding)).
-   * Burn 30 of 99 → outstanding 69, vault 99 → freeable 30.
+   * Withdrawable native WART after partial burns (1:1 collateral).
+   * withdrawable ≈ max(0, vaultBalance − outstandingSpoofed).
+   * Burn 30 of 99 → outstanding 69, vault 99 → withdrawable 30.
+   * Prefer live vaultBalance; fall back to vaultSpendable only when balance missing.
    */
   const freeableVaultWart = (sub) => {
     try {
-      const balE8 = BigInt(wartToE8String(String(sub.vaultBalance || '0')));
+      const balStr =
+        sub.vaultBalance != null && sub.vaultBalance !== ''
+          ? String(sub.vaultBalance)
+          : String(sub.vaultSpendable || '0');
+      const balE8 = BigInt(wartToE8String(balStr));
       const outE8 = BigInt(sub.mintedE8 || '0');
       const freeE8 = balE8 > outE8 ? balE8 - outE8 : 0n;
       return e8ToWartDisplay(freeE8);
@@ -998,7 +1270,7 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
     }
   };
 
-  /** Client-side outstanding spoofed wWART (E8). Not source of truth after rollup wipe. */
+  /** Client-side outstanding locked collateral (E8). Not source of truth after rollup wipe. */
   const outstandingE8Of = (sub) => {
     try {
       return BigInt(sub?.mintedE8 || '0');
@@ -1214,12 +1486,15 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
         });
         vaultAddr = vault.address;
         const enc = encryptJsonWithMnemonic(vault.clientSecret, mainMnemonic);
+        // Backup cosigner half encrypted — recover after VPS/cosigner wipe (same vault)
+        const encBackup = encryptJsonWithMnemonic(vault.cosignerRegister, mainMnemonic);
         saveTwoPartyClientLocal({
           mainAddress: mainAddr,
           subAddress: sub.address,
           vaultAddress: vault.address,
           index: sub.index,
           encryptedClientSecret: enc,
+          encryptedCosignerBackup: encBackup,
           scheme: vault.scheme,
         });
 
@@ -1229,6 +1504,9 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
           owner: l1Address.toLowerCase(),
           subAddress: sub.address,
           index: sub.index,
+          // Destination allowlist: vault may only multi-sig-send to main Warthog
+          mainAddress: mainAddr,
+          allowedTo: [mainAddr],
         });
       }
 
@@ -1311,24 +1589,59 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
     }
     if (!send) return toast.error('Connect MetaMask on WalletIsland');
     if (!sub.locked && !sub.mintedE8) {
-      return toast.error('No active lock / spoofed wWART on this sub');
+      return toast.error('No active lock / locked WART on this sub');
     }
 
     const outstandingE8 = BigInt(sub.mintedE8 || '0');
     if (outstandingE8 <= 0n && !burnAll) {
-      return toast.error('No outstanding spoofed wWART to burn on this sub');
+      return toast.error('No locked WART to release on this sub');
+    }
+
+    // Max freeable so capacity stays ≥ Used (matches backend solvency rule).
+    let maxFreeableE8 = outstandingE8;
+    try {
+      const cap = computeWliqMintAvailable(l1Vault);
+      const used18 = cap.liquid18 + cap.claim18;
+      if (cap.capacity18 > 0n && used18 > 0n) {
+        const free18 = cap.capacity18 > used18 ? cap.capacity18 - used18 : 0n;
+        const freeE8 = free18 / 10n ** 10n;
+        if (freeE8 < maxFreeableE8) maxFreeableE8 = freeE8;
+      }
+    } catch {
+      /* backend still enforces */
     }
 
     let burnE8;
     try {
       if (burnAll || amountWart === 'max' || amountWart === '') {
-        burnE8 = outstandingE8 > 0n ? outstandingE8.toString() : null; // null = backend burns full
+        if (maxFreeableE8 <= 0n) {
+          return toast.error(
+            'Cannot release: Used ≥ Capacity. Burn wWART/WLIQ claims on Home first.',
+            { duration: 8000 },
+          );
+        }
+        if (maxFreeableE8 < outstandingE8) {
+          // Cap "release all" to free headroom so backend accepts
+          burnE8 = maxFreeableE8.toString();
+          toast(
+            `Release capped to ${e8ToWartDisplay(maxFreeableE8)} WART (keep capacity ≥ Used). Burn claims to free more.`,
+            { duration: 8000 },
+          );
+        } else {
+          burnE8 = outstandingE8 > 0n ? outstandingE8.toString() : null;
+        }
       } else {
         burnE8 = wartToE8String(amountWart);
         if (outstandingE8 > 0n && BigInt(burnE8) > outstandingE8) {
           return toast.error(
-            `Can only burn up to ${e8ToWartDisplay(outstandingE8)} spoofed wWART on this lock`,
+            `Can only release up to ${e8ToWartDisplay(outstandingE8)} locked WART on this vault`,
             { duration: 6000 },
+          );
+        }
+        if (BigInt(burnE8) > maxFreeableE8) {
+          return toast.error(
+            `Release blocked: max ${e8ToWartDisplay(maxFreeableE8)} WART freeable while Used claims remain. Burn wWART/WLIQ first.`,
+            { duration: 9000 },
           );
         }
       }
@@ -1345,8 +1658,8 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
     setLoading(true);
     const toastId = toast.loading(
       isFull
-        ? 'Burning all spoofed wWART & unlocking…'
-        : `Burning ${amountWart} spoofed wWART…`,
+        ? 'Releasing all locked WART & unlocking…'
+        : `Releasing ${amountWart} locked WART…`,
     );
 
     try {
@@ -1360,7 +1673,7 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
       const notice = await pollForBurnNotice(sub.address, { fullUnlock: isFull });
 
       if (!notice) {
-        toast.error('Burn submitted but notice not seen — check rollup / refresh', {
+        toast.error('Release submitted but notice not seen — check rollup / refresh', {
           id: toastId,
           duration: 7000,
         });
@@ -1419,12 +1732,20 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
           }
         })();
         toast.success(
-          `Burned. Outstanding ${e8ToWartDisplay(remaining)}; ~${freeHint} WART freeable to withdraw`,
+          `Released. Locked remaining ${e8ToWartDisplay(remaining)}; ~${freeHint} WART withdrawable`,
           { id: toastId, duration: 8000 },
         );
       }
     } catch (err) {
-      toast.error('Burn failed: ' + (err.message || err), { id: toastId, duration: 8000 });
+      const msg = String(err?.message || err || '');
+      const capacityHint =
+        /reject|failed|revert/i.test(msg)
+          ? ' If Capacity would fall under Used, burn wWART/WLIQ claims first (or release less).'
+          : '';
+      toast.error('Release failed: ' + msg + capacityHint, {
+        id: toastId,
+        duration: 10000,
+      });
     } finally {
       setIsUnlocking((prev) => ({ ...prev, [sub.index]: false }));
       setLoading(false);
@@ -1433,6 +1754,104 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
 
   /** @deprecated use requestBurnUnlock */
   const requestUnlock = (sub) => requestBurnUnlock(sub, { burnAll: true });
+
+  /**
+   * Post-restart recovery: client shows unlocked / nothing locked, but native WART
+   * still sits on the vault. Clears local pin flags, optionally tries rollup Release
+   * if L1 inspect still has outstanding, then vault → main for full live balance.
+   */
+  const recoverVaultToMainAfterRestart = async (sub) => {
+    const vaultAddr = (sub.vaultAddress || sub.pendingVaultAddress || '')
+      .toString()
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    if (!vaultAddr) return toast.error('No vault address');
+    if (!mainMnemonic) return toast.error('Mnemonic required');
+    if (!l1Address) return toast.error('Connect MetaMask (L1) for multi-sig cosign');
+
+    setIsVaultWithdrawing((prev) => ({ ...prev, [sub.index]: true }));
+    setLoading(true);
+    const toastId = toast.loading('Recovery: checking live vault balance…');
+
+    try {
+      const liveBal = await fetchBalanceAndNonce(vaultAddr, true);
+      const liveSpendable = String(liveBal.spendable || liveBal.balance || '0');
+      if (Number(liveSpendable) <= 0) {
+        throw new Error('Vault balance is 0 on Warthog — nothing to recover');
+      }
+
+      // Drop client-only lock so freeable math allows full spend
+      setSubWallets((prev) =>
+        prev.map((s) =>
+          s.index === sub.index
+            ? {
+                ...s,
+                ...clearClientLockState(s),
+                vaultBalance: String(liveBal.balance || liveSpendable),
+                vaultSpendable: liveSpendable,
+                vaultBalanceAt: Date.now(),
+              }
+            : s,
+        ),
+      );
+
+      // If rollup still pins capacity, try real Release first (Used must be 0)
+      const inspOut = (() => {
+        try {
+          return BigInt(l1Vault?.outstandingE8 || '0');
+        } catch {
+          return 0n;
+        }
+      })();
+      if (inspOut > 0n && send) {
+        toast.loading(
+          `Rollup still pins ${e8ToWartDisplay(inspOut)} — attempting Release all…`,
+          { id: toastId },
+        );
+        try {
+          await send({
+            type: 'sub_unlock',
+            subAddress: sub.address,
+            burnAmt: inspOut.toString(),
+          });
+          await pollForBurnNotice(sub.address, { fullUnlock: true, timeoutMs: 45000 });
+        } catch (e) {
+          console.warn('[recover] sub_unlock', e);
+          toast.loading(
+            'Release skipped/failed — trying withdraw (cosigner uses live inspect pin)…',
+            { id: toastId, duration: 5000 },
+          );
+        }
+      }
+
+      setVaultWithdrawAmounts((prev) => ({ ...prev, [sub.index]: liveSpendable }));
+      // withdrawVaultToMain reads amount from state — pass via set then call after tick
+      await new Promise((r) => setTimeout(r, 50));
+      toast.loading(`Recovering ${liveSpendable} WART vault → main…`, { id: toastId });
+
+      // Inline withdraw with outstanding forced to 0 so freeable = full balance
+      const subForWithdraw = {
+        ...sub,
+        locked: false,
+        mintedE8: '0',
+        vaultBalance: liveSpendable,
+        vaultSpendable: liveSpendable,
+      };
+      // Temporarily clear pin in map then withdraw
+      setSubWallets((prev) =>
+        prev.map((s) => (s.index === sub.index ? { ...s, ...subForWithdraw } : s)),
+      );
+      await withdrawVaultToMain(subForWithdraw);
+    } catch (err) {
+      toast.error('Recovery failed: ' + (err?.message || err), {
+        id: toastId,
+        duration: 10000,
+      });
+    } finally {
+      setIsVaultWithdrawing((prev) => ({ ...prev, [sub.index]: false }));
+      setLoading(false);
+    }
+  };
 
   /**
    * Live-refresh sub + vault balances from the Warthog node.
@@ -1567,8 +1986,11 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
     return 'Securing sub-wallet (deposit path)…';
   };
 
-  /** Vault card — status + tabbed burn / withdraw (like app Overview/Send tabs). */
-  const VaultCard = ({ sub }) => {
+  /**
+   * Render vault card as a function (not an inner component).
+   * Inner components remount on every keystroke and close <details> / blur inputs.
+   */
+  const renderVaultCard = (sub) => {
     const vaultAddr = sub.pendingVaultAddress || sub.vaultAddress;
     if (!vaultAddr) {
       return (
@@ -1595,7 +2017,15 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
     const st = vaultLockStatus(sub);
     const outE8 = outstandingE8Of(sub);
     const freeable = freeableVaultWart(sub);
+    const totalInVault =
+      sub.vaultBalance != null && sub.vaultBalance !== ''
+        ? sub.vaultBalance
+        : sub.vaultSpendable ?? '…';
     const canBurn = sub.locked || outE8 > 0n;
+    const detailsKey = String(sub.index);
+    const openVaultMain = openVaultPanels[detailsKey]?.vaultMain === true;
+    const openBurn = openVaultPanels[detailsKey]?.burn === true;
+    const openDetails = openVaultPanels[detailsKey]?.details === true;
 
     return (
       <div
@@ -1603,217 +2033,364 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
       >
         <div className="sw-card-head">
           <h4 className="sw-card-title">Vault</h4>
-          <span className={`sw-pill ${st.className}`}>{st.label}</span>
+          <div className="sw-card-head-right">
+            <button
+              type="button"
+              className="sw-pill sw-pill-muted sw-pill-copy"
+              title={`Copy sub index ${sub.index}`}
+              onClick={() => copyToClipboard(String(sub.index), 'Sub index')}
+            >
+              sub #{sub.index}
+            </button>
+            <span className={`sw-pill ${st.className}`}>{st.label}</span>
+          </div>
         </div>
 
+        {/* Always-visible summary — clear collateral vs withdrawable */}
         <div className="sw-card-meta">
           <div className="sw-meta-row">
-            <span className="sw-meta-k">Address</span>
+            <span className="sw-meta-k">Sub index</span>
             <button
               type="button"
               className="sw-meta-v mono sw-link"
-              onClick={() => copyToClipboard(vaultAddr)}
-              title={vaultAddr}
+              title="Copy HD sub index"
+              onClick={() => copyToClipboard(String(sub.index), 'Sub index')}
             >
-              {displayedVaultAddr}
+              #{sub.index}
             </button>
           </div>
           <div className="sw-meta-row">
-            <span className="sw-meta-k">Balance</span>
+            <span className="sw-meta-k">Sub address</span>
+            <button
+              type="button"
+              className="sw-meta-v mono sw-link"
+              title={sub.address}
+              onClick={() => copyToClipboard(sub.address, 'Sub address')}
+            >
+              {isSmallScreen
+                ? `${String(sub.address).slice(0, 6)}…${String(sub.address).slice(-4)}`
+                : sub.address}
+            </button>
+          </div>
+          <div className="sw-meta-row">
+            <span className="sw-meta-k" title="Total native WART sitting on the vault address">
+              In vault
+            </span>
             <span className="sw-meta-v">
-              {sub.vaultSpendable != null && sub.vaultSpendable !== ''
-                ? `${sub.vaultSpendable} free`
-                : sub.vaultBalance ?? '…'}{' '}
-              WART
+              {totalInVault} WART
               {sub.vaultBalanceAt ? (
-                <span className="sw-live-tag" title={new Date(sub.vaultBalanceAt).toLocaleString()}>
+                <span
+                  className="sw-live-tag"
+                  title={new Date(sub.vaultBalanceAt).toLocaleString()}
+                >
                   · live
                 </span>
-              ) : (
-                <span className="sw-live-tag">· cached</span>
-              )}
+              ) : null}
             </span>
           </div>
           {outE8 > 0n && (
             <div className="sw-meta-row">
-              <span className="sw-meta-k">Outstanding</span>
+              <span
+                className="sw-meta-k"
+                title="Native WART on the vault pinned as mint capacity (not MetaMask ERC-20 wWART). One figure only — same as capacity credit."
+              >
+                Locked collateral
+              </span>
               <span className="sw-meta-v">
-                {e8ToWartDisplay(sub.mintedE8 || '0')} spoofed wWART
-                {Number(freeable) > 0 ? (
-                  <span className="sw-live-tag"> · freeable {freeable}</span>
-                ) : null}
+                {e8ToWartDisplay(sub.mintedE8 || '0')} WART
+                <span className="sw-live-tag">· capacity pin</span>
               </span>
             </div>
           )}
-        </div>
-
-        <div className="sw-card-toolbar">
-          <button
-            type="button"
-            className="btn secondary small"
-            onClick={() => inspectVault(vaultAddr)}
-            disabled={loading}
-          >
-            Inspect
-          </button>
-          <button
-            type="button"
-            className="btn secondary small"
-            onClick={() => loadOrCreateVault(sub)}
-            disabled={loading || isUnlocking[sub.index]}
-            title="Hide vault panel"
-          >
-            Hide
-          </button>
-          {!sub.locked && outE8 === 0n && (
-            <button
-              type="button"
-              className="btn secondary small"
-              disabled={loading}
-              title="Clear stale client lock flags after cartesi wipe"
-              onClick={() => {
-                setSubWallets((prev) =>
-                  prev.map((s) =>
-                    s.index === sub.index ? { ...s, ...clearClientLockState(s) } : s,
-                  ),
-                );
-                toast.success('Client vault lock flags cleared');
-              }}
+          <div className="sw-meta-row">
+            <span
+              className="sw-meta-k"
+              title="Native WART you can Vault → main after Release (in vault − locked collateral)"
             >
-              Clear stuck
-            </button>
-          )}
+              Withdrawable
+            </span>
+            <span className="sw-meta-v">
+              {outE8 > 0n ? freeable : totalInVault === '…' ? '…' : freeable} WART
+            </span>
+          </div>
         </div>
 
-        {/* Action tabs — same idea as Overview / Send / Activity */}
-        <nav className="sw-action-tabs" role="tablist" aria-label="Vault actions">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={vaultActionTab === 'burn'}
-            className={`sw-action-tab ${vaultActionTab === 'burn' ? 'is-active' : ''}`}
-            onClick={() => setVaultActionTab('burn')}
-          >
-            Burn wWART
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={vaultActionTab === 'withdraw'}
-            className={`sw-action-tab ${vaultActionTab === 'withdraw' ? 'is-active' : ''}`}
-            onClick={() => setVaultActionTab('withdraw')}
-          >
-            Vault → main
-          </button>
-        </nav>
-
-        {vaultActionTab === 'burn' && (
-          <div className="sw-action-panel" role="tabpanel">
-            {canBurn ? (
-              <div className="action-group burn-group">
-                <input
-                  type="number"
-                  step="0.00000001"
-                  min="0"
-                  placeholder="Burn amount"
-                  value={burnAmounts[sub.index] || ''}
-                  onChange={(e) =>
-                    setBurnAmounts((prev) => ({ ...prev, [sub.index]: e.target.value }))
-                  }
-                  disabled={isUnlocking[sub.index] || loading}
-                  className="input amount-input"
-                  title={`Max outstanding ${e8ToWartDisplay(sub.mintedE8 || '0')}`}
-                />
+        <details
+          className="sw-details"
+          open={openDetails}
+          onToggle={(e) => {
+            const open = e.currentTarget.open;
+            setOpenVaultPanels((prev) => ({
+              ...prev,
+              [detailsKey]: { ...prev[detailsKey], details: open },
+            }));
+          }}
+        >
+          <summary>Vault details</summary>
+          <div className="sw-details-body">
+            <div className="sw-card-meta">
+              <div className="sw-meta-row">
+                <span className="sw-meta-k">Address</span>
+                <button
+                  type="button"
+                  className="sw-meta-v mono sw-link"
+                  onClick={() => copyToClipboard(vaultAddr, 'Address copied')}
+                  title={vaultAddr}
+                >
+                  {displayedVaultAddr}
+                </button>
+              </div>
+              <div className="sw-meta-row">
+                <span className="sw-meta-k">In vault</span>
+                <span className="sw-meta-v">
+                  {sub.vaultBalance ?? '…'} WART
+                  {sub.vaultBalanceAt ? (
+                    <span
+                      className="sw-live-tag"
+                      title={new Date(sub.vaultBalanceAt).toLocaleString()}
+                    >
+                      · live
+                    </span>
+                  ) : (
+                    <span className="sw-live-tag">· cached</span>
+                  )}
+                </span>
+              </div>
+              {sub.vaultSpendable != null &&
+                sub.vaultSpendable !== '' &&
+                String(sub.vaultSpendable) !== String(sub.vaultBalance || '') && (
+                  <div className="sw-meta-row">
+                    <span
+                      className="sw-meta-k"
+                      title="On-chain spendable after mempool holds"
+                    >
+                      Spendable
+                    </span>
+                    <span className="sw-meta-v">{sub.vaultSpendable} WART</span>
+                  </div>
+                )}
+              {outE8 > 0n && (
+                <p className="sw-hint" style={{ margin: '0.35rem 0 0' }}>
+                  Locked collateral and L1 mint capacity are the same pin (
+                  {e8ToWartDisplay(sub.mintedE8 || '0')} WART). Not MetaMask wWART —
+                  that is a separate claim under Home / Get wWART.
+                </p>
+              )}
+            </div>
+            <div className="sw-card-toolbar">
+              <button
+                type="button"
+                className="btn secondary small"
+                onClick={() => inspectVault(vaultAddr)}
+                disabled={loading}
+              >
+                Inspect
+              </button>
+              <button
+                type="button"
+                className="btn secondary small"
+                onClick={() => loadOrCreateVault(sub)}
+                disabled={loading || isUnlocking[sub.index]}
+                title="Hide vault from panel"
+              >
+                Hide vault
+              </button>
+              {!sub.locked && outE8 === 0n && (
                 <button
                   type="button"
                   className="btn secondary small"
-                  disabled={isUnlocking[sub.index] || loading}
-                  onClick={() =>
-                    setBurnAmounts((prev) => ({
-                      ...prev,
-                      [sub.index]: e8ToWartDisplay(sub.mintedE8 || '0'),
-                    }))
-                  }
-                >
-                  Max
-                </button>
-                <button
-                  type="button"
-                  className="btn danger small"
-                  disabled={
-                    isUnlocking[sub.index] ||
-                    loading ||
-                    !burnAmounts[sub.index] ||
-                    Number(burnAmounts[sub.index]) <= 0
-                  }
-                  onClick={() =>
-                    requestBurnUnlock(sub, { amountWart: burnAmounts[sub.index] })
-                  }
-                >
-                  {isUnlocking[sub.index] ? '…' : 'Burn'}
-                </button>
-                <button
-                  type="button"
-                  className="btn danger small"
-                  disabled={isUnlocking[sub.index] || loading}
-                  onClick={() => requestBurnUnlock(sub, { burnAll: true })}
-                  title="Burn all outstanding & fully unlock"
-                >
-                  Burn all
-                </button>
-                <button
-                  type="button"
-                  className="btn secondary small"
+                  disabled={loading}
                   onClick={() => {
                     setSubWallets((prev) =>
                       prev.map((s) =>
                         s.index === sub.index ? { ...s, ...clearClientLockState(s) } : s,
                       ),
                     );
-                    setBurnAmounts((prev) => ({ ...prev, [sub.index]: '' }));
-                    toast.success('Cleared client lock/collateral (UI only)', {
-                      duration: 5000,
-                    });
+                    toast.success('Client vault lock flags cleared');
                   }}
-                  disabled={loading}
-                  title="UI-only unlock after rollup wipe"
                 >
-                  Force UI unlock
+                  Clear stuck
                 </button>
-              </div>
+              )}
+            </div>
+          </div>
+        </details>
+
+        <details
+          className="sw-details"
+          open={openBurn}
+          onToggle={(e) => {
+            const open = e.currentTarget.open;
+            setOpenVaultPanels((prev) => ({
+              ...prev,
+              [detailsKey]: { ...prev[detailsKey], burn: open },
+            }));
+          }}
+        >
+          <summary>
+            Release locked WART
+            {canBurn ? ` · ${e8ToWartDisplay(sub.mintedE8 || '0')} locked` : ' · none'}
+          </summary>
+          <div className="sw-details-body">
+            {canBurn ? (
+              <>
+                <p className="sw-hint">
+                  Unlocks native vault collateral (capacity shrinks). Backend rejects a release that
+                  would leave <strong>Capacity &lt; Used</strong> — burn wWART/WLIQ claims on Home
+                  first, or release only free headroom. Then Vault → main for coins.
+                </p>
+                <div className="action-group burn-group">
+                  <input
+                    type="number"
+                    step="0.00000001"
+                    min="0"
+                    placeholder="Amount to release"
+                    value={burnAmounts[sub.index] || ''}
+                    onChange={(e) =>
+                      setBurnAmounts((prev) => ({ ...prev, [sub.index]: e.target.value }))
+                    }
+                    disabled={isUnlocking[sub.index] || loading}
+                    className="input amount-input"
+                  />
+                  <button
+                    type="button"
+                    className="btn secondary small"
+                    disabled={isUnlocking[sub.index] || loading}
+                    onClick={() =>
+                      setBurnAmounts((prev) => ({
+                        ...prev,
+                        [sub.index]: e8ToWartDisplay(sub.mintedE8 || '0'),
+                      }))
+                    }
+                  >
+                    Max
+                  </button>
+                  <button
+                    type="button"
+                    className="btn danger small"
+                    disabled={
+                      isUnlocking[sub.index] ||
+                      loading ||
+                      !burnAmounts[sub.index] ||
+                      Number(burnAmounts[sub.index]) <= 0
+                    }
+                    onClick={() =>
+                      requestBurnUnlock(sub, { amountWart: burnAmounts[sub.index] })
+                    }
+                  >
+                    {isUnlocking[sub.index] ? '…' : 'Release'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn danger small"
+                    disabled={isUnlocking[sub.index] || loading}
+                    onClick={() => requestBurnUnlock(sub, { burnAll: true })}
+                  >
+                    Release all
+                  </button>
+                </div>
+                <details className="sw-details sw-details--nested">
+                  <summary>Force UI unlock (advanced)</summary>
+                  <div className="sw-details-body">
+                    <p className="sw-hint">
+                      Clears local lock flags only. Does not move coins or restore cosigner keys.
+                    </p>
+                    <button
+                      type="button"
+                      className="btn secondary small"
+                      onClick={() => {
+                        setSubWallets((prev) =>
+                          prev.map((s) =>
+                            s.index === sub.index ? { ...s, ...clearClientLockState(s) } : s,
+                          ),
+                        );
+                        setBurnAmounts((prev) => ({ ...prev, [sub.index]: '' }));
+                        toast.success(
+                          'UI lock cleared — then Vault → main withdraw. Cosigner not restored.',
+                          { duration: 7000 },
+                        );
+                      }}
+                      disabled={loading}
+                    >
+                      Force UI unlock
+                    </button>
+                  </div>
+                </details>
+              </>
             ) : (
-              <p className="sw-tab-empty">
-                Nothing to burn — vault unlocked (outstanding 0).
-              </p>
+              <>
+                <p className="sw-tab-empty">
+                  Client shows 0 locked. After a rollup restart, native WART can still sit on
+                  the vault while the UI looks unlocked (Force UI unlock only clears flags).
+                </p>
+                {Number(totalInVault) > 0 && (
+                  <div className="action-group" style={{ marginTop: '0.5rem' }}>
+                    <button
+                      type="button"
+                      className="btn primary small"
+                      disabled={loading || isVaultWithdrawing[sub.index]}
+                      onClick={() => recoverVaultToMainAfterRestart(sub)}
+                    >
+                      Recover vault → main (post-restart)
+                    </button>
+                  </div>
+                )}
+              </>
             )}
             {isUnlocking[sub.index] && (
               <div className="status-message status-unlock">
                 <div className="spinner" />
                 <span>
-                  Burning spoofed wWART
+                  Releasing locked WART
                   <LoadingDots />
                 </span>
               </div>
             )}
           </div>
-        )}
+        </details>
 
-        {vaultActionTab === 'withdraw' && (
-          <div className="sw-action-panel" role="tabpanel">
+        <details
+          className="sw-details"
+          open={openVaultMain}
+          onToggle={(e) => {
+            const open = e.currentTarget.open;
+            setOpenVaultPanels((prev) => ({
+              ...prev,
+              [detailsKey]: { ...prev[detailsKey], vaultMain: open },
+            }));
+          }}
+        >
+          <summary>
+            Vault → main
+            {outE8 > 0n ? ` · withdrawable ${freeable}` : Number(totalInVault) > 0 ? ` · ${totalInVault} in vault` : ''}
+          </summary>
+          <div className="sw-details-body">
+            <p className="sw-hint">
+              Multi-sig (or legacy) withdraw native WART from vault to main.
+              {outE8 === 0n && Number(totalInVault) > 0
+                ? ' If this fails with Pin held after a restart, use Recover under Release.'
+                : ''}
+            </p>
             <div className="action-group vault-withdraw-group">
               <input
-                type="number"
-                step="0.00000001"
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
                 placeholder={
-                  outE8 > 0n ? `Freeable ≤ ${freeable}` : sub.vaultBalance || '0'
+                  outE8 > 0n ? `Withdrawable ≤ ${freeable}` : sub.vaultBalance || '0'
                 }
                 value={vaultWithdrawAmounts[sub.index] || ''}
-                onChange={(e) =>
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  // allow empty / decimal typing without resetting the panel
+                  if (raw !== '' && !/^\d*[.,]?\d*$/.test(raw)) return;
                   setVaultWithdrawAmounts((prev) => ({
                     ...prev,
-                    [sub.index]: e.target.value,
-                  }))
-                }
+                    [sub.index]: raw.replace(',', '.'),
+                  }));
+                }}
+                onClick={(e) => e.stopPropagation()}
+                onKeyDown={(e) => e.stopPropagation()}
                 disabled={
                   isVaultWithdrawing[sub.index] ||
                   loading ||
@@ -1822,11 +2399,6 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                   (outE8 > 0n && Number(freeable) <= 0)
                 }
                 className="input amount-input"
-                title={
-                  outE8 > 0n
-                    ? `Freeable ${freeable} (vault − outstanding). Burn more to free more.`
-                    : 'Multi-sig send to main (live balance checked on submit)'
-                }
               />
               <button
                 type="button"
@@ -1878,14 +2450,13 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                   (outE8 > 0n && Number(freeable) <= 0)
                 }
                 onClick={() => withdrawVaultToMain(sub)}
-                title="2P multi-sig vault → main"
               >
                 {isVaultWithdrawing[sub.index] ? 'Sending…' : 'Withdraw'}
               </button>
             </div>
             {outE8 > 0n && Number(freeable) <= 0 && (
               <p className="sw-tab-empty">
-                Nothing freeable yet — switch to <strong>Burn wWART</strong> first.
+                Nothing withdrawable yet — open <strong>Release locked WART</strong> first.
               </p>
             )}
             {isVaultWithdrawing[sub.index] && (
@@ -1898,15 +2469,22 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
               </div>
             )}
           </div>
-        )}
+        </details>
       </div>
     );
   };
 
-  const totalSubs = subWallets.length;
+  const isVaultFocus = focusMode === 'vault';
+
+  // Sub wallets tab: all non-hidden subs. Vault tab: only those with a vault address.
+  const visibleSubs = isVaultFocus
+    ? baseVisibleSubs.filter((s) => !!(s.vaultAddress || s.pendingVaultAddress))
+    : baseVisibleSubs;
+
+  const totalSubs = visibleSubs.length;
   const safePos =
     totalSubs === 0 ? 0 : Math.min(Math.max(0, activeSubPos), totalSubs - 1);
-  const activeSub = totalSubs > 0 ? subWallets[safePos] : null;
+  const activeSub = totalSubs > 0 ? visibleSubs[safePos] : null;
 
   const goPrevSub = () => {
     if (totalSubs <= 1) return;
@@ -1918,31 +2496,143 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
   };
 
   const generateAndFocus = async () => {
-    const before = subWallets.length;
     await generateLockedSubWallet();
-    // New sub is appended — focus it after state settles
-    setTimeout(() => setActiveSubPos(before), 50);
+    // New sub is appended to full list; show non-hidden and focus last visible
+    setShowHiddenSubs(false);
+    setTimeout(() => {
+      setActiveSubPos((pos) => {
+        // after state update, focus will clamp; use large number then effect clamps
+        return 9999;
+      });
+    }, 80);
   };
 
+  // Cross-layer snapshot: vault locks (Warthog) vs rollup claims vs MetaMask ERC-20
+  const clientSpoofedE8 = (() => {
+    try {
+      return subWallets.reduce((acc, s) => {
+        try {
+          return acc + BigInt(s?.mintedE8 || '0');
+        } catch {
+          return acc;
+        }
+      }, 0n);
+    } catch {
+      return 0n;
+    }
+  })();
+  const rollupClaimHuman = (() => {
+    try {
+      const raw = l1Vault?.l1WwartClaim ?? l1Vault?.wwartPortable ?? '0';
+      const n = Number(raw);
+      if (Number.isFinite(n) && Math.abs(n) < 1e15) return n; // already human
+      // 18-dec integer string
+      const bi = BigInt(String(raw).split('.')[0] || '0');
+      return Number(bi) / 1e18;
+    } catch {
+      return 0;
+    }
+  })();
+  const mmHuman =
+    mmWwartBal != null && mmWwartBal !== ''
+      ? Number(mmWwartBal)
+      : null;
+  const fmtAmt = (n) =>
+    n == null || !Number.isFinite(n)
+      ? '—'
+      : n.toLocaleString(undefined, { maximumFractionDigits: 4 });
+
   return (
-  <section className="subwallet-section">
+  <section className={`subwallet-section${isVaultFocus ? ' subwallet-section--vault-focus' : ''}`}>
     <div className="subwallet-top">
-      <h3>Sub-wallets</h3>
+      <h3>{isVaultFocus ? 'WART vaults' : 'Sub wallets'}</h3>
+      <p className="sw-top-lead">
+        {isVaultFocus
+          ? 'Multi-sig vault balances · release locked · Vault → main'
+          : 'Fund → sweep → mint capacity · then claim wWART on L1'}
+      </p>
       <details className="bridge-flow-guide">
-        <summary>How it works</summary>
-        <p className="bridge-flow-lead">
-          Fund sub (any source) → <strong>sweep to vault</strong> → mint spoofed wWART 1:1 → burn to free → multi-sig withdraw.
-          Needs MetaMask + seed + rollup.
-        </p>
-        <ol className="bridge-flow-steps">
-          <li><span className="step-num">1</span><span>Generate sub · Load/create vault</span></li>
-          <li><span className="step-num">2</span><span>Fund sub (main or peer send)</span></li>
-          <li><span className="step-num">3</span><span>Refresh · Sweep any free amount → mint</span></li>
-          <li><span className="step-num">4</span><span>Burn spoofed wWART · vault → main</span></li>
-        </ol>
+        <summary>{isVaultFocus ? 'Vault tips' : 'Steps'}</summary>
+        {isVaultFocus ? (
+          <ol className="bridge-flow-steps">
+            <li><span className="step-num">1</span><span>Cycle vaults with the pager</span></li>
+            <li><span className="step-num">2</span><span>Refresh for live vault totals</span></li>
+            <li><span className="step-num">3</span><span>Release locked WART if needed, then Vault → main</span></li>
+          </ol>
+        ) : (
+          <>
+            <p className="bridge-flow-lead">
+              Needs MetaMask + seed + rollup online.
+            </p>
+            <ol className="bridge-flow-steps">
+              <li><span className="step-num">1</span><span>Generate sub · create vault</span></li>
+              <li><span className="step-num">2</span><span>Fund sub</span></li>
+              <li><span className="step-num">3</span><span>Sweep → lock WART capacity</span></li>
+              <li><span className="step-num">4</span><span>L1: claim wWART → withdraw → Execute voucher</span></li>
+            </ol>
+          </>
+        )}
       </details>
     </div>
 
+    {/* Cross-layer: locked vault WART · rollup claim · MetaMask ERC-20 */}
+    <div className="sw-card sw-card--l1-track">
+      <div className="sw-card-head">
+        <h4 className="sw-card-title">Balances across layers</h4>
+        <div className="sw-card-head-right">
+          <button
+            type="button"
+            className="btn secondary small"
+            onClick={() => {
+              if (typeof onRefreshL1Vault === 'function') onRefreshL1Vault();
+              if (typeof onRefreshMmWwart === 'function') onRefreshMmWwart();
+            }}
+          >
+            Refresh L1
+          </button>
+        </div>
+      </div>
+      <div className="sw-card-meta">
+        <div className="sw-meta-row">
+          <span
+            className="sw-meta-k"
+            title="Native WART still locked as collateral on your vaults. Release this to free withdrawable WART."
+          >
+            Locked WART
+          </span>
+          <span className="sw-meta-v">
+            {e8ToWartDisplay(clientSpoofedE8)} WART
+          </span>
+        </div>
+        <div className="sw-meta-row">
+          <span
+            className="sw-meta-k"
+            title="Rollup claim balance (portable wWART credit) — withdraw + execute voucher to mint ERC-20 in MetaMask"
+          >
+            Rollup claim
+          </span>
+          <span className="sw-meta-v">{fmtAmt(rollupClaimHuman)} wWART</span>
+        </div>
+        <div className="sw-meta-row">
+          <span
+            className="sw-meta-k"
+            title="ERC-20 wWART already in your connected MetaMask wallet"
+          >
+            MetaMask
+          </span>
+          <span className="sw-meta-v">
+            {mmHuman != null ? `${fmtAmt(mmHuman)} wWART` : '— connect MM'}
+          </span>
+        </div>
+      </div>
+      <p className="wh-hint sw-l1-track-hint">
+        <strong>Locked WART</strong> (vault collateral) is not MetaMask ERC-20. After claim on L1, tokens show under{' '}
+        <strong>MetaMask</strong>. Release locked WART on the vault to free <strong>Withdrawable</strong> balance.
+      </p>
+    </div>
+
+    {/* Sub generation only on Sub wallets tab — not on Vault tab */}
+    {!isVaultFocus && (
     <div className="subwallet-controls">
       <button
         onClick={generateAndFocus}
@@ -1959,17 +2649,23 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
           value={regenIndex}
           onChange={(e) => setRegenIndex(e.target.value)}
           className="input regen-input"
-          title="Salted index to regenerate"
+          title="HD index to regenerate (click sub index to copy)"
         />
         <button
           onClick={async () => {
-            await regenerateSubWallet();
-            // Jump to regenerated index if present
             const idx = Number(regenIndex);
+            await regenerateSubWallet();
+            setShowHiddenSubs(false);
             if (!Number.isNaN(idx)) {
-              const pos = subWallets.findIndex((s) => s.index === idx);
-              if (pos >= 0) setActiveSubPos(pos);
-              else setActiveSubPos(Math.max(0, subWallets.length - 1));
+              setTimeout(() => {
+                setActiveSubPos(0);
+                // focus after list updates — match by index in visible list
+                setActiveSubPos((_) => {
+                  const list = subWallets.filter((s) => !s.hidden || s.index === idx);
+                  const pos = list.findIndex((s) => s.index === idx);
+                  return pos >= 0 ? pos : 9999;
+                });
+              }, 100);
             }
           }}
           disabled={loading || !regenIndex}
@@ -1978,11 +2674,41 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
           Regen
         </button>
       </div>
+
+      {hiddenCount > 0 && (
+        <div className="sw-hidden-controls">
+          <button
+            type="button"
+            className="btn secondary small"
+            onClick={() => setShowHiddenSubs((v) => !v)}
+            title="Show or hide subs marked hidden"
+          >
+            {showHiddenSubs ? 'Hide stuck' : `Show hidden (${hiddenCount})`}
+          </button>
+          <button
+            type="button"
+            className="btn danger small"
+            onClick={clearAllHiddenSubs}
+            title="Permanently remove all hidden subs from this UI list"
+          >
+            Clear hidden
+          </button>
+        </div>
+      )}
     </div>
+    )}
 
     {totalSubs === 0 && (
       <div className="sw-empty">
-        <p>No sub-wallets yet. Generate one to start the bridge path.</p>
+        <p>
+          {isVaultFocus
+            ? subWallets.length === 0
+              ? 'No vaults yet. Open Sub wallets, generate a sub, then Load / create vault.'
+              : 'No vaults created yet. Open Sub wallets → Load / create vault on a sub.'
+            : subWallets.length === 0
+              ? 'No sub-wallets yet. Generate one to start the bridge path.'
+              : `${hiddenCount} sub(s) hidden — click “Show hidden” or generate a new sub.`}
+        </p>
       </div>
     )}
 
@@ -1995,18 +2721,27 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
       const shortPill = isSmallScreen
         ? `#${String(sub.index).slice(0, 6)}…`
         : `#${sub.index}`;
+      const vaultAddrShort = (() => {
+        const va = String(sub.vaultAddress || sub.pendingVaultAddress || '');
+        if (!va) return '';
+        return `${va.slice(0, 6)}…${va.slice(-4)}`;
+      })();
 
       return (
         <div className="sw-carousel" key={sub.index}>
-          {/* Pager: cycle sub + paired vault without showing every sub */}
-          <div className="sw-pager" role="navigation" aria-label="Sub-wallet switcher">
+          {/* Pager */}
+          <div
+            className="sw-pager"
+            role="navigation"
+            aria-label={isVaultFocus ? 'Vault switcher' : 'Sub-wallet switcher'}
+          >
             <button
               type="button"
               className="btn secondary small sw-pager-btn"
               onClick={goPrevSub}
               disabled={totalSubs <= 1}
-              title="Previous sub-wallet"
-              aria-label="Previous sub-wallet"
+              title={isVaultFocus ? 'Previous vault' : 'Previous sub-wallet'}
+              aria-label={isVaultFocus ? 'Previous vault' : 'Previous sub-wallet'}
             >
               ← Prev
             </button>
@@ -2019,23 +2754,31 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                 className="input sw-pager-select"
                 value={safePos}
                 onChange={(e) => setActiveSubPos(Number(e.target.value))}
-                title="Jump to sub-wallet"
-                aria-label="Select sub-wallet"
+                title={isVaultFocus ? 'Jump to vault' : 'Jump to sub-wallet'}
+                aria-label={isVaultFocus ? 'Select vault' : 'Select sub-wallet'}
               >
-                {subWallets.map((s, i) => {
+                {visibleSubs.map((s, i) => {
                   const short = `${String(s.address).slice(0, 6)}…${String(s.address).slice(-4)}`;
+                  const vAddr = String(s.vaultAddress || s.pendingVaultAddress || '');
+                  const vShort = vAddr ? `${vAddr.slice(0, 6)}…${vAddr.slice(-4)}` : '';
                   const locked = s.locked || (s.mintedE8 && BigInt(s.mintedE8 || '0') > 0n);
                   return (
                     <option key={s.index} value={i}>
-                      {i + 1}. #{s.index} · {short}
-                      {locked ? ' · locked' : ''}
-                      {s.balance && Number(s.balance) > 0 ? ` · ${s.balance} WART` : ''}
+                      {isVaultFocus
+                        ? `${i + 1}. vault ${vShort || short}${locked ? ' · locked' : ''}${
+                            s.vaultBalance != null && Number(s.vaultBalance) > 0
+                              ? ` · ${s.vaultBalance} WART`
+                              : ''
+                          }`
+                        : `${i + 1}. #${s.index} · ${short}${s.hidden ? ' · hidden' : ''}${
+                            locked ? ' · locked' : ''
+                          }${s.balance && Number(s.balance) > 0 ? ` · ${s.balance} WART` : ''}`}
                     </option>
                   );
                 })}
               </select>
               <div className="sw-pager-dots">
-                {subWallets.map((s, i) => {
+                {visibleSubs.map((s, i) => {
                   const locked =
                     s.locked || (s.mintedE8 && BigInt(s.mintedE8 || '0') > 0n);
                   return (
@@ -2046,8 +2789,16 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                         locked ? 'is-locked' : ''
                       }`}
                       onClick={() => setActiveSubPos(i)}
-                      title={`Sub-wallet ${i + 1} (index ${s.index})`}
-                      aria-label={`Show sub-wallet ${i + 1} of ${totalSubs}`}
+                      title={
+                        isVaultFocus
+                          ? `Vault ${i + 1}`
+                          : `Sub-wallet ${i + 1} (index ${s.index})`
+                      }
+                      aria-label={
+                        isVaultFocus
+                          ? `Show vault ${i + 1} of ${totalSubs}`
+                          : `Show sub-wallet ${i + 1} of ${totalSubs}`
+                      }
                       aria-current={i === safePos ? 'true' : undefined}
                     >
                       {i + 1}
@@ -2062,38 +2813,50 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
               className="btn secondary small sw-pager-btn"
               onClick={goNextSub}
               disabled={totalSubs <= 1}
-              title="Next sub-wallet"
-              aria-label="Next sub-wallet"
+              title={isVaultFocus ? 'Next vault' : 'Next sub-wallet'}
+              aria-label={isVaultFocus ? 'Next vault' : 'Next sub-wallet'}
             >
               Next →
             </button>
           </div>
 
-          <div className="sw-cards">
-            {/* ── Sub wallet card ── */}
-            <div className="sw-card sw-card--sub">
+          <div className={`sw-cards${isVaultFocus ? ' sw-cards--vault-only' : ''}`}>
+            {/* ── Sub wallet card (Sub wallets tab only) ── */}
+            {!isVaultFocus && (
+            <div className={`sw-card sw-card--sub ${sub.hidden ? 'is-hidden-sub' : ''}`}>
               <div className="sw-card-head">
-                <h4 className="sw-card-title">Sub-wallet</h4>
-                <span className="sw-pill sw-pill-muted" title={`Index ${sub.index}`}>
+                <h4 className="sw-card-title">
+                  Sub-wallet
+                  {sub.hidden ? (
+                    <span className="sw-live-tag"> · hidden</span>
+                  ) : null}
+                </h4>
+                <button
+                  type="button"
+                  className="sw-pill sw-pill-muted sw-pill-copy"
+                  title={`Click to copy full index: ${sub.index}`}
+                  onClick={() => copyToClipboard(String(sub.index), 'Index copied')}
+                >
                   {shortPill}
-                </span>
+                </button>
               </div>
 
+              {/* Always-visible summary */}
               <div className="sw-card-meta">
+                <div className="sw-meta-row">
+                  <span className="sw-meta-k">Balance</span>
+                  <span className="sw-meta-v">{sub.balance ?? '0'} WART</span>
+                </div>
                 <div className="sw-meta-row">
                   <span className="sw-meta-k">Address</span>
                   <button
                     type="button"
                     className="sw-meta-v mono sw-link"
-                    onClick={() => copyToClipboard(sub.address)}
+                    onClick={() => copyToClipboard(sub.address, 'Address copied')}
                     title={sub.address}
                   >
                     {displayedSubAddr}
                   </button>
-                </div>
-                <div className="sw-meta-row">
-                  <span className="sw-meta-k">Balance</span>
-                  <span className="sw-meta-v">{sub.balance ?? '0'} WART</span>
                 </div>
               </div>
 
@@ -2118,30 +2881,56 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                 )}
               </div>
 
-              {/* Action tabs — same pattern as Overview / Send / Activity */}
-              <nav className="sw-action-tabs" role="tablist" aria-label="Sub-wallet actions">
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={subActionTab === 'fund'}
-                  className={`sw-action-tab ${subActionTab === 'fund' ? 'is-active' : ''}`}
-                  onClick={() => setSubActionTab('fund')}
-                >
-                  Fund / exit
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={subActionTab === 'sweep'}
-                  className={`sw-action-tab ${subActionTab === 'sweep' ? 'is-active' : ''}`}
-                  onClick={() => setSubActionTab('sweep')}
-                >
-                  Sweep &amp; mint
-                </button>
-              </nav>
+              <details className="sw-details">
+                <summary>Sub details &amp; list tools</summary>
+                <div className="sw-details-body">
+                  <div className="sw-card-meta">
+                    <div className="sw-meta-row">
+                      <span className="sw-meta-k">Index</span>
+                      <button
+                        type="button"
+                        className="sw-meta-v mono sw-link"
+                        onClick={() => copyToClipboard(String(sub.index), 'Index copied')}
+                        title={`Full HD index: ${sub.index}`}
+                      >
+                        {sub.index}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="sw-card-toolbar">
+                    {sub.hidden ? (
+                      <button
+                        type="button"
+                        className="btn secondary small"
+                        onClick={() => unhideSubWallet(sub)}
+                      >
+                        Unhide
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn secondary small"
+                        onClick={() => hideSubWallet(sub)}
+                      >
+                        Hide from list
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="btn danger small"
+                      onClick={() => removeSubWallet(sub)}
+                      title="Remove from UI only — does not move on-chain WART"
+                    >
+                      Remove from UI
+                    </button>
+                  </div>
+                </div>
+              </details>
 
-              {subActionTab === 'fund' && (
-                <div className="sw-action-panel" role="tabpanel">
+              <details className="sw-details">
+                <summary>Fund / exit (main ↔ sub)</summary>
+                <div className="sw-details-body">
+                  <p className="sw-hint">Main → sub deposit or return free sub balance to main (not vault).</p>
                   <div className="action-group deposit-group">
                     <input
                       type="number"
@@ -2156,14 +2945,12 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                       }
                       disabled={isDepositing[sub.index] || loading}
                       className="input amount-input"
-                      title="Optional main → sub"
                     />
                     <button
                       type="button"
                       onClick={() => depositToSub(sub)}
                       disabled={isDepositing[sub.index] || loading}
                       className="btn primary small"
-                      title="Main → sub (optional if peers fund the sub)"
                     >
                       {isDepositing[sub.index] ? '…' : 'Main → sub'}
                     </button>
@@ -2185,7 +2972,6 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                         Number(sub.balance) <= 0
                       }
                       className="input amount-input"
-                      title="Sub → main (not vault)"
                     />
                     <button
                       type="button"
@@ -2211,7 +2997,6 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                         Number(sub.balance) <= 0
                       }
                       className="btn primary small"
-                      title="Sub → main"
                     >
                       {isWithdrawing[sub.index] ? '…' : 'Sub → main'}
                     </button>
@@ -2235,10 +3020,14 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                     </div>
                   )}
                 </div>
-              )}
+              </details>
 
-              {subActionTab === 'sweep' && (
-                <div className="sw-action-panel" role="tabpanel">
+              <details className="sw-details">
+                <summary>Sweep &amp; mint (sub → vault)</summary>
+                <div className="sw-details-body">
+                  <p className="sw-hint">
+                    Move free sub WART into vault and lock it 1:1 as capacity.
+                  </p>
                   <div className="action-group sweep-group">
                     <input
                       type="number"
@@ -2253,11 +3042,6 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                       }
                       disabled={isSweeping[sub.index] || loading}
                       className="input amount-input"
-                      title={
-                        !hasVault
-                          ? 'Create vault first'
-                          : 'Any free WART on sub → vault + mint spoofed wWART'
-                      }
                     />
                     <button
                       type="button"
@@ -2272,62 +3056,67 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                       onClick={() => sweepToVault(sub, subSweepAmounts[sub.index])}
                       disabled={isSweeping[sub.index] || loading}
                       className="btn primary small"
-                      title="Sweep free balance to vault + mint spoofed wWART 1:1"
                     >
                       {isSweeping[sub.index] ? 'Sweeping…' : 'Sweep & mint'}
                     </button>
-                    {sub.locking && !isSweeping[sub.index] && (
-                      <button
-                        type="button"
-                        className="btn secondary small"
-                        onClick={() =>
-                          setSubWallets((prev) =>
-                            prev.map((s) =>
-                              s.index === sub.index ? { ...s, locking: false } : s,
-                            ),
-                          )
-                        }
-                      >
-                        Clear locking
-                      </button>
-                    )}
-                    {(sub.sweepTxHash || hasVault) && !sub.locked && (
-                      <button
-                        type="button"
-                        className="btn secondary small"
-                        disabled={isSweeping[sub.index] || loading || !l1Address}
-                        title="Re-post sweep_lock if mint failed after funds hit vault"
-                        onClick={() => {
-                          if (!sub.sweepTxHash) {
-                            const known =
-                              typeof window !== 'undefined'
-                                ? window.prompt('Paste Warthog sweep tx hash', '')
-                                : null;
-                            if (!known) return;
-                            setSubWallets((prev) =>
-                              prev.map((s) =>
-                                s.index === sub.index
-                                  ? { ...s, sweepTxHash: known.trim() }
-                                  : s,
-                              ),
-                            );
-                            setTimeout(
-                              () =>
-                                retryMintSpoofedWwart({
-                                  ...sub,
-                                  sweepTxHash: known.trim(),
-                                }),
-                              50,
-                            );
-                            return;
-                          }
-                          retryMintSpoofedWwart(sub);
-                        }}
-                      >
-                        Retry mint
-                      </button>
-                    )}
                   </div>
+                  <details className="sw-details sw-details--nested">
+                    <summary>Advanced (retry mint / clear locking)</summary>
+                    <div className="sw-details-body">
+                      <div className="sw-card-toolbar">
+                        {sub.locking && !isSweeping[sub.index] && (
+                          <button
+                            type="button"
+                            className="btn secondary small"
+                            onClick={() =>
+                              setSubWallets((prev) =>
+                                prev.map((s) =>
+                                  s.index === sub.index ? { ...s, locking: false } : s,
+                                ),
+                              )
+                            }
+                          >
+                            Clear locking
+                          </button>
+                        )}
+                        {(sub.sweepTxHash || hasVault) && !sub.locked && (
+                          <button
+                            type="button"
+                            className="btn secondary small"
+                            disabled={isSweeping[sub.index] || loading || !l1Address}
+                            onClick={() => {
+                              if (!sub.sweepTxHash) {
+                                const known =
+                                  typeof window !== 'undefined'
+                                    ? window.prompt('Paste Warthog sweep tx hash', '')
+                                    : null;
+                                if (!known) return;
+                                setSubWallets((prev) =>
+                                  prev.map((s) =>
+                                    s.index === sub.index
+                                      ? { ...s, sweepTxHash: known.trim() }
+                                      : s,
+                                  ),
+                                );
+                                setTimeout(
+                                  () =>
+                                    retryMintSpoofedWwart({
+                                      ...sub,
+                                      sweepTxHash: known.trim(),
+                                    }),
+                                  50,
+                                );
+                                return;
+                              }
+                              retryMintSpoofedWwart(sub);
+                            }}
+                          >
+                            Retry mint
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </details>
                   {isSweeping[sub.index] && (
                     <div className="status-message status-sweep">
                       <div className="spinner" />
@@ -2338,11 +3127,12 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                     </div>
                   )}
                 </div>
-              )}
+              </details>
             </div>
+            )}
 
-            {/* Paired vault for this sub only */}
-            <VaultCard sub={sub} />
+            {/* Vault card only on Vault tab — Sub wallets stays sub-only */}
+            {isVaultFocus && renderVaultCard(sub)}
           </div>
         </div>
       );
