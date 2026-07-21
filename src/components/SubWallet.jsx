@@ -994,19 +994,23 @@ function SubWallet({
           multiSigErr = e;
           console.warn('[vault withdraw] multi-sig failed', e);
           const m = String(e?.message || e);
-          // Always fall through to legacy on Unknown vault / missing cosigner
+          // Policy / pin failures must NOT fall through to legacy full-key path
+          // (that would bypass COSIGNER_REQUIRE_TICKETS and freeable caps).
           if (
-            !/COSIGNER_MISSING|Unknown vault|unknown vault|Missing 2P|recreate multi-sig|Destination not allowed|hashHex does not match|no encrypted cosigner backup/i.test(
+            /COSIGNER_REQUIRE_TICKETS|release_ticket|ticket-backed|ticket sum|freeable|outstanding|Insufficient|Pin held|Pin:|amountE8|Nothing freeable|Mnemonic|owner mismatch|not allowed|Destination not allowed|hashHex does not match/i.test(
               m,
             )
           ) {
-            if (
-              /freeable|outstanding|Insufficient|Pin held|Pin:|amountE8|Nothing freeable|Mnemonic|owner mismatch/i.test(
-                m,
-              )
-            ) {
-              throw e;
-            }
+            throw e;
+          }
+          // Only fall through to legacy on Unknown vault / missing cosigner share
+          if (
+            !/COSIGNER_MISSING|Unknown vault|unknown vault|Missing 2P|recreate multi-sig|no encrypted cosigner backup/i.test(
+              m,
+            )
+          ) {
+            // Other multi-sig errors: still surface (do not silent-bypass policy)
+            throw e;
           }
         }
       }
@@ -2458,6 +2462,8 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
             {outE8 > 0n && Number(freeable) <= 0 && (
               <p className="sw-tab-empty">
                 Nothing withdrawable yet — open <strong>Release locked WART</strong> first.
+                Release emits <strong>release tickets</strong>; cosigner only signs freeable
+                ticket amounts while collateral is still pinned.
               </p>
             )}
             {isVaultWithdrawing[sub.index] && (

@@ -538,35 +538,53 @@ export async function POST({ request }) {
         if (REQUIRE_TICKETS && !policy.hasTickets) {
           return json(403, {
             error:
-              'COSIGNER_REQUIRE_TICKETS: no release_ticket notices — burn on Cartesi first',
+              'COSIGNER_REQUIRE_TICKETS: no release_ticket notices — Release locked WART on Cartesi first (sub_unlock emits tickets)',
             outstandingE8: policy.outstandingE8,
+            ticketSumE8: policy.ticketSumE8 || '0',
             policy,
           });
         }
-        // Partial pin: freeable = (tickets|burned) − already signed
+        // Hard mode: freeable from release_ticket sum only (no burned fallback)
+        const ticketSum = BigInt(policy.ticketSumE8 || '0');
+        const effectiveBase = REQUIRE_TICKETS ? ticketSum : freeableBase;
+        if (REQUIRE_TICKETS && effectiveBase === 0n) {
+          return json(403, {
+            error:
+              'COSIGNER_REQUIRE_TICKETS: ticket sum is 0 — Release locked WART to mint freeable tickets',
+            outstandingE8: policy.outstandingE8,
+            ticketSumE8: '0',
+            hasTickets: policy.hasTickets,
+            policy,
+          });
+        }
+        // Partial pin: freeable = tickets (hard) or tickets|burned (soft) − already signed
         if (amountE8 == null || amountE8 <= 0n) {
           return json(403, {
             error:
-              'Pin held: outstanding spoofed wWART > 0 — pass amountE8 ≤ freeable (burned/tickets − already withdrawn)',
+              'Pin held: outstanding spoofed wWART > 0 — pass amountE8 ≤ freeable (tickets − already withdrawn)',
             outstandingE8: policy.outstandingE8,
             burnedE8: burned.toString(),
-            freeableBaseE8: freeableBase.toString(),
+            freeableBaseE8: effectiveBase.toString(),
+            ticketSumE8: ticketSum.toString(),
             signedWithdrawE8: used.toString(),
-            freeableE8: (freeableBase > used ? freeableBase - used : 0n).toString(),
+            freeableE8: (effectiveBase > used ? effectiveBase - used : 0n).toString(),
             hasTickets: policy.hasTickets,
+            requireTickets: REQUIRE_TICKETS,
             policy,
           });
         }
-        const freeable = freeableBase > used ? freeableBase - used : 0n;
+        const freeable = effectiveBase > used ? effectiveBase - used : 0n;
         if (amountE8 > freeable) {
           return json(403, {
-            error: `Pin: amount ${amountE8} E8 exceeds freeable ${freeable} E8 (burn more spoofed wWART first)`,
+            error: `Pin: amount ${amountE8} E8 exceeds freeable ${freeable} E8 (ticket-backed)`,
             outstandingE8: policy.outstandingE8,
             burnedE8: burned.toString(),
-            freeableBaseE8: freeableBase.toString(),
+            freeableBaseE8: effectiveBase.toString(),
+            ticketSumE8: ticketSum.toString(),
             signedWithdrawE8: used.toString(),
             freeableE8: freeable.toString(),
             hasTickets: policy.hasTickets,
+            requireTickets: REQUIRE_TICKETS,
             policy,
           });
         }
