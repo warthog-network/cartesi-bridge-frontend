@@ -8,6 +8,7 @@
 import { secp256k1 } from '@noble/curves/secp256k1';
 import { generateRandomKeys, PublicKey, PrivateKey } from 'paillier-bigint';
 import { sha256, ripemd160, getBytes, hexlify, concat, toUtf8Bytes } from 'ethers-v6';
+import CryptoJS from 'crypto-js';
 
 export const MULTISIG_SCHEME = 'wart-2p-ecdsa-lindell-v1';
 
@@ -240,34 +241,36 @@ export function clearTwoPartyClientLocal(mainAddress, subAddress) {
   }
 }
 
-// ─── Offline vault-share backup (user-held; never upload plaintext to cosigner) ───
+// ─── Offline vault-share backup (WartBunker-style opaque password blob) ───
+//
+// File: user-vault-share.txt — single CryptoJS AES ciphertext (text/plain).
+// Unlock: password only (like warthog_wallet.txt). Never uploaded to cosigner.
+// Inside (after password decrypt): user clientSecret + optional cosignerRegister.
+// Full d is never stored. Cosigner still holds live d_dapp separately.
 
-/** Downloadable file type — client-side only recovery of user half (+ optional enc d_dapp re-register). */
+/** Logical type inside the encrypted payload (never visible in the .txt). */
 export const VAULT_SHARE_FILE_TYPE = 'cartesi-bridge-vault-share-v1';
+/** Opaque download name (WartBunker-style). */
+export const VAULT_SHARE_DOWNLOAD_NAME = 'user-vault-share.txt';
 
 /**
- * Build an offline backup object.
- *
- * Trust model (unchanged):
- * - encryptedClientSecret = mnemonic-wrapped d_user + Paillier sk  → user only
- * - encryptedCosignerBackup = mnemonic-wrapped d_dapp register blob → optional; only re-registers
- *   app half to cosigner (never sends plaintext d_user)
- * - Full d is never in this file
+ * Build the *plaintext* payload that will be password-AES encrypted into the .txt.
+ * Prefer passing clientSecret / cosignerRegister objects (not outer mnemonic wraps).
  */
-export function buildVaultShareBackupFile({
+export function buildVaultSharePlainPayload({
   mainAddress,
   subAddress,
   vaultAddress,
   index,
-  encryptedClientSecret,
-  encryptedCosignerBackup = null,
+  clientSecret,
+  cosignerRegister = null,
   scheme = MULTISIG_SCHEME,
   ownerL1 = null,
 }) {
-  if (!encryptedClientSecret) {
-    throw new Error('encryptedClientSecret required for vault-share backup');
+  if (!clientSecret?.userShareHex || !clientSecret?.paillierLambda) {
+    throw new Error('clientSecret (user half) required for vault-share backup');
   }
-  const vault = String(vaultAddress || '')
+  const vault = String(vaultAddress || clientSecret.address || '')
     .replace(/^0x/i, '')
     .toLowerCase();
   const sub = String(subAddress || '')
@@ -278,7 +281,7 @@ export function buildVaultShareBackupFile({
     .toLowerCase();
   return {
     type: VAULT_SHARE_FILE_TYPE,
-    version: 1,
+    version: 2,
     scheme: scheme || MULTISIG_SCHEME,
     createdAt: Date.now(),
     mainAddress: main || null,
@@ -286,38 +289,77 @@ export function buildVaultShareBackupFile({
     vaultAddress: vault || null,
     index: index != null ? Number(index) : null,
     ownerL1: ownerL1 ? String(ownerL1).toLowerCase() : null,
-    /** Ciphertexts only — decrypt with Warthog mnemonic offline */
-    encryptedClientSecret: String(encryptedClientSecret),
-    encryptedCosignerBackup: encryptedCosignerBackup
-      ? String(encryptedCosignerBackup)
-      : null,
-    trustModel: {
-      userShare:
-        'Browser-only. This file holds mnemonic-encrypted d_user + Paillier sk. Never sent to cosigner as plaintext.',
-      dappShare:
-        'Cosigner holds d_dapp. encryptedCosignerBackup (if present) only re-registers app half after cosigner wipe.',
-      fullKey: 'Never assembled or stored. d = d_user + d_dapp only ephemerally at keygen.',
-      doNot: 'Do not upload this file to the cosigner, dApp, or any third party unencrypted.',
-    },
+    /** Plain only inside password-encrypted blob — never written as open JSON */
+    clientSecret,
+    cosignerRegister: cosignerRegister || null,
   };
 }
 
-/** Trigger browser download of the backup JSON (client-side only). */
-export function downloadVaultShareBackupFile(fileObj, filename) {
+/** CryptoJS AES encrypt entire payload → opaque string (same style as warthog_wallet.txt). */
+export function encryptVaultShareWithPassword(plainPayload, password) {
+  const pwd = String(password || '');
+  if (!pwd) throw new Error('Password required to encrypt user-vault-share.txt');
+  if (pwd.length < 4) throw new Error('Password too short (min 4 characters)');
+  const payload =
+    plainPayload?.type === VAULT_SHARE_FILE_TYPE
+      ? plainPayload
+      : buildVaultSharePlainPayload(plainPayload);
+  return CryptoJS.AES.encrypt(JSON.stringify(payload), pwd).toString();
+}
+
+/** Decrypt opaque ciphertext with password → validated plain payload. */
+export function decryptVaultShareWithPassword(cipherText, password) {
+  const pwd = String(password || '');
+  if (!pwd) throw new Error('Password required to open user-vault-share.txt');
+  const raw = String(cipherText || '').trim();
+  if (!raw) throw new Error('Empty vault-share file');
+  // Reject obvious open JSON (old v1 format) — handled separately by import
+  if (raw.startsWith('{')) {
+    throw new Error('LEGACY_JSON_VAULT_SHARE');
+  }
+  let decrypted;
+  try {
+    const bytes = CryptoJS.AES.decrypt(raw, pwd);
+    decrypted = bytes.toString(CryptoJS.enc.Utf8);
+  } catch {
+    throw new Error('Failed to decrypt vault-share: invalid password or corrupt file');
+  }
+  if (!decrypted) {
+    throw new Error('Failed to decrypt vault-share: invalid password or corrupt file');
+  }
+  let obj;
+  try {
+    obj = JSON.parse(decrypted);
+  } catch {
+    throw new Error('Failed to decrypt vault-share: invalid password or corrupt file');
+  }
+  if (obj?.type !== VAULT_SHARE_FILE_TYPE) {
+    throw new Error(`Unknown vault-share payload type "${obj?.type || '?'}"`);
+  }
+  if (!obj.clientSecret?.userShareHex) {
+    throw new Error('Vault-share payload missing user half (clientSecret)');
+  }
+  return obj;
+}
+
+/**
+ * Download opaque password-encrypted .txt (client-side only).
+ * @param {string|object} cipherOrPayload - AES ciphertext string, or plain payload (+ password required)
+ * @param {string} [password] - required if cipherOrPayload is plain object
+ * @param {string} [filename]
+ */
+export function downloadVaultShareBackupFile(cipherOrPayload, password, filename) {
   if (typeof document === 'undefined') {
     throw new Error('downloadVaultShareBackupFile requires a browser');
   }
-  const parsed =
-    fileObj?.type === VAULT_SHARE_FILE_TYPE
-      ? fileObj
-      : buildVaultShareBackupFile(fileObj);
-  const vaultShort = (parsed.vaultAddress || 'vault').slice(0, 12);
-  const name =
-    filename ||
-    `vault-share-${vaultShort}-${new Date().toISOString().slice(0, 10)}.json`;
-  const blob = new Blob([JSON.stringify(parsed, null, 2)], {
-    type: 'application/json',
-  });
+  let cipher;
+  if (typeof cipherOrPayload === 'string' && !cipherOrPayload.trim().startsWith('{')) {
+    cipher = cipherOrPayload.trim();
+  } else {
+    cipher = encryptVaultShareWithPassword(cipherOrPayload, password);
+  }
+  const name = filename || VAULT_SHARE_DOWNLOAD_NAME;
+  const blob = new Blob([cipher], { type: 'text/plain' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -330,123 +372,181 @@ export function downloadVaultShareBackupFile(fileObj, filename) {
   return name;
 }
 
-/** Parse + validate a vault-share backup from JSON text or object. */
-export function parseVaultShareBackupFile(raw) {
-  let obj = raw;
-  if (typeof raw === 'string') {
-    const t = raw.trim();
-    if (!t) throw new Error('Empty vault-share file');
-    try {
-      obj = JSON.parse(t);
-    } catch {
-      throw new Error('Vault-share file is not valid JSON');
-    }
-  }
-  if (!obj || typeof obj !== 'object') {
-    throw new Error('Invalid vault-share file');
-  }
-  if (obj.type !== VAULT_SHARE_FILE_TYPE) {
-    throw new Error(
-      `Unknown file type "${obj.type || '?'}" — expected ${VAULT_SHARE_FILE_TYPE}`,
-    );
-  }
-  if (!obj.encryptedClientSecret) {
-    throw new Error('File missing encryptedClientSecret (user half)');
-  }
-  return obj;
+/** @deprecated alias — prefer buildVaultSharePlainPayload + encryptVaultShareWithPassword */
+export function buildVaultShareBackupFile(args) {
+  return buildVaultSharePlainPayload({
+    ...args,
+    clientSecret: args.clientSecret,
+    cosignerRegister: args.cosignerRegister,
+  });
 }
 
 /**
- * Verify mnemonic opens the ciphertext, then write into localStorage.
- * Does NOT contact cosigner or upload anything.
+ * Build plain payload from localStorage (needs mnemonic to unwrap mnemonic-wrapped secrets).
+ * @returns {object|null}
+ */
+export function exportVaultShareBackupFromLocal(
+  mainAddress,
+  subAddress,
+  { ownerL1 = null, mnemonic = null } = {},
+) {
+  const local = loadTwoPartyClientLocal(mainAddress, subAddress);
+  if (!local?.encryptedClientSecret) return null;
+  const phrase = String(mnemonic || '').trim();
+  if (!phrase) {
+    throw new Error('Mnemonic required to export vault share (unwrap local secret)');
+  }
+  let clientSecret;
+  try {
+    clientSecret = decryptJsonWithMnemonic(local.encryptedClientSecret, phrase);
+  } catch {
+    throw new Error('Cannot unwrap local user share — wrong mnemonic?');
+  }
+  let cosignerRegister = null;
+  if (local.encryptedCosignerBackup) {
+    try {
+      cosignerRegister = decryptJsonWithMnemonic(local.encryptedCosignerBackup, phrase);
+    } catch {
+      cosignerRegister = null;
+    }
+  }
+  return buildVaultSharePlainPayload({
+    mainAddress,
+    subAddress,
+    vaultAddress: local.vaultAddress,
+    index: local.index,
+    clientSecret,
+    cosignerRegister,
+    scheme: local.scheme,
+    ownerL1,
+  });
+}
+
+/**
+ * Import opaque password .txt (or legacy open JSON v1).
+ * Re-wraps secrets with mnemonic into localStorage. Does NOT contact cosigner.
  *
- * @returns {{ vaultAddress, subAddress, index, hasCosignerBackup }}
+ * @returns {{ vaultAddress, subAddress, index, hasCosignerBackup, scheme }}
  */
 export function importVaultShareBackupFile(
   raw,
-  { mainAddress, mnemonic, subAddress: preferSub = null } = {},
+  {
+    mainAddress,
+    mnemonic,
+    password = null,
+    subAddress: preferSub = null,
+  } = {},
 ) {
-  const file = parseVaultShareBackupFile(raw);
   const phrase = String(mnemonic || '').trim();
-  if (!phrase) throw new Error('Mnemonic required to verify vault-share backup');
-
-  // Prove we can decrypt user half — fail closed on wrong phrase / corrupt file
-  let clientSecret;
-  try {
-    clientSecret = decryptJsonWithMnemonic(file.encryptedClientSecret, phrase);
-  } catch {
-    throw new Error(
-      'Cannot decrypt user share — wrong Warthog mnemonic, or file corrupt',
-    );
+  if (!phrase) {
+    throw new Error('Mnemonic required to install vault share into this browser');
   }
+
+  const text = typeof raw === 'string' ? raw.trim() : '';
+  let payload;
+
+  // Legacy open JSON (v1) — mnemonic-wrapped fields, no outer password
+  if (text.startsWith('{') || (raw && typeof raw === 'object' && raw.type)) {
+    const file = typeof raw === 'object' && raw.type ? raw : JSON.parse(text);
+    if (file.type !== VAULT_SHARE_FILE_TYPE) {
+      throw new Error(`Unknown file type "${file.type || '?'}"`);
+    }
+    if (file.clientSecret?.userShareHex) {
+      // Already plain (shouldn't be open on disk) — accept carefully
+      payload = file;
+    } else if (file.encryptedClientSecret) {
+      let clientSecret;
+      try {
+        clientSecret = decryptJsonWithMnemonic(file.encryptedClientSecret, phrase);
+      } catch {
+        throw new Error('Legacy vault-share: cannot decrypt with this mnemonic');
+      }
+      let cosignerRegister = null;
+      if (file.encryptedCosignerBackup) {
+        try {
+          cosignerRegister = decryptJsonWithMnemonic(
+            file.encryptedCosignerBackup,
+            phrase,
+          );
+        } catch {
+          /* optional */
+        }
+      }
+      payload = {
+        ...file,
+        clientSecret,
+        cosignerRegister,
+      };
+    } else {
+      throw new Error('Legacy vault-share missing user half');
+    }
+  } else {
+    // Opaque WartBunker-style blob
+    const pwd = String(password || '');
+    if (!pwd) throw new Error('Password required to open user-vault-share.txt');
+    payload = decryptVaultShareWithPassword(text, pwd);
+  }
+
+  const clientSecret = payload.clientSecret;
   if (!clientSecret?.userShareHex || !clientSecret?.paillierLambda) {
     throw new Error('Decrypted payload is not a valid 2P client secret');
   }
-  if (file.encryptedCosignerBackup) {
-    try {
-      decryptJsonWithMnemonic(file.encryptedCosignerBackup, phrase);
-    } catch {
-      throw new Error(
-        'encryptedCosignerBackup present but will not decrypt with this mnemonic',
-      );
-    }
-  }
 
-  const main = String(mainAddress || file.mainAddress || '')
+  const main = String(mainAddress || payload.mainAddress || '')
     .replace(/^0x/i, '')
     .toLowerCase();
-  const sub = String(preferSub || file.subAddress || '')
+  const sub = String(preferSub || payload.subAddress || '')
     .replace(/^0x/i, '')
     .toLowerCase();
   if (!main) throw new Error('mainAddress required to import vault share');
   if (!sub) throw new Error('subAddress missing in file — cannot import');
 
-  const vault = String(
-    file.vaultAddress || clientSecret.address || '',
-  )
+  const vault = String(payload.vaultAddress || clientSecret.address || '')
     .replace(/^0x/i, '')
     .toLowerCase();
+
+  const enc = encryptJsonWithMnemonic(clientSecret, phrase);
+  const encBackup = payload.cosignerRegister
+    ? encryptJsonWithMnemonic(payload.cosignerRegister, phrase)
+    : null;
 
   saveTwoPartyClientLocal({
     mainAddress: main,
     subAddress: sub,
     vaultAddress: vault,
-    index: file.index != null ? Number(file.index) : 0,
-    encryptedClientSecret: file.encryptedClientSecret,
-    encryptedCosignerBackup: file.encryptedCosignerBackup || null,
-    scheme: file.scheme || MULTISIG_SCHEME,
+    index: payload.index != null ? Number(payload.index) : 0,
+    encryptedClientSecret: enc,
+    encryptedCosignerBackup: encBackup,
+    scheme: payload.scheme || MULTISIG_SCHEME,
   });
 
   return {
     vaultAddress: vault,
     subAddress: sub,
-    index: file.index != null ? Number(file.index) : 0,
-    hasCosignerBackup: !!file.encryptedCosignerBackup,
-    scheme: file.scheme || MULTISIG_SCHEME,
+    index: payload.index != null ? Number(payload.index) : 0,
+    hasCosignerBackup: !!payload.cosignerRegister,
+    scheme: payload.scheme || MULTISIG_SCHEME,
   };
 }
 
-/**
- * Export from existing localStorage binding (if present).
- * @returns {object|null} backup file object
- */
-export function exportVaultShareBackupFromLocal(
-  mainAddress,
-  subAddress,
-  { ownerL1 = null } = {},
-) {
-  const local = loadTwoPartyClientLocal(mainAddress, subAddress);
-  if (!local?.encryptedClientSecret) return null;
-  return buildVaultShareBackupFile({
-    mainAddress,
-    subAddress,
-    vaultAddress: local.vaultAddress,
-    index: local.index,
-    encryptedClientSecret: local.encryptedClientSecret,
-    encryptedCosignerBackup: local.encryptedCosignerBackup,
-    scheme: local.scheme,
-    ownerL1,
-  });
+/** Prompt helper (browser). Returns password or null if cancelled. */
+export function promptVaultSharePassword(mode = 'encrypt') {
+  if (typeof window === 'undefined') return null;
+  if (mode === 'encrypt') {
+    const p1 = window.prompt(
+      'Password to encrypt user-vault-share.txt\n(same idea as warthog_wallet.txt — store offline)',
+    );
+    if (p1 == null || p1 === '') return null;
+    const p2 = window.prompt('Confirm password for user-vault-share.txt');
+    if (p2 == null) return null;
+    if (p1 !== p2) {
+      throw new Error('Passwords do not match');
+    }
+    return p1;
+  }
+  const p = window.prompt('Password for user-vault-share.txt');
+  if (p == null || p === '') return null;
+  return p;
 }
 
 /** Client: k1, R1 = k1·G */
