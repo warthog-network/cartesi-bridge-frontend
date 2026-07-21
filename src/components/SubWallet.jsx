@@ -23,6 +23,7 @@ import { multiSigTransferWart } from '../utils/multiSigTransfer.js';
 import { deriveVaultWallet } from '../utils/vaultDerive.js';
 import { getSmartNonce, bumpNonceAfterSuccess } from '../utils/cancelLimitOrder.js';
 import { computeWliqMintAvailable } from '../utils/wliqCapacity.js';
+import { SHARE_TOKEN } from '../utils/tokenNames.js';
 const API_URL = '/api/proxy';
 
 /** Module-level so SubWallet re-renders do not remount / reset dots interval. */
@@ -2507,7 +2508,7 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
     }, 80);
   };
 
-  // Cross-layer snapshot: vault locks (Warthog) vs rollup claims vs MetaMask ERC-20
+  // Cross-layer snapshot: vault locks · WLIQ · wWART claim · MetaMask ERC-20
   const clientSpoofedE8 = (() => {
     try {
       return subWallets.reduce((acc, s) => {
@@ -2521,18 +2522,22 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
       return 0n;
     }
   })();
-  const rollupClaimHuman = (() => {
+  /** Parse vault 18-dec (or already-human) amount to number. */
+  const human18 = (raw) => {
     try {
-      const raw = l1Vault?.l1WwartClaim ?? l1Vault?.wwartPortable ?? '0';
+      if (raw == null || raw === '') return 0;
       const n = Number(raw);
       if (Number.isFinite(n) && Math.abs(n) < 1e15) return n; // already human
-      // 18-dec integer string
       const bi = BigInt(String(raw).split('.')[0] || '0');
       return Number(bi) / 1e18;
     } catch {
       return 0;
     }
-  })();
+  };
+  const rollupWliqHuman = human18(l1Vault?.liquid);
+  const rollupClaimHuman = human18(
+    l1Vault?.l1WwartClaim ?? l1Vault?.wwartPortable ?? '0',
+  );
   const mmHuman =
     mmWwartBal != null && mmWwartBal !== ''
       ? Number(mmWwartBal)
@@ -2575,7 +2580,7 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
       </details>
     </div>
 
-    {/* Cross-layer: locked vault WART · rollup claim · MetaMask ERC-20 */}
+    {/* Cross-layer: locked vault WART · WLIQ · wWART claim · MetaMask ERC-20 */}
     <div className="sw-card sw-card--l1-track">
       <div className="sw-card-head">
         <h4 className="sw-card-title">Balances across layers</h4>
@@ -2607,9 +2612,20 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
         <div className="sw-meta-row">
           <span
             className="sw-meta-k"
-            title="Rollup claim balance (portable wWART credit) — withdraw + execute voucher to mint ERC-20 in MetaMask"
+            title={`${SHARE_TOKEN.symbol} share held on the rollup (mint/burn on Warthog Home). Uses the same capacity pool as wWART claims.`}
           >
-            Rollup claim
+            Rollup {SHARE_TOKEN.symbol}
+          </span>
+          <span className="sw-meta-v">
+            {fmtAmt(rollupWliqHuman)} {SHARE_TOKEN.symbol}
+          </span>
+        </div>
+        <div className="sw-meta-row">
+          <span
+            className="sw-meta-k"
+            title="Rollup wWART capacity claim — withdraw + execute voucher to mint ERC-20 in MetaMask"
+          >
+            Rollup wWART claim
           </span>
           <span className="sw-meta-v">{fmtAmt(rollupClaimHuman)} wWART</span>
         </div>
@@ -2626,8 +2642,9 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
         </div>
       </div>
       <p className="wh-hint sw-l1-track-hint">
-        <strong>Locked WART</strong> (vault collateral) is not MetaMask ERC-20. After claim on L1, tokens show under{' '}
-        <strong>MetaMask</strong>. Release locked WART on the vault to free <strong>Withdrawable</strong> balance.
+        <strong>Locked WART</strong> is vault collateral.{' '}
+        <strong>{SHARE_TOKEN.symbol}</strong> and <strong>wWART claim</strong> are rollup shares
+        against that capacity. MetaMask shows L1 ERC-20 after voucher execute.
       </p>
     </div>
 
