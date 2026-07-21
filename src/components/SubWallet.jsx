@@ -164,6 +164,53 @@ function SubWallet({
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
+  // Re-sync locked collateral (mintedE8) from rollup notices when subs load.
+  // Fixes stale localStorage after partial releases (e.g. UI stuck at 8 after release → 2).
+  useEffect(() => {
+    let cancelled = false;
+    const subs = (subWallets || []).filter(
+      (s) => s?.address && (s.locked || (s.mintedE8 && s.mintedE8 !== '0') || s.vaultAddress),
+    );
+    if (!subs.length) return undefined;
+
+    (async () => {
+      const updates = [];
+      for (const s of subs) {
+        try {
+          const rebuilt = await rebuildOutstandingE8FromNotices(s.address);
+          if (!rebuilt || cancelled) continue;
+          const prev = String(s.mintedE8 || '0');
+          if (prev !== rebuilt.outstandingE8) {
+            updates.push({
+              index: s.index,
+              mintedE8: rebuilt.outstandingE8,
+              locked: !rebuilt.fullyUnlocked && BigInt(rebuilt.outstandingE8) > 0n,
+            });
+          }
+        } catch {
+          /* rollup may be down */
+        }
+      }
+      if (cancelled || !updates.length) return;
+      setSubWallets((prev) =>
+        prev.map((s) => {
+          const u = updates.find((x) => x.index === s.index);
+          return u ? { ...s, mintedE8: u.mintedE8, locked: u.locked } : s;
+        }),
+      );
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // Only when wallet/sub list identity changes — not every mintedE8 write
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    address,
+    // stable-ish fingerprint of which subs exist
+    (subWallets || []).map((s) => `${s.index}:${s.address}`).join('|'),
+  ]);
+
   // NOTE: do not define child components inside SubWallet — each re-render remounts them
   // and collapses <details> / steals input focus (Vault → main typing bug).
 
@@ -685,40 +732,8 @@ function SubWallet({
       // onto existing mintedE8 (retry / double-poll used to double locked amount, e.g. 16→32).
       let outstandingFromNotices = null;
       try {
-        const gqlClient = new GraphQLClient(getRollupGraphqlUrl());
-        const { notices } = await gqlClient.request(gql`
-          { notices(last: 80) { edges { node { payload } } } }
-        `);
-        const subNorm = String(sub.address).replace(/^0x/i, '').toLowerCase();
-        let minted = 0n;
-        let burned = 0n;
-        for (const e of notices?.edges || []) {
-          const n = parseNoticePayload(e.node.payload);
-          if (!n?.type) continue;
-          const nSub = String(n.subAddress || '')
-            .replace(/^0x/i, '')
-            .toLowerCase();
-          if (nSub && nSub !== subNorm) continue;
-          if (n.type === 'sweep_locked' && n.mintedE8 != null) {
-            try {
-              minted += BigInt(String(n.mintedE8));
-            } catch {
-              /* */
-            }
-          } else if (
-            (n.type === 'spoofed_wwart_burned' || n.type === 'subwallet_unlocked') &&
-            n.burnedE8 != null
-          ) {
-            // Only attribute burns that target this sub when subAddress present
-            if (nSub && nSub !== subNorm) continue;
-            try {
-              burned += BigInt(String(n.burnedE8));
-            } catch {
-              /* */
-            }
-          }
-        }
-        outstandingFromNotices = (minted > burned ? minted - burned : 0n).toString();
+        const rebuilt = await rebuildOutstandingE8FromNotices(sub.address);
+        if (rebuilt) outstandingFromNotices = rebuilt.outstandingE8;
       } catch {
         /* ignore */
       }
@@ -1206,29 +1221,177 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
   return false;
 };
 
-  const pollForBurnNotice = async (subAddress, { fullUnlock = false, timeoutMs = 60000 } = {}) => {
+  /**
+   * Rebuild locked outstanding (E8) for a sub from full notice history.
+   * minted = sum(sweep_locked.mintedE8), burned = sum(spoofed burns).
+   * Source of truth after partial releases — do not trust a single stale notice.
+   */
+  const rebuildOutstandingE8FromNotices = async (subAddress, { last = 120 } = {}) => {
+    const subNorm = String(subAddress || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    if (!subNorm) return null;
+    const gqlClient = new GraphQLClient(getRollupGraphqlUrl());
+    const { notices } = await gqlClient.request(gql`
+      { notices(last: ${last}) { edges { node { payload } } } }
+    `);
+    let minted = 0n;
+    let burned = 0n;
+    let lastBurnNotice = null;
+    let fullyUnlocked = false;
+    for (const e of notices?.edges || []) {
+      const n = parseNoticePayload(e.node.payload);
+      if (!n?.type) continue;
+      const nSub = String(n.subAddress || '')
+        .replace(/^0x/i, '')
+        .toLowerCase();
+      if (nSub && nSub !== subNorm) continue;
+      if (n.type === 'sweep_locked' && n.mintedE8 != null) {
+        try {
+          minted += BigInt(String(n.mintedE8));
+        } catch {
+          /* */
+        }
+      } else if (
+        (n.type === 'spoofed_wwart_burned' || n.type === 'subwallet_unlocked') &&
+        n.burnedE8 != null
+      ) {
+        try {
+          burned += BigInt(String(n.burnedE8));
+        } catch {
+          /* */
+        }
+        // Keep the newest burn notice (GraphQL last:N is oldest→newest on this stack)
+        lastBurnNotice = n;
+        if (n.type === 'subwallet_unlocked' || String(n.remainingMintedE8 || '') === '0') {
+          fullyUnlocked = true;
+        }
+      }
+    }
+    const outstandingE8 = fullyUnlocked
+      ? 0n
+      : minted > burned
+        ? minted - burned
+        : 0n;
+    return {
+      outstandingE8: outstandingE8.toString(),
+      mintedE8: minted.toString(),
+      burnedE8: burned.toString(),
+      lastBurnNotice,
+      fullyUnlocked: fullyUnlocked || outstandingE8 === 0n,
+    };
+  };
+
+  /**
+   * Wait for a burn/unlock notice that advances state past prevOutstandingE8.
+   * IMPORTANT: GraphQL `notices(last:N)` is chronological (oldest first) here —
+   * never `.find()` the first match (that reuses an older partial burn forever).
+   */
+  const pollForBurnNotice = async (
+    subAddress,
+    {
+      fullUnlock = false,
+      timeoutMs = 60000,
+      prevOutstandingE8 = null,
+      expectBurnedE8 = null,
+    } = {},
+  ) => {
     const start = Date.now();
     const subNorm = String(subAddress).replace(/^0x/i, '').toLowerCase();
+    const prev =
+      prevOutstandingE8 != null && prevOutstandingE8 !== ''
+        ? BigInt(String(prevOutstandingE8))
+        : null;
+    const expectBurn =
+      expectBurnedE8 != null && expectBurnedE8 !== ''
+        ? BigInt(String(expectBurnedE8))
+        : null;
+
     while (Date.now() - start < timeoutMs) {
       try {
+        // Prefer full rebuild — survives multi-release history
+        const rebuilt = await rebuildOutstandingE8FromNotices(subAddress);
+        if (rebuilt) {
+          if (fullUnlock && rebuilt.fullyUnlocked) {
+            return (
+              rebuilt.lastBurnNotice || {
+                type: 'subwallet_unlocked',
+                remainingMintedE8: '0',
+                burnedE8: rebuilt.burnedE8,
+                verified: true,
+                subAddress: subNorm,
+              }
+            );
+          }
+          if (!fullUnlock && prev != null) {
+            const out = BigInt(rebuilt.outstandingE8);
+            // Progress: outstanding dropped, or full unlock
+            if (out < prev || rebuilt.fullyUnlocked) {
+              return (
+                rebuilt.lastBurnNotice || {
+                  type: out === 0n ? 'subwallet_unlocked' : 'spoofed_wwart_burned',
+                  remainingMintedE8: rebuilt.outstandingE8,
+                  burnedE8: expectBurn != null ? expectBurn.toString() : rebuilt.burnedE8,
+                  verified: true,
+                  subAddress: subNorm,
+                }
+              );
+            }
+          }
+          // No prev baseline: accept newest burn if present
+          if (!fullUnlock && prev == null && rebuilt.lastBurnNotice) {
+            return rebuilt.lastBurnNotice;
+          }
+        }
+
+        // Fallback: newest matching notice in the window (last element, not first)
         const gqlClient = new GraphQLClient(getRollupGraphqlUrl());
         const { notices } = await gqlClient.request(gql`
-          { notices(last: 20) { edges { node { payload } } } }
+          { notices(last: 40) { edges { node { payload } } } }
         `);
         const parsed = (notices?.edges || [])
           .map((e) => parseNoticePayload(e.node.payload))
           .filter(Boolean);
-        const hit = parsed.find((n) => {
+        const hits = parsed.filter((n) => {
           const sa = String(n.subAddress || '').replace(/^0x/i, '').toLowerCase();
-          if (sa !== subNorm || !n.verified) return false;
+          if (sa !== subNorm || n.verified === false) return false;
           if (fullUnlock) return n.type === 'subwallet_unlocked';
           return n.type === 'spoofed_wwart_burned' || n.type === 'subwallet_unlocked';
         });
-        if (hit) return hit;
+        if (hits.length) {
+          // Prefer: match expected burn amount → else highest timestamp → else last in list
+          let hit = hits[hits.length - 1];
+          if (expectBurn != null) {
+            const matchBurn = [...hits].reverse().find((n) => {
+              try {
+                return BigInt(String(n.burnedE8 || '0')) === expectBurn;
+              } catch {
+                return false;
+              }
+            });
+            if (matchBurn) hit = matchBurn;
+          } else {
+            const byTs = [...hits].sort(
+              (a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0),
+            );
+            if (byTs[0]) hit = byTs[0];
+          }
+          if (prev != null && hit.remainingMintedE8 != null) {
+            try {
+              if (BigInt(String(hit.remainingMintedE8)) >= prev && hit.type !== 'subwallet_unlocked') {
+                // Stale older notice — keep polling
+                hit = null;
+              }
+            } catch {
+              /* accept */
+            }
+          }
+          if (hit) return hit;
+        }
       } catch {
         /* ignore */
       }
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 1500));
     }
     return null;
   };
@@ -1675,7 +1838,11 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
       });
 
       toast.loading('Waiting for burn notice…', { id: toastId });
-      const notice = await pollForBurnNotice(sub.address, { fullUnlock: isFull });
+      const notice = await pollForBurnNotice(sub.address, {
+        fullUnlock: isFull,
+        prevOutstandingE8: outstandingE8.toString(),
+        expectBurnedE8: burnE8,
+      });
 
       if (!notice) {
         toast.error('Release submitted but notice not seen — check rollup / refresh', {
@@ -1685,12 +1852,28 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
         return;
       }
 
-      const remaining = notice.remainingMintedE8 != null
-        ? String(notice.remainingMintedE8)
-        : isFull
-          ? '0'
-          : (outstandingE8 - BigInt(burnE8 || 0)).toString();
-      const fullyUnlocked = remaining === '0' || notice.type === 'subwallet_unlocked';
+      // Always rebuild from full history — a single notice can be an older partial burn
+      // (GraphQL last:N is oldest→newest; stale .find() left UI at 8 after releasing 6→2).
+      let remaining;
+      let fullyUnlocked;
+      try {
+        const rebuilt = await rebuildOutstandingE8FromNotices(sub.address);
+        if (rebuilt) {
+          remaining = rebuilt.outstandingE8;
+          fullyUnlocked = rebuilt.fullyUnlocked;
+        }
+      } catch {
+        /* fall through */
+      }
+      if (remaining == null) {
+        remaining =
+          notice.remainingMintedE8 != null
+            ? String(notice.remainingMintedE8)
+            : isFull
+              ? '0'
+              : (outstandingE8 - BigInt(burnE8 || 0)).toString();
+        fullyUnlocked = remaining === '0' || notice.type === 'subwallet_unlocked';
+      }
 
       setSubWallets((prev) =>
         prev.map((s) =>
