@@ -240,6 +240,215 @@ export function clearTwoPartyClientLocal(mainAddress, subAddress) {
   }
 }
 
+// ─── Offline vault-share backup (user-held; never upload plaintext to cosigner) ───
+
+/** Downloadable file type — client-side only recovery of user half (+ optional enc d_dapp re-register). */
+export const VAULT_SHARE_FILE_TYPE = 'cartesi-bridge-vault-share-v1';
+
+/**
+ * Build an offline backup object.
+ *
+ * Trust model (unchanged):
+ * - encryptedClientSecret = mnemonic-wrapped d_user + Paillier sk  → user only
+ * - encryptedCosignerBackup = mnemonic-wrapped d_dapp register blob → optional; only re-registers
+ *   app half to cosigner (never sends plaintext d_user)
+ * - Full d is never in this file
+ */
+export function buildVaultShareBackupFile({
+  mainAddress,
+  subAddress,
+  vaultAddress,
+  index,
+  encryptedClientSecret,
+  encryptedCosignerBackup = null,
+  scheme = MULTISIG_SCHEME,
+  ownerL1 = null,
+}) {
+  if (!encryptedClientSecret) {
+    throw new Error('encryptedClientSecret required for vault-share backup');
+  }
+  const vault = String(vaultAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  const sub = String(subAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  const main = String(mainAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  return {
+    type: VAULT_SHARE_FILE_TYPE,
+    version: 1,
+    scheme: scheme || MULTISIG_SCHEME,
+    createdAt: Date.now(),
+    mainAddress: main || null,
+    subAddress: sub || null,
+    vaultAddress: vault || null,
+    index: index != null ? Number(index) : null,
+    ownerL1: ownerL1 ? String(ownerL1).toLowerCase() : null,
+    /** Ciphertexts only — decrypt with Warthog mnemonic offline */
+    encryptedClientSecret: String(encryptedClientSecret),
+    encryptedCosignerBackup: encryptedCosignerBackup
+      ? String(encryptedCosignerBackup)
+      : null,
+    trustModel: {
+      userShare:
+        'Browser-only. This file holds mnemonic-encrypted d_user + Paillier sk. Never sent to cosigner as plaintext.',
+      dappShare:
+        'Cosigner holds d_dapp. encryptedCosignerBackup (if present) only re-registers app half after cosigner wipe.',
+      fullKey: 'Never assembled or stored. d = d_user + d_dapp only ephemerally at keygen.',
+      doNot: 'Do not upload this file to the cosigner, dApp, or any third party unencrypted.',
+    },
+  };
+}
+
+/** Trigger browser download of the backup JSON (client-side only). */
+export function downloadVaultShareBackupFile(fileObj, filename) {
+  if (typeof document === 'undefined') {
+    throw new Error('downloadVaultShareBackupFile requires a browser');
+  }
+  const parsed =
+    fileObj?.type === VAULT_SHARE_FILE_TYPE
+      ? fileObj
+      : buildVaultShareBackupFile(fileObj);
+  const vaultShort = (parsed.vaultAddress || 'vault').slice(0, 12);
+  const name =
+    filename ||
+    `vault-share-${vaultShort}-${new Date().toISOString().slice(0, 10)}.json`;
+  const blob = new Blob([JSON.stringify(parsed, null, 2)], {
+    type: 'application/json',
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  return name;
+}
+
+/** Parse + validate a vault-share backup from JSON text or object. */
+export function parseVaultShareBackupFile(raw) {
+  let obj = raw;
+  if (typeof raw === 'string') {
+    const t = raw.trim();
+    if (!t) throw new Error('Empty vault-share file');
+    try {
+      obj = JSON.parse(t);
+    } catch {
+      throw new Error('Vault-share file is not valid JSON');
+    }
+  }
+  if (!obj || typeof obj !== 'object') {
+    throw new Error('Invalid vault-share file');
+  }
+  if (obj.type !== VAULT_SHARE_FILE_TYPE) {
+    throw new Error(
+      `Unknown file type "${obj.type || '?'}" — expected ${VAULT_SHARE_FILE_TYPE}`,
+    );
+  }
+  if (!obj.encryptedClientSecret) {
+    throw new Error('File missing encryptedClientSecret (user half)');
+  }
+  return obj;
+}
+
+/**
+ * Verify mnemonic opens the ciphertext, then write into localStorage.
+ * Does NOT contact cosigner or upload anything.
+ *
+ * @returns {{ vaultAddress, subAddress, index, hasCosignerBackup }}
+ */
+export function importVaultShareBackupFile(
+  raw,
+  { mainAddress, mnemonic, subAddress: preferSub = null } = {},
+) {
+  const file = parseVaultShareBackupFile(raw);
+  const phrase = String(mnemonic || '').trim();
+  if (!phrase) throw new Error('Mnemonic required to verify vault-share backup');
+
+  // Prove we can decrypt user half — fail closed on wrong phrase / corrupt file
+  let clientSecret;
+  try {
+    clientSecret = decryptJsonWithMnemonic(file.encryptedClientSecret, phrase);
+  } catch {
+    throw new Error(
+      'Cannot decrypt user share — wrong Warthog mnemonic, or file corrupt',
+    );
+  }
+  if (!clientSecret?.userShareHex || !clientSecret?.paillierLambda) {
+    throw new Error('Decrypted payload is not a valid 2P client secret');
+  }
+  if (file.encryptedCosignerBackup) {
+    try {
+      decryptJsonWithMnemonic(file.encryptedCosignerBackup, phrase);
+    } catch {
+      throw new Error(
+        'encryptedCosignerBackup present but will not decrypt with this mnemonic',
+      );
+    }
+  }
+
+  const main = String(mainAddress || file.mainAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  const sub = String(preferSub || file.subAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (!main) throw new Error('mainAddress required to import vault share');
+  if (!sub) throw new Error('subAddress missing in file — cannot import');
+
+  const vault = String(
+    file.vaultAddress || clientSecret.address || '',
+  )
+    .replace(/^0x/i, '')
+    .toLowerCase();
+
+  saveTwoPartyClientLocal({
+    mainAddress: main,
+    subAddress: sub,
+    vaultAddress: vault,
+    index: file.index != null ? Number(file.index) : 0,
+    encryptedClientSecret: file.encryptedClientSecret,
+    encryptedCosignerBackup: file.encryptedCosignerBackup || null,
+    scheme: file.scheme || MULTISIG_SCHEME,
+  });
+
+  return {
+    vaultAddress: vault,
+    subAddress: sub,
+    index: file.index != null ? Number(file.index) : 0,
+    hasCosignerBackup: !!file.encryptedCosignerBackup,
+    scheme: file.scheme || MULTISIG_SCHEME,
+  };
+}
+
+/**
+ * Export from existing localStorage binding (if present).
+ * @returns {object|null} backup file object
+ */
+export function exportVaultShareBackupFromLocal(
+  mainAddress,
+  subAddress,
+  { ownerL1 = null } = {},
+) {
+  const local = loadTwoPartyClientLocal(mainAddress, subAddress);
+  if (!local?.encryptedClientSecret) return null;
+  return buildVaultShareBackupFile({
+    mainAddress,
+    subAddress,
+    vaultAddress: local.vaultAddress,
+    index: local.index,
+    encryptedClientSecret: local.encryptedClientSecret,
+    encryptedCosignerBackup: local.encryptedCosignerBackup,
+    scheme: local.scheme,
+    ownerL1,
+  });
+}
+
 /** Client: k1, R1 = k1·G */
 export function clientSignRound1() {
   const k1 = randomScalar();

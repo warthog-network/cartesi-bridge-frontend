@@ -16,6 +16,10 @@ import {
   loadTwoPartyClientLocal,
   clearTwoPartyClientLocal,
   restoreCosignerRegisterFromLocal,
+  buildVaultShareBackupFile,
+  downloadVaultShareBackupFile,
+  exportVaultShareBackupFromLocal,
+  importVaultShareBackupFile,
   MULTISIG_SCHEME,
 } from '../utils/twoPartyEcdsa.js';
 import { registerMultiSigVault, cosignerStatus } from '../utils/cosignerClient.js';
@@ -221,6 +225,87 @@ function SubWallet({
       .writeText(s)
       .then(() => toast.success(`${label}: ${s.length > 24 ? s.slice(0, 12) + '…' : s}`))
       .catch(() => toast.error('Failed to copy'));
+  };
+
+  /**
+   * Download mnemonic-encrypted vault-share file (user half + optional cosigner re-register blob).
+   * Never uploads to cosigner/server — trust model intact.
+   */
+  const downloadVaultShareBackup = (sub) => {
+    const mainAddr = mainWallet?.address || address;
+    if (!mainAddr) return toast.error('Unlock main Warthog wallet first');
+    if (!sub?.address) return toast.error('No sub-wallet');
+    try {
+      const file = exportVaultShareBackupFromLocal(mainAddr, sub.address, {
+        ownerL1: l1Address,
+      });
+      if (!file) {
+        return toast.error(
+          'No local user share for this vault — create multi-sig vault first, or Import a backup file',
+          { duration: 8000 },
+        );
+      }
+      const name = downloadVaultShareBackupFile(file);
+      toast.success(
+        `Downloaded ${name} — store offline. Needs your mnemonic to open. Cosigner still holds d_dapp separately.`,
+        { duration: 9000 },
+      );
+    } catch (e) {
+      toast.error(String(e?.message || e));
+    }
+  };
+
+  /**
+   * Import offline vault-share into this browser (localStorage only).
+   * Does not send d_user to cosigner. Optional encryptedCosignerBackup stays local
+   * until an existing re-register path needs it.
+   */
+  const importVaultShareBackup = (sub, fileList) => {
+    const file = fileList?.[0];
+    if (!file) return;
+    const mainAddr = mainWallet?.address || address;
+    if (!mainAddr) return toast.error('Unlock main Warthog wallet first');
+    if (!mainMnemonic) {
+      return toast.error('Mnemonic required to verify encrypted vault-share file');
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const text = String(reader.result || '');
+        const result = importVaultShareBackupFile(text, {
+          mainAddress: mainAddr,
+          mnemonic: mainMnemonic,
+          subAddress: sub?.address || undefined,
+        });
+        // Bind vault address on the sub if we got one
+        if (sub?.index != null && result.vaultAddress) {
+          setSubWallets((prev) =>
+            prev.map((s) =>
+              s.index === sub.index
+                ? {
+                    ...s,
+                    vaultAddress: result.vaultAddress,
+                    pendingVaultAddress: result.vaultAddress,
+                    multisig: true,
+                    vaultScheme: result.scheme,
+                  }
+                : s,
+            ),
+          );
+        }
+        toast.success(
+          `Imported user share for vault ${String(result.vaultAddress).slice(0, 12)}…` +
+            (result.hasCosignerBackup
+              ? ' (cosigner re-register backup included — still separate from user half)'
+              : ''),
+          { duration: 9000 },
+        );
+      } catch (e) {
+        toast.error(String(e?.message || e), { duration: 9000 });
+      }
+    };
+    reader.onerror = () => toast.error('Failed to read vault-share file');
+    reader.readAsText(file);
   };
 
   /** Visible list (hidden stuck vaults stay in storage until removed). */
@@ -1666,6 +1751,31 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
           scheme: vault.scheme,
         });
 
+        // Offline user-share backup (client-only). Cosigner never receives this file.
+        try {
+          const backupFile = buildVaultShareBackupFile({
+            mainAddress: mainAddr,
+            subAddress: sub.address,
+            vaultAddress: vault.address,
+            index: sub.index,
+            encryptedClientSecret: enc,
+            encryptedCosignerBackup: encBackup,
+            scheme: vault.scheme,
+            ownerL1: l1Address,
+          });
+          const fname = downloadVaultShareBackupFile(backupFile);
+          toast.success(
+            `Save offline: ${fname} — user half is mnemonic-encrypted. Cosigner keeps d_dapp separately.`,
+            { duration: 10000 },
+          );
+        } catch (backupErr) {
+          console.warn('[vault-share] auto-download failed', backupErr);
+          toast(
+            'Vault created — download your vault-share backup from Vault details (user half stays browser-only).',
+            { duration: 9000 },
+          );
+        }
+
         toast.loading('Registering 2P material with co-signer (no full key)…', { id: toastId });
         await registerMultiSigVault({
           ...vault.cosignerRegister,
@@ -1713,8 +1823,8 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
       );
       setCheckedVault((prev) => ({ ...prev, [sub.index]: true }));
       toast.success(
-        `2P-ECDSA vault ${vaultAddr.slice(0, 12)}… — full key never stored`,
-        { id: toastId, duration: 6000 },
+        `2P-ECDSA vault ${vaultAddr.slice(0, 12)}… — full key never stored · save vault-share file offline`,
+        { id: toastId, duration: 7000 },
       );
     } catch (err) {
       toast.error(`Multi-sig vault failed: ${err.message || err}`, {
@@ -2300,6 +2410,42 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
             <span className="sw-meta-v">
               {outE8 > 0n ? freeable : totalInVault === '…' ? '…' : freeable} WART
             </span>
+          </div>
+        </div>
+
+        {/* Offline vault-share backup — user half stays client-side (never uploaded) */}
+        <div className="sw-card-actions sw-vault-share-backup">
+          <p className="wh-hint sw-l1-track-hint" style={{ marginBottom: '0.5rem' }}>
+            <strong>Vault share backup</strong> — your half of the key is only in this browser.
+            Download an encrypted file offline (opens with your mnemonic). Cosigner still holds{' '}
+            <code>d_dapp</code> separately; full key is never in one place.
+          </p>
+          <div className="sw-row-actions" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+            <button
+              type="button"
+              className="btn secondary small"
+              onClick={() => downloadVaultShareBackup(sub)}
+              disabled={loading}
+              title="Download mnemonic-encrypted user share (+ optional cosigner re-register blob)"
+            >
+              Download vault share
+            </button>
+            <label
+              className="btn secondary small"
+              style={{ cursor: 'pointer', margin: 0 }}
+              title="Import offline vault-share file into this browser only"
+            >
+              Import vault share…
+              <input
+                type="file"
+                accept="application/json,.json"
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                  importVaultShareBackup(sub, e.target.files);
+                  e.target.value = '';
+                }}
+              />
+            </label>
           </div>
         </div>
 

@@ -13,6 +13,8 @@ import {
   createTwoPartyVault,
   encryptJsonWithMnemonic,
   saveTwoPartyClientLocal,
+  buildVaultShareBackupFile,
+  downloadVaultShareBackupFile,
   MULTISIG_SCHEME,
 } from '../utils/twoPartyEcdsa.js';
 import { registerMultiSigVault } from '../utils/cosignerClient.js';
@@ -253,6 +255,21 @@ export default function PersonalVaultMvp({
         encryptedCosignerBackup: encBackup,
         scheme: MULTISIG_SCHEME,
       });
+      try {
+        const backupFile = buildVaultShareBackupFile({
+          mainAddress: mainWallet?.address,
+          subAddress: sub.address,
+          vaultAddress: vault.address,
+          index: sub.index,
+          encryptedClientSecret: enc,
+          encryptedCosignerBackup: encBackup,
+          scheme: MULTISIG_SCHEME,
+          ownerL1: l1Address,
+        });
+        downloadVaultShareBackupFile(backupFile);
+      } catch (e) {
+        console.warn('[personal-vault] share backup download', e);
+      }
       await registerMultiSigVault({
         ...vault.cosignerRegister,
         owner: l1Address.toLowerCase(),
@@ -281,7 +298,10 @@ export default function PersonalVaultMvp({
       setVaultAddress(vAddr);
       persist({ vaultAddress: vAddr, step: 2, multisig: true });
       setStep(2);
-      toast.success('2P-ECDSA multi-sig vault registered!', { id: toastId });
+      toast.success(
+        '2P-ECDSA multi-sig vault registered — save the vault-share file offline (user half stays browser-only)',
+        { id: toastId, duration: 9000 },
+      );
     } catch (err) {
       toast.error(err.message, { id: toastId });
     } finally {
