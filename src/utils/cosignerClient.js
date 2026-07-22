@@ -101,6 +101,19 @@ export async function cosignerStatus(vaultAddress) {
   });
 }
 
+/**
+ * List vaults registered on the cosigner for this L1 owner (public metadata only).
+ * Used by Unloaded vaults — catches cosigner-only vaults with no rollup notices.
+ */
+export async function cosignerListByOwner(ownerL1) {
+  const owner = String(ownerL1 || '').toLowerCase();
+  if (!owner) throw new Error('owner required');
+  return cosignerFetch({
+    method: 'GET',
+    query: `?owner=${encodeURIComponent(owner)}`,
+  });
+}
+
 /** Removed: open that returned privateKey */
 export async function multiSigOpen() {
   throw new Error(

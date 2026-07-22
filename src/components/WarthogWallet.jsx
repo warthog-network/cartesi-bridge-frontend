@@ -473,6 +473,8 @@ const WarthogWallet = ({
         nextNonce: 0,
         pinHeight: null,
         pinHash: null,
+        ok: false,
+        error: 'invalid address',
       };
     }
     if (!isForSub) {
@@ -546,12 +548,15 @@ const WarthogWallet = ({
         pinHeight: headPinHeight,
         pinHash: headPinHash,
         isDefi: isDefiNode(activeNode),
+        ok: true,
       };
     } catch (err) {
       const errorMessage = err.message || 'Could not fetch chain head or balance';
       setError(errorMessage);
       console.error('Fetch error:', err);
       if (!isForSub) setIsRefreshingBalance(false);
+      // ok:false — callers must NOT treat this as a confirmed zero balance
+      // (was overwriting live vaultBalance with "0" after transient node/proxy errors).
       return {
         balance: '0',
         spendable: '0',
@@ -559,6 +564,8 @@ const WarthogWallet = ({
         nextNonce: 0,
         pinHeight: null,
         pinHash: null,
+        ok: false,
+        error: errorMessage,
       };
     }
   };

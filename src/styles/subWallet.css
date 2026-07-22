@@ -548,6 +548,70 @@
   opacity: 0.95;
 }
 
+/* Unloaded vaults discovery panel */
+.sw-card--unloaded {
+  margin: 0.75rem 0 1rem;
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--accent-teal, #00ffcc) 35%, #333);
+}
+.sw-unloaded-list {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+.sw-unloaded-list--dim {
+  opacity: 0.75;
+  margin-top: 0.35rem;
+}
+.sw-unloaded-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 0.75rem;
+  padding: 0.45rem 0.55rem;
+  border-radius: 8px;
+  background: color-mix(in srgb, #000 35%, transparent);
+  border: 1px solid color-mix(in srgb, #fff 8%, transparent);
+}
+.sw-unloaded-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.75rem;
+  min-width: 0;
+}
+.sw-unloaded-bal {
+  font-weight: 600;
+  color: var(--accent-teal, #00ffcc);
+  font-variant-numeric: tabular-nums;
+}
+.sw-unloaded-meta {
+  font-size: 0.78rem;
+  opacity: 0.75;
+}
+.sw-unloaded-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.sw-unloaded-loaded {
+  margin-top: 0.65rem;
+  font-size: 0.85rem;
+  opacity: 0.9;
+}
+.sw-unloaded-loaded summary {
+  cursor: pointer;
+  color: color-mix(in srgb, #fff 70%, transparent);
+}
+.sw-muted {
+  opacity: 0.7;
+  font-size: 0.8rem;
+}
+
 .sw-card-head {
   display: flex;
   align-items: center;

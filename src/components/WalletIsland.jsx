@@ -10,6 +10,7 @@ import { Toaster, toast } from 'react-hot-toast';
 import { ethers, toUtf8String, getBytes } from 'ethers-v6';
 import WarthogWallet from './WarthogWallet'; // Added import for WarthogWallet component
 import VoucherExecutor from './VoucherExecutor.jsx';
+import AnvilTestKeys from './AnvilTestKeys.jsx';
 import '../styles/global.css'; // Assuming global styles (including new Warthog CSS) in Astro
 import '../styles/warthog.css';
 import {
@@ -18,6 +19,7 @@ import {
   L1_RPC_URL,
   LOCAL_ADDRESSES,
   getAddresses,
+  getNetwork,
   getNetworkId,
   getWwartToken,
 } from '../utils/bridgeConfig.js';
@@ -40,7 +42,12 @@ import {
 } from '../utils/vaultStateCache.js';
 
 // Active network address book (Anvil default; Sepolia when PUBLIC_NETWORK=sepolia)
-const RPC_URL = L1_RPC_URL;
+const ACTIVE_NETWORK = getNetwork();
+/** Prefer public network RPC for MetaMask (users are not on localhost). */
+const RPC_URL =
+  ACTIVE_NETWORK?.rpcUrl ||
+  L1_RPC_URL ||
+  'https://cartesi-bridge.duckdns.org/rpc';
 const _addrs = getAddresses() || LOCAL_ADDRESSES;
 const INPUT_BOX_ADDRESS = _addrs.inputBox || LOCAL_ADDRESSES.inputBox;
 const DAPP_ADDRESS = _addrs.dapp || LOCAL_ADDRESSES.dapp;
@@ -99,6 +106,123 @@ export default function WalletIsland() {
   const [vaultFromCache, setVaultFromCache] = useState(false);
   /** Live MetaMask ERC-20 wWART balance (human units string) */
   const [mmWwartBal, setMmWwartBal] = useState(null);
+  /**
+   * L1 register_address status for this MetaMask owner.
+   * null = unknown / loading, true = registered, false = not yet.
+   */
+  const [l1Registered, setL1Registered] = useState(null);
+
+  const l1RegStorageKey = (addr) =>
+    `cartesiL1Registered:${String(addr || '')
+      .replace(/^0x/i, '')
+      .toLowerCase()}`;
+
+  const readLocalL1Registered = (addr) => {
+    if (typeof localStorage === 'undefined' || !addr) return false;
+    try {
+      return localStorage.getItem(l1RegStorageKey(addr)) === '1';
+    } catch {
+      return false;
+    }
+  };
+
+  const writeLocalL1Registered = (addr, yes) => {
+    if (typeof localStorage === 'undefined' || !addr) return;
+    try {
+      if (yes) localStorage.setItem(l1RegStorageKey(addr), '1');
+      else localStorage.removeItem(l1RegStorageKey(addr));
+    } catch {
+      /* */
+    }
+  };
+
+  /** Scan GraphQL notices for address_registered matching this L1 owner. */
+  const checkRegisteredFromNotices = async (addr) => {
+    const bare = String(addr || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    if (bare.length !== 40) return false;
+    try {
+      const gql = getRollupGraphqlUrl();
+      const res = await fetch(gql, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: `{ notices(last: 200) { edges { node { payload } } } }`,
+        }),
+        cache: 'no-store',
+      });
+      if (!res.ok) return false;
+      const data = await res.json();
+      const edges = data?.data?.notices?.edges || [];
+      for (const e of edges) {
+        const raw = e?.node?.payload;
+        if (!raw) continue;
+        let n = null;
+        try {
+          if (typeof raw === 'object') n = raw;
+          else {
+            const s = String(raw);
+            if (s.trim().startsWith('{')) n = JSON.parse(s);
+            else {
+              const hex = s.startsWith('0x') || s.startsWith('0X') ? s.slice(2) : s;
+              if (/^[0-9a-fA-F]+$/.test(hex) && hex.length % 2 === 0) {
+                n = JSON.parse(toUtf8String('0x' + hex));
+              }
+            }
+          }
+        } catch {
+          continue;
+        }
+        if (n?.type !== 'address_registered') continue;
+        const u = String(n.user || '')
+          .replace(/^0x/i, '')
+          .toLowerCase();
+        if (u === bare || u === `0x${bare}`) return true;
+      }
+    } catch {
+      /* */
+    }
+    return false;
+  };
+
+  /** Resolve registered flag from inspect / notices / local optimistic cache. */
+  const resolveL1Registered = async (addr, inspectJson = null) => {
+    if (!addr) {
+      setL1Registered(null);
+      return false;
+    }
+    if (inspectJson?.registered === true) {
+      setL1Registered(true);
+      writeLocalL1Registered(addr, true);
+      return true;
+    }
+    if (inspectJson?.registered === false) {
+      // Live dApp says no — clear stale optimistic cache unless notices say yes
+      const fromNotices = await checkRegisteredFromNotices(addr);
+      if (fromNotices) {
+        setL1Registered(true);
+        writeLocalL1Registered(addr, true);
+        return true;
+      }
+      setL1Registered(false);
+      writeLocalL1Registered(addr, false);
+      return false;
+    }
+    // Older dApp without registered field: notices + local
+    const fromNotices = await checkRegisteredFromNotices(addr);
+    if (fromNotices) {
+      setL1Registered(true);
+      writeLocalL1Registered(addr, true);
+      return true;
+    }
+    if (readLocalL1Registered(addr)) {
+      setL1Registered(true);
+      return true;
+    }
+    setL1Registered(false);
+    return false;
+  };
 
   /** Instant paint from localStorage (may be stale). */
   const hydrateVaultFromCache = (addr) => {
@@ -169,6 +293,44 @@ export default function WalletIsland() {
       }
     };
     tryAutoConnect();
+
+    const eth = window.ethereum;
+    if (!eth?.on) return undefined;
+
+    const onAccountsChanged = async (accounts) => {
+      if (!accounts || accounts.length === 0) {
+        clearLocalSession({ wipeCache: false });
+        toast('MetaMask disconnected');
+        return;
+      }
+      try {
+        const prov = new ethers.BrowserProvider(eth);
+        const sign = await prov.getSigner();
+        const addr = await sign.getAddress();
+        setProvider(prov);
+        setSigner(sign);
+        setAddress(addr);
+        setConnected(true);
+        hydrateVaultPreferApi(addr);
+        refreshVault(addr);
+        refreshMmWwart(addr);
+        toast.success(`Account: ${addr.slice(0, 6)}…${addr.slice(-4)}`);
+      } catch (e) {
+        console.warn('[accountsChanged]', e);
+      }
+    };
+
+    const onChainChanged = () => {
+      // MetaMask recommends full reload; soft re-bind is enough for Anvil demo
+      tryAutoConnect();
+    };
+
+    eth.on('accountsChanged', onAccountsChanged);
+    eth.on('chainChanged', onChainChanged);
+    return () => {
+      eth.removeListener?.('accountsChanged', onAccountsChanged);
+      eth.removeListener?.('chainChanged', onChainChanged);
+    };
   }, []);
 
   const refreshMmWwart = async (addr) => {
@@ -292,6 +454,163 @@ export default function WalletIsland() {
     };
   }, []);
 
+  /**
+   * EIP-3085: add/switch the active Cartesi L1 network in MetaMask
+   * (same idea as wallet_watchAsset for the token).
+   * @param {{ silent?: boolean }} opts — silent: no toast on soft failures (connect path)
+   */
+  const ensureCartesiNetwork = async (opts = {}) => {
+    const silent = !!opts.silent;
+    if (!window.ethereum) {
+      if (!silent) toast.error('Please install MetaMask!');
+      throw new Error('MetaMask not found');
+    }
+    const net = getNetwork() || ACTIVE_NETWORK;
+    const chainIdHex =
+      net.chainIdHex ||
+      (net.chainId != null ? `0x${Number(net.chainId).toString(16)}` : '0x7a69');
+    const chainName = net.label || 'Cartesi Local';
+    const rpcUrls = [net.rpcUrl || RPC_URL].filter(Boolean);
+    const nativeCurrency = net.nativeCurrency || {
+      name: 'ETH',
+      symbol: 'ETH',
+      decimals: 18,
+    };
+    const params = {
+      chainId: chainIdHex,
+      chainName,
+      rpcUrls,
+      nativeCurrency,
+    };
+    try {
+      // Prefer switch if already added
+      await window.ethereum.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: chainIdHex }],
+      });
+      if (!silent) toast.success(`Switched to ${chainName}`);
+      return true;
+    } catch (switchErr) {
+      // 4902 = chain not in wallet → add it
+      const code = switchErr?.code ?? switchErr?.data?.originalError?.code;
+      if (code === 4902 || /unrecognized chain|unknown chain/i.test(String(switchErr?.message || ''))) {
+        try {
+          await window.ethereum.request({
+            method: 'wallet_addEthereumChain',
+            params: [params],
+          });
+          if (!silent) toast.success(`${chainName} added to MetaMask`);
+          return true;
+        } catch (addErr) {
+          if (!silent) {
+            toast.error(
+              `Could not add network: ${addErr?.message || addErr}. RPC: ${rpcUrls[0] || '—'}`,
+              { duration: 7000 },
+            );
+          }
+          throw addErr;
+        }
+      }
+      // User rejected switch, or already on a different chain and cancelled
+      if (code === 4001) {
+        if (!silent) toast('Network switch cancelled');
+        return false;
+      }
+      // Fallback: try add anyway (some wallets only implement add)
+      try {
+        await window.ethereum.request({
+          method: 'wallet_addEthereumChain',
+          params: [params],
+        });
+        if (!silent) toast.success(`${chainName} added to MetaMask`);
+        return true;
+      } catch (addErr) {
+        if (!silent) {
+          toast.error(`Network prompt failed: ${addErr?.message || addErr}`, {
+            duration: 6000,
+          });
+        }
+        throw addErr;
+      }
+    }
+  };
+
+  /** Reset React connection state (always local; MetaMask has no full logout API). */
+  const clearLocalSession = (opts = {}) => {
+    const wipeCache = !!opts.wipeCache;
+    const prev = address;
+    if (wipeCache && prev) {
+      try {
+        clearVaultCache(prev);
+      } catch {
+        /* ignore */
+      }
+    }
+    setProvider(null);
+    setSigner(null);
+    setAddress('');
+    setConnected(false);
+    setVaultFromCache(false);
+    setMmWwartBal(null);
+    setL1Registered(null);
+    setVault({
+      liquid: '0',
+      wWART: '0',
+      CTSI: '0',
+      eth: '0',
+      usdc: '0',
+    });
+    setSpoofedWwart({ history: [], burnHistory: [], total: '0', totalBurned: '0' });
+    setL1Tab('home');
+    setWithdrawWwartAmt('');
+    setWwartDepositAmt('');
+  };
+
+  /**
+   * Disconnect: leave the site session. Tries MetaMask wallet_revokePermissions
+   * so eth_accounts is empty (stops auto-reconnect on refresh).
+   */
+  const disconnectWallet = async () => {
+    try {
+      if (window.ethereum?.request) {
+        try {
+          await window.ethereum.request({
+            method: 'wallet_revokePermissions',
+            params: [{ eth_accounts: {} }],
+          });
+        } catch (e) {
+          // Older MetaMask / other wallets — local disconnect still works
+          console.warn('[disconnect] revokePermissions unavailable', e?.message || e);
+        }
+      }
+    } finally {
+      clearLocalSession({ wipeCache: false });
+      toast.success('Disconnected MetaMask from this site');
+    }
+  };
+
+  /**
+   * Log out: disconnect + clear this address’s vault cache so a new tester
+   * does not inherit ghost claims / balances from localStorage.
+   */
+  const logoutWallet = async () => {
+    try {
+      if (window.ethereum?.request) {
+        try {
+          await window.ethereum.request({
+            method: 'wallet_revokePermissions',
+            params: [{ eth_accounts: {} }],
+          });
+        } catch (e) {
+          console.warn('[logout] revokePermissions unavailable', e?.message || e);
+        }
+      }
+    } finally {
+      clearLocalSession({ wipeCache: true });
+      toast.success('Logged out — site session and vault cache cleared');
+    }
+  };
+
   // FUNCTIONS FROM ORIGINAL WalletIsland
   const connect = async () => {
     if (!window.ethereum) {
@@ -301,16 +620,10 @@ export default function WalletIsland() {
 
     try {
       try {
-        await window.ethereum.request({
-          method: 'wallet_addEthereumChain',
-          params: [{
-            chainId: '0x7a69',
-            chainName: 'Cartesi Local',
-            rpcUrls: [RPC_URL],
-            nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
-          }]
-        });
-      } catch (e) {}
+        await ensureCartesiNetwork({ silent: true });
+      } catch {
+        /* still allow connect if user is already on a usable chain */
+      }
 
       await window.ethereum.request({ method: 'eth_requestAccounts' });
       const prov = new ethers.BrowserProvider(window.ethereum);
@@ -321,6 +634,7 @@ export default function WalletIsland() {
       setSigner(sign);
       setAddress(addr);
       setConnected(true);
+      setL1Registered(null);
       hydrateVaultFromCache(addr);
       toast.success(`Connected: ${addr.slice(0,6)}...${addr.slice(-4)}`);
       refreshVault(addr);
@@ -408,8 +722,13 @@ export default function WalletIsland() {
           setVaultFromCache(true);
           console.warn('[refreshVault] inspect empty — keeping local cache');
         }
+        // Still resolve L1 registration (notices / local) even if vault balances empty
+        await resolveL1Registered(addr, json);
         return;
       }
+
+      // Track L1 register_address status for the Register button label
+      await resolveL1Registered(addr, json);
 
       const totalMinted = String(
         json?.totalSpoofedMinted || fromIndex?.totalSpoofedMinted || '0',
@@ -587,7 +906,7 @@ export default function WalletIsland() {
     }
   };
 
-  const send = async (payload) => {
+  const send = async (payload, { successMessage = null } = {}) => {
     if (!signer) {
       toast.error("Wallet not connected!");
       throw new Error("Wallet not connected!");
@@ -601,7 +920,11 @@ export default function WalletIsland() {
       const receipt = await tx.wait();
       // ethers-v6: receipt.hash (v5 used transactionHash)
       const txHash = receipt?.hash || receipt?.transactionHash || tx?.hash || '';
-      toast.success(txHash ? `Sent! Tx: ${String(txHash).slice(0, 10)}…` : 'Sent to rollup InputBox');
+      if (successMessage) {
+        toast.success(successMessage);
+      } else {
+        toast.success(txHash ? `Sent! Tx: ${String(txHash).slice(0, 10)}…` : 'Sent to rollup InputBox');
+      }
       setTimeout(() => refreshVault(address), 8000);
       return receipt;
     } catch (err) {
@@ -612,6 +935,62 @@ export default function WalletIsland() {
       setLoading(false);
     }
   };
+
+  /**
+   * Register this MetaMask address with the Cartesi dApp (vault owner).
+   * If already registered, show that and skip a redundant InputBox tx when we know.
+   */
+  const registerL1Address = async () => {
+    if (!address || !signer) {
+      toast.error('Connect MetaMask first');
+      return;
+    }
+    if (rollupOnline === false) {
+      toast.error('Rollup offline — cannot register right now');
+      return;
+    }
+
+    // Fresh check (inspect / notices / local)
+    let already = l1Registered === true;
+    if (!already) {
+      try {
+        already = await resolveL1Registered(address);
+      } catch {
+        already = readLocalL1Registered(address);
+      }
+    }
+
+    if (already) {
+      setL1Registered(true);
+      toast.success('Already registered', {
+        duration: 4000,
+        icon: '✓',
+      });
+      return;
+    }
+
+    try {
+      await send(
+        { type: 'register_address' },
+        { successMessage: 'L1 address registered with the rollup' },
+      );
+      setL1Registered(true);
+      writeLocalL1Registered(address, true);
+      // Re-check after rollup processes the input
+      setTimeout(() => {
+        resolveL1Registered(address).catch(() => {});
+      }, 10000);
+    } catch {
+      /* send() already toasted */
+    }
+  };
+
+  const registerL1ButtonLabel =
+    l1Registered === true
+      ? 'Already registered'
+      : l1Registered === null
+        ? 'Register L1 address…'
+        : 'Register L1 address';
 
   const depositEth = async () => {
     if (!ethDepositAmt || !signer) return;
@@ -861,11 +1240,34 @@ export default function WalletIsland() {
       <div className="wi-shell preview-section">
         <Toaster position="top-right" />
         <div className="wi-connect-card">
-          <p className="wi-connect-lead">Cartesi L1 vault — connect MetaMask (local Anvil)</p>
+          <p className="wi-connect-lead">
+            L1 MetaMask — required for vault multi-sig, lock/burn, and vouchers
+          </p>
+          <p className="wi-muted" style={{ marginTop: 0, marginBottom: '0.75rem' }}>
+            This is your Cartesi rollup owner address. Connect MetaMask first, then use{' '}
+            <strong>Register L1 address</strong> once so the dApp knows this wallet.
+          </p>
           <button type="button" onClick={connect} className="btn primary">
             <Wallet className="inline" size={18} style={{ marginRight: 8, verticalAlign: -3 }} />
-            Connect wallet
+            Connect MetaMask (L1)
           </button>
+          <button
+            type="button"
+            className="wi-token-copy"
+            onClick={async () => {
+              try {
+                await ensureCartesiNetwork();
+              } catch {
+                /* toasts handled inside */
+              }
+            }}
+          >
+            Add network · {ACTIVE_NETWORK?.label || 'Cartesi Local'} (chain{' '}
+            {ACTIVE_NETWORK?.chainId ?? 31337})
+          </button>
+          {(getNetworkId() === 'anvil' || ACTIVE_NETWORK?.isDemo) && (
+            <AnvilTestKeys rpcUrl={RPC_URL} compact />
+          )}
           <div className="wi-stat-grid wi-stat-grid--preview">
             <div className="wi-stat wi-stat--liquid">
               <span className="wi-stat-k">{SHARE_TOKEN.symbol}</span>
@@ -884,7 +1286,7 @@ export default function WalletIsland() {
               <span className="wi-stat-v">0.12</span>
             </div>
           </div>
-          <p className="wi-muted">Preview only — connect to load your vault</p>
+          <p className="wi-muted">Preview only — connect MetaMask to load your L1 vault</p>
         </div>
       </div>
     );
@@ -987,6 +1389,19 @@ export default function WalletIsland() {
           <div className="wi-header-tools">
             <button
               type="button"
+              className={`btn small ${l1Registered === true ? 'secondary' : 'primary'}`}
+              title={
+                l1Registered === true
+                  ? 'This MetaMask address is already registered as rollup vault owner'
+                  : 'Register this MetaMask address with the Cartesi dApp (owner / vault mapping)'
+              }
+              onClick={() => registerL1Address()}
+              disabled={loading || rollupOnline === false}
+            >
+              {registerL1ButtonLabel}
+            </button>
+            <button
+              type="button"
               className="btn primary small"
               onClick={() => {
                 refreshVault(address);
@@ -1003,6 +1418,22 @@ export default function WalletIsland() {
               onClick={() => setShowWarthog(!showWarthog)}
             >
               {showWarthog ? 'Hide wallet' : 'Show wallet'}
+            </button>
+            <button
+              type="button"
+              className="btn small secondary"
+              title="Disconnect this site from MetaMask (keeps vault cache)"
+              onClick={() => disconnectWallet()}
+            >
+              Disconnect
+            </button>
+            <button
+              type="button"
+              className="btn small wi-btn-logout"
+              title="Disconnect and clear vault cache for this address"
+              onClick={() => logoutWallet()}
+            >
+              Log out
             </button>
           </div>
         </header>
@@ -1067,6 +1498,10 @@ export default function WalletIsland() {
             </p>
             <ol className="wi-steps">
               <li>
+                <strong>Register L1</strong> — use the button in the L1 · MetaMask header (once per
+                wallet)
+              </li>
+              <li>
                 <strong>Bridge</strong> — fund sub, sweep → lock capacity
               </li>
               <li>
@@ -1086,6 +1521,36 @@ export default function WalletIsland() {
                 Optional: <strong>Release</strong> locked WART → Vault → main
               </li>
             </ol>
+            <div className="wi-header-tools" style={{ margin: '0.75rem 0' }}>
+              <button
+                type="button"
+                className={`btn small ${l1Registered === true ? 'secondary' : 'primary'}`}
+                onClick={() => registerL1Address()}
+                disabled={loading || rollupOnline === false}
+              >
+                {registerL1ButtonLabel}
+              </button>
+              <span className="wi-muted" style={{ fontSize: '0.8rem', alignSelf: 'center' }}>
+                {l1Registered === true
+                  ? 'This MetaMask wallet is the rollup vault owner'
+                  : 'Sends your MetaMask address to the rollup as vault owner'}
+              </span>
+            </div>
+            <button
+              type="button"
+              className="wi-token-copy"
+              onClick={async () => {
+                try {
+                  await ensureCartesiNetwork();
+                } catch {
+                  /* toasts handled inside */
+                }
+              }}
+            >
+              Add network · {ACTIVE_NETWORK?.label || 'Cartesi Local'} · RPC{' '}
+              {(ACTIVE_NETWORK?.rpcUrl || RPC_URL || '').replace(/^https?:\/\//, '').slice(0, 28)}
+              …
+            </button>
             {WWART_ADDRESS ? (
               <button
                 type="button"
@@ -1220,6 +1685,13 @@ export default function WalletIsland() {
               Optional portals &amp; diagnostics. wWART deposit returns L1 tokens to the rollup
               balance — it does <strong>not</strong> free Used capacity (burn does).
             </p>
+            {(getNetworkId() === 'anvil' || ACTIVE_NETWORK?.isDemo) && (
+              <AnvilTestKeys
+                rpcUrl={RPC_URL}
+                compact
+                highlightAddress={address}
+              />
+            )}
             {WWART_ADDRESS ? (
               <div className="wi-portal-card wi-portal-card--focus" style={{ marginBottom: '0.75rem' }}>
                 <div className="wi-portal-title">Deposit wWART (MetaMask → rollup)</div>
@@ -1342,11 +1814,11 @@ export default function WalletIsland() {
             <div className="wi-header-tools" style={{ marginTop: '0.75rem' }}>
               <button
                 type="button"
-                className="btn secondary small"
-                onClick={() => send({ type: 'register_address' })}
+                className={`btn small ${l1Registered === true ? 'secondary' : 'primary'}`}
+                onClick={() => registerL1Address()}
                 disabled={loading || rollupOnline === false}
               >
-                Register L1 address
+                {registerL1ButtonLabel}
               </button>
             </div>
           </div>

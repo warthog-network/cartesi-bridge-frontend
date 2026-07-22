@@ -24,7 +24,11 @@ import {
   VAULT_SHARE_DOWNLOAD_NAME,
   MULTISIG_SCHEME,
 } from '../utils/twoPartyEcdsa.js';
-import { registerMultiSigVault, cosignerStatus } from '../utils/cosignerClient.js';
+import {
+  registerMultiSigVault,
+  cosignerStatus,
+  cosignerListByOwner,
+} from '../utils/cosignerClient.js';
 import { multiSigTransferWart } from '../utils/multiSigTransfer.js';
 import { getSmartNonce, bumpNonceAfterSuccess } from '../utils/cancelLimitOrder.js';
 import { computeWliqMintAvailable } from '../utils/wliqCapacity.js';
@@ -83,6 +87,14 @@ function SubWallet({
   // Vault → main withdraw (after unlock)
   const [vaultWithdrawAmounts, setVaultWithdrawAmounts] = useState({});
   const [isVaultWithdrawing, setIsVaultWithdrawing] = useState({});
+  /**
+   * Vaults with rollup/share history for this owner that are not on a loaded card.
+   * @type {Array<{ vaultAddress: string, subAddress: string|null, subIndex: number|null, balance: string, spendable: string, lastType: string|null, lastAt: number|null, loaded: boolean }>}
+   */
+  const [unloadedVaults, setUnloadedVaults] = useState([]);
+  const [unloadedBusy, setUnloadedBusy] = useState(false);
+  /** Vault addresses user hid / dismissed (persist — do not auto-reattach). */
+  const [dismissedVaults, setDismissedVaults] = useState([]);
   // Controlled <details> open flags per sub (survive re-renders; default closed)
   // { [subIndex]: { vaultMain?: boolean, burn?: boolean, details?: boolean } }
   const [openVaultPanels, setOpenVaultPanels] = useState({});
@@ -169,33 +181,194 @@ function SubWallet({
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Re-sync locked collateral (mintedE8) from rollup notices when subs load.
-  // Fixes stale localStorage after partial releases (e.g. UI stuck at 8 after release → 2).
+  // Load / persist dismissed vault addresses per main Warthog wallet
+  const dismissedStorageKey = (main) =>
+    `cartesiDismissedVaults:${String(main || '')
+      .replace(/^0x/i, '')
+      .toLowerCase()}`;
+
+  useEffect(() => {
+    const main = mainWallet?.address || address;
+    if (!main || typeof localStorage === 'undefined') {
+      setDismissedVaults([]);
+      return;
+    }
+    try {
+      const raw = localStorage.getItem(dismissedStorageKey(main));
+      const arr = raw ? JSON.parse(raw) : [];
+      setDismissedVaults(Array.isArray(arr) ? arr.map((a) => String(a).toLowerCase()) : []);
+    } catch {
+      setDismissedVaults([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mainWallet?.address, address]);
+
+  useEffect(() => {
+    const main = mainWallet?.address || address;
+    if (!main || typeof localStorage === 'undefined') return;
+    try {
+      localStorage.setItem(
+        dismissedStorageKey(main),
+        JSON.stringify(dismissedVaults),
+      );
+    } catch {
+      /* */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dismissedVaults, mainWallet?.address, address]);
+
+  const dismissVaultAddress = (vaultAddr) => {
+    const v = String(vaultAddr || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    if (v.length < 40) return;
+    setDismissedVaults((prev) => (prev.includes(v) ? prev : [...prev, v]));
+  };
+
+  const undismissVaultAddress = (vaultAddr) => {
+    const v = String(vaultAddr || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    setDismissedVaults((prev) => prev.filter((x) => x !== v));
+  };
+
+  const isVaultDismissed = (vaultAddr) => {
+    const v = String(vaultAddr || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    return dismissedVaults.includes(v);
+  };
+
+  /**
+   * Re-fetch balances only for vaults already attached to a sub card.
+   * Do NOT auto-reattach after "Dismiss vault" (that was popping vaults back).
+   */
+  useEffect(() => {
+    let cancelled = false;
+    const targets = (subWallets || []).filter((s) => {
+      if (s.vaultDetached) return false;
+      const v = (s.vaultAddress || s.pendingVaultAddress || '').toString();
+      return v.replace(/^0x/i, '').length >= 40;
+    });
+    if (!targets.length || !fetchBalanceAndNonce) return undefined;
+
+    (async () => {
+      for (const s of targets) {
+        if (cancelled) break;
+        const vaultAddr = String(s.vaultAddress || s.pendingVaultAddress)
+          .replace(/^0x/i, '')
+          .toLowerCase();
+        try {
+          const vb = await fetchBalanceAndNonce(vaultAddr, true);
+          if (cancelled || vb?.ok === false) continue;
+          setSubWallets((prev) =>
+            prev.map((x) =>
+              x.index === s.index && !x.vaultDetached
+                ? {
+                    ...x,
+                    // Keep the same attached address — never switch to another vault
+                    vaultAddress: vaultAddr,
+                    pendingVaultAddress: vaultAddr,
+                    vaultBalance: String(vb.balance ?? x.vaultBalance ?? '0'),
+                    vaultSpendable: String(
+                      vb.spendable ?? vb.balance ?? x.vaultSpendable ?? '0',
+                    ),
+                    vaultBalanceAt: Date.now(),
+                  }
+                : x,
+            ),
+          );
+        } catch (e) {
+          console.warn('[vault balance heal]', e?.message || e);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    address,
+    selectedNode,
+    // fire when sub/vault identity changes (not every balance tick)
+    (subWallets || [])
+      .map(
+        (s) =>
+          `${s.index}:${s.vaultAddress || s.pendingVaultAddress || ''}:${s.vaultDetached ? 1 : 0}`,
+      )
+      .join('|'),
+  ]);
+
+  // Discover vaults with history that are not on a loaded card (Vault tab / L1 ready)
+  useEffect(() => {
+    if (!l1Address && !(subWallets || []).length) return undefined;
+    let cancelled = false;
+    const t = setTimeout(() => {
+      if (!cancelled) {
+        discoverUnloadedVaults().catch(() => {});
+      }
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    l1Address,
+    address,
+    focusMode,
+    (subWallets || [])
+      .map((s) => `${s.index}:${s.vaultAddress || s.pendingVaultAddress || ''}`)
+      .join('|'),
+  ]);
+
+  // Re-sync locked collateral (mintedE8) from rollup notices + L1 inspect.
+  // Fixes sticky unlock after unlock→re-lock (historical subwallet_unlocked must not pin UI to 0).
   useEffect(() => {
     let cancelled = false;
     const subs = (subWallets || []).filter(
       (s) => s?.address && (s.locked || (s.mintedE8 && s.mintedE8 !== '0') || s.vaultAddress),
     );
-    if (!subs.length) return undefined;
+    if (!subs.length && !(l1Vault?.outstandingE8 != null && l1Address)) return undefined;
 
     (async () => {
       const updates = [];
+      // Prefer live inspect outstanding for this L1 owner when present
+      let inspectOut = null;
+      try {
+        if (l1Vault?.outstandingE8 != null) {
+          inspectOut = BigInt(String(l1Vault.outstandingE8));
+        }
+      } catch {
+        inspectOut = null;
+      }
       for (const s of subs) {
         try {
           const rebuilt = await rebuildOutstandingE8FromNotices(s.address);
-          if (!rebuilt || cancelled) continue;
+          if (cancelled) continue;
+          let next =
+            rebuilt?.outstandingE8 != null ? BigInt(String(rebuilt.outstandingE8)) : null;
+          // If notices lag or sticky-zero after re-lock, inspect is authoritative
+          if (inspectOut != null && (next == null || next < inspectOut)) {
+            next = inspectOut;
+          }
+          if (next == null) continue;
+          const nextStr = next.toString();
           const prev = String(s.mintedE8 || '0');
-          if (prev !== rebuilt.outstandingE8) {
+          const nextLocked = next > 0n;
+          if (prev !== nextStr || !!s.locked !== nextLocked) {
             updates.push({
               index: s.index,
-              mintedE8: rebuilt.outstandingE8,
-              locked: !rebuilt.fullyUnlocked && BigInt(rebuilt.outstandingE8) > 0n,
+              mintedE8: nextStr,
+              locked: nextLocked,
             });
           }
         } catch {
           /* rollup may be down */
         }
       }
+      // No sub list yet but inspect shows pin — still nothing to patch
       if (cancelled || !updates.length) return;
       setSubWallets((prev) =>
         prev.map((s) => {
@@ -208,10 +381,11 @@ function SubWallet({
     return () => {
       cancelled = true;
     };
-    // Only when wallet/sub list identity changes — not every mintedE8 write
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     address,
+    l1Address,
+    l1Vault?.outstandingE8,
     // stable-ish fingerprint of which subs exist
     (subWallets || []).map((s) => `${s.index}:${s.address}`).join('|'),
   ]);
@@ -834,8 +1008,76 @@ function SubWallet({
     }
   };
 
+  /** Normalize Warthog address to 40-hex account id for notice matching. */
+  const wartAccountId = (addr) =>
+    String(addr || '')
+      .replace(/^0x/i, '')
+      .toLowerCase()
+      .slice(0, 40);
+
+  /** Live L1 inspect outstandingE8 (authoritative pin after re-lock). */
+  const fetchInspectOutstandingE8 = async (ownerL1 = l1Address) => {
+    const bare = String(ownerL1 || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    if (bare.length !== 40) return null;
+    try {
+      const base = getInspectUrl().replace(/\/$/, '');
+      const res = await fetch(`${base}/vault/${bare}`, { cache: 'no-store' });
+      if (!res.ok) return null;
+      const data = await res.json();
+      const payload = data?.reports?.[0]?.payload;
+      if (!payload) return null;
+      let json;
+      try {
+        if (typeof payload === 'string' && payload.trim().startsWith('{')) {
+          json = JSON.parse(payload);
+        } else {
+          json = JSON.parse(toUtf8String(payload));
+        }
+      } catch {
+        const hex = String(payload).replace(/^0x/i, '');
+        json = JSON.parse(
+          new TextDecoder().decode(
+            new Uint8Array(hex.match(/.{1,2}/g).map((b) => parseInt(b, 16))),
+          ),
+        );
+      }
+      if (json?.error) return null;
+      if (json?.outstandingE8 == null) return null;
+      return BigInt(String(json.outstandingE8));
+    } catch {
+      return null;
+    }
+  };
+
   /** Post sweep_lock + poll (shared by full sweep and retry-mint). */
   const postSweepLock = async (sub, vaultAddress, sweepProof, toastId) => {
+    let prevOutstanding = 0n;
+    try {
+      prevOutstanding = BigInt(String(sub.mintedE8 || '0'));
+    } catch {
+      prevOutstanding = 0n;
+    }
+    // Snapshot notice stream so we only accept a *new* sweep_locked (not historical)
+    let seenFingerprints = new Set();
+    try {
+      const snap = await rebuildOutstandingE8FromNotices(sub.address, {
+        last: 200,
+        collectFingerprints: true,
+      });
+      if (snap?.outstandingE8 != null) {
+        try {
+          prevOutstanding = BigInt(String(snap.outstandingE8));
+        } catch {
+          /* */
+        }
+      }
+      if (snap?.lockFingerprints) seenFingerprints = new Set(snap.lockFingerprints);
+    } catch {
+      /* */
+    }
+
     // Include vaultAddress + owner so rollup can recover if pendingLocks was lost
     // (cartesi restart) or user only ran create_vault without sub_lock.
     await send({
@@ -848,59 +1090,122 @@ function SubWallet({
       recipient: l1Address,
     });
 
-    const completed = await pollForLockNotice(sub.address, 90000);
-    if (completed) {
-      // Rebuild outstanding from ALL notices for this sub — never add latest notice
-      // onto existing mintedE8 (retry / double-poll used to double locked amount, e.g. 16→32).
-      let outstandingFromNotices = null;
-      try {
-        const rebuilt = await rebuildOutstandingE8FromNotices(sub.address);
-        if (rebuilt) outstandingFromNotices = rebuilt.outstandingE8;
-      } catch {
-        /* ignore */
-      }
+    const pollStart = Date.now();
+    const completed = await pollForLockNotice(sub.address, {
+      timeoutMs: 90000,
+      sinceMs: pollStart - 5000,
+      prevOutstandingE8: prevOutstanding,
+      seenFingerprints,
+    });
 
+    // Resolve outstanding with retries — notices lag after unlock→re-lock
+    let nextMinted = prevOutstanding;
+    let resolved = false;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      try {
+        const rebuilt = await rebuildOutstandingE8FromNotices(sub.address, { last: 200 });
+        if (rebuilt?.outstandingE8 != null) {
+          const o = BigInt(String(rebuilt.outstandingE8));
+          // Accept if pin increased (re-lock) or any positive after success notice
+          if (o > prevOutstanding || (completed && o > 0n)) {
+            nextMinted = o;
+            resolved = true;
+            break;
+          }
+        }
+      } catch {
+        /* */
+      }
+      try {
+        const insp = await fetchInspectOutstandingE8(l1Address);
+        if (insp != null && (insp > prevOutstanding || (completed && insp > 0n))) {
+          nextMinted = insp;
+          resolved = true;
+          break;
+        }
+      } catch {
+        /* */
+      }
+      if (attempt < 7) await new Promise((r) => setTimeout(r, 2000));
+    }
+
+    // Last resort: if notice completed but rebuild stuck at 0, re-query inspect once more
+    if (!resolved || nextMinted === 0n) {
+      try {
+        const insp = await fetchInspectOutstandingE8(l1Address);
+        if (insp != null && insp > 0n) {
+          nextMinted = insp;
+          resolved = true;
+        }
+      } catch {
+        /* */
+      }
+    }
+
+    if (completed || resolved || nextMinted > prevOutstanding) {
+      const nextStr = nextMinted.toString();
       setSubWallets((prev) =>
         prev.map((s) => {
           if (s.index !== sub.index) return s;
-          // Prefer notice rebuild; fall back to previous outstanding (do not add)
-          const nextMinted =
-            outstandingFromNotices != null
-              ? outstandingFromNotices
-              : s.mintedE8 || '0';
           return {
             ...s,
-            locked: BigInt(nextMinted || '0') > 0n,
+            locked: nextMinted > 0n,
             locking: false,
             vaultAddress: vaultAddress,
             pendingVaultAddress: vaultAddress,
-            mintedE8: nextMinted,
+            mintedE8: nextStr,
           };
         }),
       );
       await refreshSubBalance(sub.address);
       try {
         const vaultBalanceData = await fetchBalanceAndNonce(vaultAddress, true);
-        setSubWallets((prev) =>
-          prev.map((s) =>
-            s.index === sub.index
-              ? { ...s, vaultBalance: vaultBalanceData.balance || '0' }
-              : s,
-          ),
-        );
-        toast.success(`Vault balance: ${vaultBalanceData.balance || '0'} WART`, {
-          duration: 4000,
-        });
+        if (vaultBalanceData?.ok !== false) {
+          setSubWallets((prev) =>
+            prev.map((s) =>
+              s.index === sub.index
+                ? {
+                    ...s,
+                    vaultBalance: String(
+                      vaultBalanceData.balance ?? vaultBalanceData.spendable ?? '0',
+                    ),
+                    vaultSpendable: String(
+                      vaultBalanceData.spendable ??
+                        vaultBalanceData.balance ??
+                        '0',
+                    ),
+                    vaultBalanceAt: Date.now(),
+                  }
+                : s,
+            ),
+          );
+          toast.success(
+            `Vault balance: ${vaultBalanceData.balance || vaultBalanceData.spendable || '0'} WART`,
+            { duration: 4000 },
+          );
+        }
       } catch {
         /* ignore */
       }
-      toast.success(
-        'Step 4 done: locked. WART is locked as collateral — release any amount to unlock partially.',
-        { id: toastId, duration: 7000 },
-      );
+      if (nextMinted > 0n) {
+        toast.success(
+          `Step 4 done: locked ${e8ToWartDisplay(nextMinted)} WART as collateral — release to free withdrawable.`,
+          { id: toastId, duration: 7000 },
+        );
+      } else {
+        toast.error(
+          'sweep_lock accepted but outstanding still 0 — Refresh L1 vault / wait for notice index, then retry mint.',
+          { id: toastId, duration: 9000 },
+        );
+      }
+      try {
+        onRefreshL1Vault?.();
+      } catch {
+        /* */
+      }
     } else {
       toast.error(
-        'sweep_lock submitted but notice not seen — check cartesi logs / GraphQL',
+        'sweep_lock submitted but lock notice not seen — check cartesi logs / GraphQL',
         { id: toastId, duration: 7000 },
       );
       setSubWallets((prev) =>
@@ -1288,28 +1593,67 @@ function SubWallet({
       }));
     }
   };
-const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const { notices } = await client.request(gql`
-        { notices(last: 5) { edges { node { payload } } } }
-      `);
-      const parsed = notices.edges
-        .map(e => {
-          try { return JSON.parse(toUtf8String(e.node.payload)); }
-          catch { return null; }
-        })
-        .filter(Boolean);
-      // Updated: Removed 'subwallet_locked' since backend now sends 'sweep_locked' for consistency
-      if (parsed.some(n => n.type === 'sweep_locked' && n.subAddress === subAddress && n.verified)) {
-        return true;
+  /**
+   * Wait for a *new* sweep_locked notice for this sub.
+   * CRITICAL: never treat historical sweep_locked as success after unlock→re-lock
+   * (that raced rebuild while outstanding still 0 → sticky unlock UI).
+   */
+  const pollForLockNotice = async (subAddress, opts = {}) => {
+    const timeoutMs = opts.timeoutMs ?? 45000;
+    const sinceMs = opts.sinceMs ?? Date.now() - 15_000;
+    const prevOutstandingE8 = opts.prevOutstandingE8 ?? 0n;
+    const seenFingerprints = opts.seenFingerprints || new Set();
+    const subId = wartAccountId(subAddress);
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const { notices } = await client.request(gql`
+          { notices(last: 40) { edges { node { payload } } } }
+        `);
+        const parsed = (notices?.edges || [])
+          .map((e) => parseNoticePayload(e.node.payload))
+          .filter(Boolean);
+
+        // Prefer newest-first scan of recent window
+        for (let i = parsed.length - 1; i >= 0; i--) {
+          const n = parsed[i];
+          if (n.type !== 'sweep_locked') continue;
+          const nSub = wartAccountId(n.subAddress);
+          if (nSub && nSub !== subId) continue;
+          // verified may be missing on older machines — do not require it alone
+          const ts = n.timestamp != null ? Number(n.timestamp) : 0;
+          const mint = n.mintedE8 != null ? String(n.mintedE8) : '';
+          const fp = `${nSub}:${mint}:${ts}:${n.vaultAddress || ''}`;
+          const isNewFp = mint && !seenFingerprints.has(fp);
+          const isRecent = ts >= sinceMs || ts === 0; // 0 = no timestamp, allow if fingerprint new
+          if (isNewFp && isRecent) {
+            return true;
+          }
+        }
+
+        // Also accept if outstanding already advanced (inspect/notice rebuild)
+        try {
+          const rebuilt = await rebuildOutstandingE8FromNotices(subAddress, { last: 200 });
+          if (rebuilt && BigInt(String(rebuilt.outstandingE8)) > prevOutstandingE8) {
+            return true;
+          }
+        } catch {
+          /* */
+        }
+        try {
+          const insp = await fetchInspectOutstandingE8(l1Address);
+          if (insp != null && insp > prevOutstandingE8) return true;
+        } catch {
+          /* */
+        }
+      } catch {
+        /* */
       }
-    } catch {}
-    await new Promise(r => setTimeout(r, 2000));
-  }
-  return false;
-};
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    return false;
+  };
 
   /**
    * Rebuild locked outstanding (E8) for a sub from full notice history.
@@ -1320,10 +1664,11 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
    * outstanding = sum(mints) − sum(burns) across the whole stream.
    * A sticky fullyUnlocked flag left UI at 0 after re-locking 100 WART.
    */
-  const rebuildOutstandingE8FromNotices = async (subAddress, { last = 120 } = {}) => {
-    const subNorm = String(subAddress || '')
-      .replace(/^0x/i, '')
-      .toLowerCase();
+  const rebuildOutstandingE8FromNotices = async (
+    subAddress,
+    { last = 200, collectFingerprints = false } = {},
+  ) => {
+    const subNorm = wartAccountId(subAddress);
     if (!subNorm) return null;
     const gqlClient = new GraphQLClient(getRollupGraphqlUrl());
     const { notices } = await gqlClient.request(gql`
@@ -1334,18 +1679,24 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
     let lastBurnNotice = null;
     // Chronological running pin (GraphQL last:N is oldest→newest on this stack)
     let runningOutstanding = 0n;
+    const lockFingerprints = collectFingerprints ? [] : null;
     for (const e of notices?.edges || []) {
       const n = parseNoticePayload(e.node.payload);
       if (!n?.type) continue;
-      const nSub = String(n.subAddress || '')
-        .replace(/^0x/i, '')
-        .toLowerCase();
+      // Match 40-hex account id (ignore checksum / case / 0x)
+      const nSub = wartAccountId(n.subAddress);
       if (nSub && nSub !== subNorm) continue;
       if (n.type === 'sweep_locked' && n.mintedE8 != null) {
         try {
           const m = BigInt(String(n.mintedE8));
           minted += m;
           runningOutstanding += m; // re-lock after unlock re-pins
+          if (lockFingerprints) {
+            const ts = n.timestamp != null ? Number(n.timestamp) : 0;
+            lockFingerprints.push(
+              `${nSub}:${String(n.mintedE8)}:${ts}:${n.vaultAddress || ''}`,
+            );
+          }
         } catch {
           /* */
         }
@@ -1370,13 +1721,15 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
         // Keep the newest burn notice (GraphQL last:N is oldest→newest on this stack)
         lastBurnNotice = n;
       } else if (n.type === 'subwallet_unlocked') {
+        // Only zero running pin — do NOT clear mint/burn sums (re-lock still needs them)
         runningOutstanding = 0n;
         lastBurnNotice = n;
       }
     }
     // Prefer sum(mint−burn); running stream is a cross-check for remainingMintedE8 paths
     const bySum = minted > burned ? minted - burned : 0n;
-    const outstandingE8 = bySum;
+    // After unlock→re-lock, if remainingMintedE8 stream is higher (edge race), take max
+    const outstandingE8 = bySum > runningOutstanding ? bySum : runningOutstanding;
     return {
       outstandingE8: outstandingE8.toString(),
       mintedE8: minted.toString(),
@@ -1384,6 +1737,7 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
       lastBurnNotice,
       runningOutstandingE8: runningOutstanding.toString(),
       fullyUnlocked: outstandingE8 === 0n,
+      ...(lockFingerprints ? { lockFingerprints } : {}),
     };
   };
 
@@ -1557,9 +1911,25 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
    * is still set after unlock — postSweepLock leaves it equal to vaultAddress forever.
    */
   const vaultLockStatus = (sub) => {
-    const outstanding = outstandingE8Of(sub);
+    let outstanding = outstandingE8Of(sub);
+    // Heal sticky unlock: L1 inspect pin wins when local mintedE8 is stale 0
+    try {
+      if (l1Vault?.outstandingE8 != null) {
+        const insp = BigInt(String(l1Vault.outstandingE8));
+        if (insp > outstanding) outstanding = insp;
+      }
+    } catch {
+      /* */
+    }
     if (sub.locked || outstanding > 0n) {
-      return { key: 'locked', label: outstanding > 0n && !sub.locked ? 'Collateral residual 🔒' : 'Locked 🔒', className: 'status-locked' };
+      return {
+        key: 'locked',
+        label:
+          outstanding > 0n && !sub.locked
+            ? 'Collateral residual 🔒'
+            : 'Locked 🔒',
+        className: 'status-locked',
+      };
     }
     // Mid deposit/sweep only: vault assigned, not locked, still in locking flow
     if (sub.locking || (sub.pendingVaultAddress && !sub.vaultAddress)) {
@@ -1648,27 +2018,525 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
     return false;
   };
 
+  /** All vault addresses ever seen for this sub (notices + local 2P store). */
+  const collectVaultCandidatesForSub = async (sub) => {
+    const subId = wartAccountId(sub?.address);
+    const out = [];
+    const push = (a) => {
+      const h = String(a || '')
+        .replace(/^0x/i, '')
+        .toLowerCase();
+      if (h.length >= 40 && !out.includes(h)) out.push(h);
+    };
+    push(sub?.vaultAddress);
+    push(sub?.pendingVaultAddress);
+    try {
+      const local = loadTwoPartyClientLocal(
+        mainWallet?.address || address,
+        sub?.address,
+      );
+      push(local?.vaultAddress);
+    } catch {
+      /* */
+    }
+    try {
+      const gqlClient = new GraphQLClient(getRollupGraphqlUrl());
+      const { notices } = await gqlClient.request(gql`
+        { notices(last: 200) { edges { node { payload } } } }
+      `);
+      for (const e of notices?.edges || []) {
+        const n = parseNoticePayload(e.node.payload);
+        if (!n?.vaultAddress) continue;
+        if (
+          ![
+            'subwallet_pending',
+            'sweep_locked',
+            'subwallet_unlocked',
+            'vault_created',
+            'spoofed_wwart_burned',
+            'release_ticket',
+          ].includes(n.type)
+        ) {
+          continue;
+        }
+        const nSub = wartAccountId(n.subAddress);
+        if (subId && nSub && nSub !== subId) continue;
+        push(n.vaultAddress);
+      }
+    } catch {
+      /* GraphQL optional */
+    }
+    return out;
+  };
+
+  /**
+   * Live vault address + balance for a sub (explicit load / refresh only).
+   * Respects dismissed vaults and vaultDetached — never force a vault the user hid.
+   */
+  const resolveLiveVaultBalanceForSub = async (sub, { allowSwitch = false } = {}) => {
+    // User hid vault on this sub — do not re-pin
+    if (sub?.vaultDetached) return null;
+
+    const preferred = String(sub?.vaultAddress || sub?.pendingVaultAddress || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+
+    // Default: only refresh the currently attached vault
+    if (preferred.length >= 40 && !allowSwitch) {
+      if (isVaultDismissed(preferred)) return null;
+      try {
+        const vb = await fetchBalanceAndNonce(preferred, true);
+        if (vb?.ok === false) return null;
+        return {
+          vaultAddress: preferred,
+          balance: String(vb.balance ?? '0'),
+          spendable: String(vb.spendable ?? vb.balance ?? '0'),
+          totalE8: (() => {
+            try {
+              return BigInt(wartToE8String(String(vb.balance ?? '0')));
+            } catch {
+              return 0n;
+            }
+          })(),
+        };
+      } catch {
+        return null;
+      }
+    }
+
+    const candidates = (await collectVaultCandidatesForSub(sub)).filter(
+      (a) => !isVaultDismissed(a),
+    );
+    if (!candidates.length) return null;
+
+    let best = null;
+    for (const vaultAddress of candidates) {
+      try {
+        const vb = await fetchBalanceAndNonce(vaultAddress, true);
+        if (vb?.ok === false) continue;
+        let totalE8 = 0n;
+        try {
+          totalE8 = BigInt(wartToE8String(String(vb.balance ?? '0')));
+        } catch {
+          totalE8 = 0n;
+        }
+        const row = {
+          vaultAddress,
+          balance: String(vb.balance ?? '0'),
+          spendable: String(vb.spendable ?? vb.balance ?? '0'),
+          totalE8,
+        };
+        if (!best || row.totalE8 > best.totalE8) best = row;
+      } catch {
+        /* try next */
+      }
+    }
+    return best;
+  };
+
+  /**
+   * Discover vaults that have notice history for this L1 owner / local subs
+   * but are not currently shown on a loaded sub vault card.
+   */
+  const discoverUnloadedVaults = async () => {
+    setUnloadedBusy(true);
+    try {
+      const ownerBare = String(l1Address || '')
+        .replace(/^0x/i, '')
+        .toLowerCase();
+      const loadedVaultIds = new Set(
+        (subWallets || [])
+          .flatMap((s) => [s.vaultAddress, s.pendingVaultAddress])
+          .map((a) =>
+            String(a || '')
+              .replace(/^0x/i, '')
+              .toLowerCase(),
+          )
+          .filter((a) => a.length >= 40),
+      );
+      const localSubIds = new Set(
+        (subWallets || [])
+          .map((s) => wartAccountId(s.address))
+          .filter((a) => a && a.length === 40),
+      );
+
+      /** @type {Map<string, { vaultAddress: string, subAddress: string|null, subIndex: number|null, lastType: string|null, lastAt: number|null }>} */
+      const byVault = new Map();
+
+      try {
+        const gqlClient = new GraphQLClient(getRollupGraphqlUrl());
+        const { notices } = await gqlClient.request(gql`
+          { notices(last: 200) { edges { node { payload } } } }
+        `);
+        for (const e of notices?.edges || []) {
+          const n = parseNoticePayload(e.node.payload);
+          if (!n?.type || !n.vaultAddress) continue;
+          const vault = String(n.vaultAddress)
+            .replace(/^0x/i, '')
+            .toLowerCase();
+          if (vault.length < 40) continue;
+          const nOwner = String(n.owner || '')
+            .replace(/^0x/i, '')
+            .toLowerCase();
+          const nSub = wartAccountId(n.subAddress);
+          const ownerMatch = ownerBare && nOwner && nOwner === ownerBare;
+          const subMatch = nSub && localSubIds.has(nSub);
+          // Keep vaults tied to this session (L1 owner or a known sub)
+          if (!ownerMatch && !subMatch) continue;
+          if (
+            ![
+              'vault_created',
+              'subwallet_pending',
+              'sweep_locked',
+              'subwallet_unlocked',
+              'spoofed_wwart_burned',
+              'release_ticket',
+            ].includes(n.type)
+          ) {
+            continue;
+          }
+          const ts = n.timestamp != null ? Number(n.timestamp) : Date.now();
+          let subIndex = null;
+          if (n.subIndex != null && n.subIndex !== '') {
+            const si = Number(n.subIndex);
+            if (Number.isFinite(si)) subIndex = si;
+          } else if (n.index != null && n.index !== '') {
+            const si = Number(n.index);
+            if (Number.isFinite(si)) subIndex = si;
+          }
+          const prev = byVault.get(vault);
+          if (!prev || (ts && (!prev.lastAt || ts >= prev.lastAt))) {
+            byVault.set(vault, {
+              vaultAddress: vault,
+              subAddress: nSub || prev?.subAddress || null,
+              subIndex: subIndex ?? prev?.subIndex ?? null,
+              lastType: n.type,
+              lastAt: ts || prev?.lastAt || null,
+            });
+          } else {
+            if (prev && !prev.subAddress && nSub) prev.subAddress = nSub;
+            if (prev && prev.subIndex == null && subIndex != null) prev.subIndex = subIndex;
+          }
+        }
+      } catch (e) {
+        console.warn('[unloaded vaults] notices scan failed', e?.message || e);
+      }
+
+      // Also surface 2P local shares not attached to a visible vault card
+      try {
+        if (typeof localStorage !== 'undefined') {
+          const main = String(mainWallet?.address || address || '')
+            .replace(/^0x/i, '')
+            .toLowerCase();
+          if (main) {
+            // keys: cartesi-bridge-msig2p-user-v1:${main}:${sub}
+            const prefix = `cartesi-bridge-msig2p-user-v1:${main}:`;
+            for (let i = 0; i < localStorage.length; i++) {
+              const key = localStorage.key(i);
+              if (!key || !key.startsWith(prefix)) continue;
+              try {
+                const raw = localStorage.getItem(key);
+                const parsed = raw ? JSON.parse(raw) : null;
+                const vault = String(parsed?.vaultAddress || '')
+                  .replace(/^0x/i, '')
+                  .toLowerCase();
+                const sub = wartAccountId(
+                  parsed?.subAddress || key.slice(prefix.length),
+                );
+                if (vault.length < 40) continue;
+                let subIndex = null;
+                if (parsed?.index != null && parsed.index !== '') {
+                  const si = Number(parsed.index);
+                  if (Number.isFinite(si)) subIndex = si;
+                }
+                if (!byVault.has(vault)) {
+                  byVault.set(vault, {
+                    vaultAddress: vault,
+                    subAddress: sub || null,
+                    subIndex,
+                    lastType: 'local_share',
+                    lastAt: parsed?.savedAt || null,
+                  });
+                } else {
+                  const prev = byVault.get(vault);
+                  if (prev && prev.subIndex == null && subIndex != null) {
+                    prev.subIndex = subIndex;
+                  }
+                }
+              } catch {
+                /* */
+              }
+            }
+          }
+        }
+      } catch {
+        /* */
+      }
+
+      // Cosigner registry — vaults with d_dapp for this L1 owner even when
+      // rollup notices are missing (e.g. funded vault with only cosigner row).
+      if (l1Address) {
+        try {
+          const listed = await cosignerListByOwner(l1Address);
+          for (const row of listed?.vaults || []) {
+            const vault = String(row.vault || row.vaultAddress || '')
+              .replace(/^0x/i, '')
+              .toLowerCase();
+            if (vault.length < 40) continue;
+            // Skip lab/test fake subs (all-c from unit tests)
+            const sub = wartAccountId(row.subAddress);
+            if (sub && /^c{40}$/i.test(sub)) continue;
+            let subIndex = null;
+            if (row.index != null && row.index !== '') {
+              const si = Number(row.index);
+              if (Number.isFinite(si)) subIndex = si;
+            }
+            const prev = byVault.get(vault);
+            if (!prev) {
+              byVault.set(vault, {
+                vaultAddress: vault,
+                subAddress: sub || null,
+                subIndex,
+                lastType: 'cosigner',
+                lastAt: row.createdAt != null ? Number(row.createdAt) : null,
+              });
+            } else {
+              if (!prev.subAddress && sub) prev.subAddress = sub;
+              if (prev.subIndex == null && subIndex != null) prev.subIndex = subIndex;
+              if (!prev.lastType) prev.lastType = 'cosigner';
+            }
+          }
+        } catch (e) {
+          console.warn('[unloaded vaults] cosigner list failed', e?.message || e);
+        }
+      }
+
+      const rows = [];
+      for (const entry of byVault.values()) {
+        const loaded = loadedVaultIds.has(entry.vaultAddress);
+        let balance = '—';
+        let spendable = '—';
+        try {
+          const vb = await fetchBalanceAndNonce(entry.vaultAddress, true);
+          if (vb?.ok !== false) {
+            balance = String(vb.balance ?? '0');
+            spendable = String(vb.spendable ?? vb.balance ?? '0');
+          }
+        } catch {
+          /* */
+        }
+        rows.push({
+          ...entry,
+          balance,
+          spendable,
+          loaded,
+          dismissed: isVaultDismissed(entry.vaultAddress),
+        });
+      }
+
+      // Sort: unloaded first, then by balance desc, then recent activity
+      rows.sort((a, b) => {
+        if (a.dismissed !== b.dismissed) return a.dismissed ? 1 : -1;
+        if (a.loaded !== b.loaded) return a.loaded ? 1 : -1;
+        const ae = (() => {
+          try {
+            return BigInt(wartToE8String(String(a.balance === '—' ? '0' : a.balance)));
+          } catch {
+            return 0n;
+          }
+        })();
+        const be = (() => {
+          try {
+            return BigInt(wartToE8String(String(b.balance === '—' ? '0' : b.balance)));
+          } catch {
+            return 0n;
+          }
+        })();
+        if (ae !== be) return be > ae ? 1 : -1;
+        return (b.lastAt || 0) - (a.lastAt || 0);
+      });
+
+      setUnloadedVaults(rows);
+    } finally {
+      setUnloadedBusy(false);
+    }
+  };
+
+  /**
+   * Attach a discovered vault address to its HD sub.
+   * If the HD index is known but the sub is missing from the list, regenerate it
+   * from the seed first (same as Regen with that index).
+   */
+  const loadDiscoveredVaultOntoSub = async (entry) => {
+    const vault = String(entry.vaultAddress || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    if (vault.length < 40) return toast.error('Invalid vault address');
+
+    const subId = wartAccountId(entry.subAddress);
+    let target =
+      (subId &&
+        (subWallets || []).find((s) => wartAccountId(s.address) === subId)) ||
+      null;
+
+    // Match by known HD index
+    if (!target && entry.subIndex != null && Number.isFinite(Number(entry.subIndex))) {
+      const want = Number(entry.subIndex);
+      target = (subWallets || []).find((s) => Number(s.index) === want) || null;
+    }
+
+    // Regen missing sub from seed when cosigner/notices know the index
+    if (
+      !target &&
+      entry.subIndex != null &&
+      Number.isFinite(Number(entry.subIndex)) &&
+      mainMnemonic
+    ) {
+      const want = Number(entry.subIndex);
+      const toastId = toast.loading(`Regenerating sub #${want} from seed…`);
+      try {
+        const derived = await deriveSubWallet(mainMnemonic, want);
+        if (!derived?.address) throw new Error('derive failed');
+        // Verify address matches notice/cosigner sub if we have one
+        if (subId && wartAccountId(derived.address) !== subId) {
+          toast.error(
+            `Index #${want} derives a different sub than this vault’s record — check seed`,
+            { id: toastId, duration: 8000 },
+          );
+          return;
+        }
+        undismissVaultAddress(vault);
+        setSubWallets((prev) => {
+          const filtered = prev.filter((s) => Number(s.index) !== want);
+          return [
+            ...filtered,
+            {
+              index: derived.index,
+              address: derived.address,
+              balance: null,
+              spendable: null,
+              locked: false,
+              locking: false,
+              vaultAddress: vault,
+              pendingVaultAddress: vault,
+              vaultBalance: entry.balance !== '—' ? entry.balance : null,
+              vaultSpendable: entry.spendable !== '—' ? entry.spendable : null,
+              vaultBalanceAt: Date.now(),
+              vaultDetached: false,
+              mintedE8: '0',
+              hidden: false,
+            },
+          ];
+        });
+        setShowHiddenSubs(true);
+        toast.success(
+          `Sub #${want} restored · vault ${vault.slice(0, 10)}…` +
+            (entry.balance && entry.balance !== '—'
+              ? ` · ${entry.balance} WART`
+              : '') +
+            ' — still need that vault’s user share for multi-sig withdraw.',
+          { id: toastId, duration: 8000 },
+        );
+        discoverUnloadedVaults().catch(() => {});
+        return;
+      } catch (e) {
+        toast.error('Could not regen sub: ' + (e?.message || e), {
+          id: toastId,
+          duration: 7000,
+        });
+        return;
+      }
+    }
+
+    // Fallback: sub that already has this vault, or first visible sub
+    if (!target) {
+      target =
+        (subWallets || []).find(
+          (s) =>
+            String(s.vaultAddress || s.pendingVaultAddress || '')
+              .replace(/^0x/i, '')
+              .toLowerCase() === vault,
+        ) ||
+        (subWallets || []).find((s) => !s.hidden) ||
+        (subWallets || [])[0] ||
+        null;
+    }
+
+    if (!target) {
+      const idxHint =
+        entry.subIndex != null
+          ? ` Use Sub wallets → Regen index ${entry.subIndex}, then Load again.`
+          : ' Generate a sub or Import vault share first.';
+      return toast.error('No sub wallet to attach.' + idxHint, { duration: 8000 });
+    }
+
+    undismissVaultAddress(vault);
+    setSubWallets((prev) =>
+      prev.map((s) =>
+        s.index === target.index
+          ? {
+              ...s,
+              vaultAddress: vault,
+              pendingVaultAddress: vault,
+              vaultBalance: entry.balance !== '—' ? entry.balance : s.vaultBalance,
+              vaultSpendable:
+                entry.spendable !== '—' ? entry.spendable : s.vaultSpendable,
+              vaultBalanceAt: Date.now(),
+              vaultDetached: false,
+              hidden: false,
+            }
+          : s,
+      ),
+    );
+    setShowHiddenSubs(true);
+    // Focus that sub in the pager
+    setTimeout(() => {
+      setActiveSubPos(0);
+      setSubWallets((prev) => {
+        const list = prev.filter((s) => !s.hidden);
+        const idx = list.findIndex((s) => s.index === target.index);
+        if (idx >= 0) setActiveSubPos(idx);
+        return prev;
+      });
+    }, 50);
+
+    toast.success(
+      `Loaded vault ${vault.slice(0, 10)}… on sub #${target.index}` +
+        (entry.balance && entry.balance !== '—'
+          ? ` · ${entry.balance} WART`
+          : '') +
+        ' — Import vault share if you need multi-sig withdraw (d_user).',
+      { duration: 7000 },
+    );
+    discoverUnloadedVaults().catch(() => {});
+  };
+
   const getVaultAddressForSub = async (subAddress) => {
     try {
+      const subId = wartAccountId(subAddress);
       // Recreate client each call so origin is always current (and absolute)
       const gqlClient = new GraphQLClient(getRollupGraphqlUrl());
       const { notices } = await gqlClient.request(gql`
-        { notices(last: 20) { edges { node { payload } } } }
+        { notices(last: 80) { edges { node { payload } } } }
       `);
       const parsed = (notices?.edges || [])
         .map((e) => parseNoticePayload(e.node.payload))
         .filter(Boolean);
-      const relevant = parsed.filter(
-        (n) =>
-          n.subAddress === subAddress &&
-          n.vaultAddress &&
-          ['subwallet_pending', 'sweep_locked', 'subwallet_unlocked', 'vault_created'].includes(
+      const relevant = parsed.filter((n) => {
+        if (!n.vaultAddress) return false;
+        if (
+          !['subwallet_pending', 'sweep_locked', 'subwallet_unlocked', 'vault_created'].includes(
             n.type,
-          ),
-      );
+          )
+        ) {
+          return false;
+        }
+        const nSub = wartAccountId(n.subAddress);
+        return !nSub || nSub === subId;
+      });
       if (relevant.length > 0) {
-        // Take the most recent one (assuming last:20 is recent first)
-        const latest = relevant[0];
+        // GraphQL last:N is oldest→newest on this stack — take the LAST match
+        const latest = relevant[relevant.length - 1];
         return String(latest.vaultAddress).replace(/^0x/i, '').toLowerCase();
       }
     } catch (err) {
@@ -1691,18 +2559,54 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
   /**
    * Load / create 2P-ECDSA multi-sig vault (full private key never stored).
    */
+  /**
+   * Detach multi-sig vault from this sub only. Sub stays fully usable for a new vault.
+   * Does not hide the sub wallet, does not move on-chain funds.
+   */
+  const dismissVaultFromSub = (sub) => {
+    const displayed = sub.vaultAddress || sub.pendingVaultAddress;
+    if (!displayed) {
+      toast('No vault on this sub');
+      return;
+    }
+    const v = String(displayed)
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    dismissVaultAddress(v);
+    setSubWallets((prev) =>
+      prev.map((s) =>
+        s.address === sub.address || s.index === sub.index
+          ? {
+              ...s,
+              vaultAddress: null,
+              pendingVaultAddress: null,
+              vaultBalance: null,
+              vaultSpendable: null,
+              vaultBalanceAt: null,
+              vaultDetached: true,
+              // keep sub visible and ready for new vault / fund / sweep
+              hidden: false,
+              locked: false,
+              locking: false,
+              mintedE8: '0',
+            }
+          : s,
+      ),
+    );
+    setCheckedVault((prev) => ({ ...prev, [sub.index]: false }));
+    toast.success(
+      `Vault dismissed from sub #${sub.index} — sub kept for new vaults. ` +
+        'Old vault stays under Unloaded (Dismiss there if you have no d_user).',
+      { duration: 7000 },
+    );
+    discoverUnloadedVaults().catch(() => {});
+  };
+
   const loadOrCreateVault = async (sub) => {
     const displayed = sub.vaultAddress || sub.pendingVaultAddress;
     if (displayed) {
-      setSubWallets((prev) =>
-        prev.map((s) =>
-          s.address === sub.address
-            ? { ...s, vaultAddress: null, pendingVaultAddress: null, vaultBalance: null }
-            : s,
-        ),
-      );
-      setCheckedVault((prev) => ({ ...prev, [sub.index]: false }));
-      toast('Vault hidden');
+      // Prefer explicit dismiss (does not hide sub)
+      dismissVaultFromSub(sub);
       return;
     }
 
@@ -1716,6 +2620,13 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
         toast.error('Connect MetaMask (L1) for multi-sig owner', { id: toastId });
         return;
       }
+
+      // Creating / restoring a vault clears detached flag on this sub
+      setSubWallets((prev) =>
+        prev.map((s) =>
+          s.index === sub.index ? { ...s, vaultDetached: false } : s,
+        ),
+      );
 
       const mainAddr = mainWallet?.address || address;
       let vaultAddr = null;
@@ -1873,27 +2784,26 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
     }
   };
 
+  /**
+   * Live lock pin for a sub. Prefer mint−burn rebuild (handles unlock→re-lock).
+   * Do NOT use "first notice in last:N" — GraphQL is oldest→newest, so that
+   * always saw the first historical sweep_locked and stuck locked/unlocked wrong.
+   */
   const isSubLocked = async (subAddress) => {
-  try {
-    const { notices } = await client.request(gql`
-      { notices(last: 20) { edges { node { payload } } } }
-    `);
-    const parsed = notices.edges
-      .map(e => {
-        try { return JSON.parse(toUtf8String(e.node.payload)); }
-        catch { return null; }
-      })
-      .filter(Boolean);
-    // Updated: Removed 'subwallet_locked' since backend now sends 'sweep_locked' for consistency
-    const relevant = parsed.filter(
-      n => n.subAddress === subAddress && n.verified && ['subwallet_unlocked', 'sweep_locked'].includes(n.type)
-    );
-    // Note: Assumes notices are ordered by recency (last:20 fetches recent first); takes the most recent relevant one
-    return relevant.length > 0 && relevant[0].type === 'sweep_locked';
-  } catch {
+    try {
+      const rebuilt = await rebuildOutstandingE8FromNotices(subAddress, { last: 200 });
+      if (rebuilt) return BigInt(String(rebuilt.outstandingE8 || '0')) > 0n;
+    } catch {
+      /* fall through */
+    }
+    try {
+      const insp = await fetchInspectOutstandingE8(l1Address);
+      if (insp != null) return insp > 0n;
+    } catch {
+      /* */
+    }
     return false;
-  }
-};
+  };
 
   /**
    * Burn spoofed wWART for this sub-lock (partial or full).
@@ -2039,24 +2949,42 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
 
       const vAddr = sub.vaultAddress || sub.pendingVaultAddress;
       if (vAddr) {
-        try {
-          const vb = await fetchBalanceAndNonce(vAddr, true);
+        // Retry live vault balance — never persist a failed fetch as "0"
+        let liveVault = null;
+        for (let i = 0; i < 4; i++) {
+          try {
+            const vb = await fetchBalanceAndNonce(vAddr, true);
+            if (vb?.ok !== false && vb?.balance != null) {
+              liveVault = vb;
+              break;
+            }
+          } catch {
+            /* */
+          }
+          await new Promise((r) => setTimeout(r, 800));
+        }
+        if (liveVault) {
           setSubWallets((prev) =>
             prev.map((s) =>
               s.index === sub.index
-                ? { ...s, vaultBalance: vb.balance || vb.spendable || '0' }
+                ? {
+                    ...s,
+                    vaultBalance: String(liveVault.balance ?? liveVault.spendable ?? s.vaultBalance ?? '0'),
+                    vaultSpendable: String(
+                      liveVault.spendable ?? liveVault.balance ?? s.vaultSpendable ?? '0',
+                    ),
+                    vaultBalanceAt: Date.now(),
+                  }
                 : s,
             ),
           );
-        } catch {
-          /* ignore */
         }
       }
 
       if (fullyUnlocked) {
         toast.success(
-          'Fully unlocked — you can Withdraw vault → main',
-          { id: toastId, duration: 6000 },
+          'Fully unlocked — coins still on vault address. Use Vault → main to withdraw.',
+          { id: toastId, duration: 7000 },
         );
       } else {
         const freeHint = (() => {
@@ -2211,52 +3139,58 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
         ) || null;
 
       const subBal = await fetchBalanceAndNonce(subAddress, true);
-      let locked = false;
+      // Outstanding pin from notices + inspect (not broken "first notice" lock check)
+      let outstandingE8 = null;
       try {
-        locked = await isSubLocked(subAddress);
-      } catch {
-        locked = !!existing?.locked;
-      }
-
-      const updates = {
-        balance: subBal.balance || '0',
-        spendable: subBal.spendable || subBal.balance || '0',
-        locked,
-      };
-
-      // 1) Client-known vault (reliable after wipe)  2) GraphQL if rollup has notices
-      let vaultAddr = (
-        existing?.vaultAddress ||
-        existing?.pendingVaultAddress ||
-        ''
-      )
-        .toString()
-        .replace(/^0x/i, '')
-        .toLowerCase();
-      try {
-        const fromRollup = await getVaultAddressForSub(subAddress);
-        if (fromRollup) {
-          vaultAddr = String(fromRollup).replace(/^0x/i, '').toLowerCase();
+        const rebuilt = await rebuildOutstandingE8FromNotices(subAddress, { last: 200 });
+        if (rebuilt?.outstandingE8 != null) {
+          outstandingE8 = BigInt(String(rebuilt.outstandingE8));
         }
       } catch {
-        /* GraphQL optional */
+        /* */
+      }
+      try {
+        const insp = await fetchInspectOutstandingE8(l1Address);
+        if (insp != null && (outstandingE8 == null || insp > outstandingE8)) {
+          outstandingE8 = insp;
+        }
+      } catch {
+        /* */
+      }
+      if (outstandingE8 == null) {
+        try {
+          outstandingE8 = BigInt(String(existing?.mintedE8 || '0'));
+        } catch {
+          outstandingE8 = 0n;
+        }
+      }
+      const locked = outstandingE8 > 0n;
+
+      const updates = {
+        locked,
+        mintedE8: outstandingE8.toString(),
+        locking: false,
+      };
+      // Only apply sub balance if the node fetch succeeded
+      if (subBal?.ok !== false) {
+        updates.balance = subBal.balance || '0';
+        updates.spendable = subBal.spendable || subBal.balance || '0';
       }
 
-      if (vaultAddr && vaultAddr.length >= 40) {
-        updates.vaultAddress = vaultAddr;
-        updates.pendingVaultAddress = vaultAddr;
-        const vaultBal = await fetchBalanceAndNonce(vaultAddr, true);
-        // Always overwrite cache with live node numbers (including "0")
-        updates.vaultBalance = String(vaultBal.balance ?? '0');
-        updates.vaultSpendable = String(
-          vaultBal.spendable ?? vaultBal.balance ?? '0',
+      // Resolve funded vault among candidates (local + notices + 2P share)
+      try {
+        const liveVault = await resolveLiveVaultBalanceForSub(
+          existing || { address: subAddress },
         );
-        updates.vaultBalanceAt = Date.now();
-      }
-
-      if (!locked) {
-        updates.mintedE8 = '0';
-        updates.locking = false;
+        if (liveVault) {
+          updates.vaultAddress = liveVault.vaultAddress;
+          updates.pendingVaultAddress = liveVault.vaultAddress;
+          updates.vaultBalance = liveVault.balance;
+          updates.vaultSpendable = liveVault.spendable;
+          updates.vaultBalanceAt = Date.now();
+        }
+      } catch (e) {
+        console.warn('[refreshSubBalance] vault resolve failed', e?.message || e);
       }
 
       setSubWallets((prev) =>
@@ -2269,14 +3203,19 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
         }),
       );
 
-      const vaultMsg =
+      const shownVault =
         updates.vaultBalance != null
-          ? ` · vault free ${updates.vaultSpendable ?? updates.vaultBalance} (total ${updates.vaultBalance})`
-          : vaultAddr
-            ? ' · vault address known but balance fetch returned empty'
-            : ' · no vault address on this sub';
+          ? updates.vaultBalance
+          : existing?.vaultBalance ?? null;
+      const vaultMsg =
+        shownVault != null
+          ? ` · vault ${updates.vaultSpendable ?? shownVault} free / ${shownVault} total` +
+            (updates.vaultAddress
+              ? ` @ ${String(updates.vaultAddress).slice(0, 8)}…`
+              : '')
+          : ' · no vault balance resolved';
       toast.success(
-        `Live node: sub ${updates.balance} WART${vaultMsg}`,
+        `Live node: sub ${updates.balance ?? existing?.balance ?? '?'} WART${vaultMsg}`,
         { id: toastId, duration: 4500 },
       );
     } catch (err) {
@@ -2374,28 +3313,8 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
   const renderVaultCard = (sub) => {
     const vaultAddr = sub.pendingVaultAddress || sub.vaultAddress;
     if (!vaultAddr) {
-      return (
-        <div className="sw-card sw-card--vault sw-card--empty">
-          <div className="sw-card-head">
-            <h4 className="sw-card-title">Vault</h4>
-          </div>
-          <p className="sw-card-empty-msg">
-            No vault shown — Load restores this browser’s multi-sig vault, or Import a saved share
-            for a funded address (then Load).
-          </p>
-          <div className="sw-card-toolbar" style={{ flexWrap: 'wrap', gap: '0.5rem' }}>
-            <button
-              type="button"
-              className="btn primary small"
-              onClick={() => loadOrCreateVault(sub)}
-              disabled={loading || isUnlocking[sub.index]}
-            >
-              Load / create vault
-            </button>
-          </div>
-          {renderVaultShareControls(sub)}
-        </div>
-      );
+      // Create / load vault lives on the Sub wallets card — never hang Vault tab on empty create.
+      return null;
     }
 
     const displayedVaultAddr = isSmallScreen
@@ -2586,11 +3505,11 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
               <button
                 type="button"
                 className="btn secondary small"
-                onClick={() => loadOrCreateVault(sub)}
+                onClick={() => dismissVaultFromSub(sub)}
                 disabled={loading || isUnlocking[sub.index]}
-                title="Hide vault from panel"
+                title="Detach this multi-sig vault from the sub. Sub stays for a new vault. Does not hide the sub or move funds."
               >
-                Hide vault
+                Dismiss vault
               </button>
               {!sub.locked && outE8 === 0n && (
                 <button
@@ -2875,9 +3794,15 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
 
   const isVaultFocus = focusMode === 'vault';
 
-  // Sub wallets tab: all non-hidden subs. Vault tab: only those with a vault address.
+  // Sub wallets tab: all non-hidden subs (create vault lives here).
+  // Vault tab: only subs that currently have a vault attached — no empty "create vault" hang.
   const visibleSubs = isVaultFocus
-    ? baseVisibleSubs.filter((s) => !!(s.vaultAddress || s.pendingVaultAddress))
+    ? baseVisibleSubs.filter((s) => {
+        const v = String(s.vaultAddress || s.pendingVaultAddress || '')
+          .replace(/^0x/i, '')
+          .toLowerCase();
+        return v.length >= 40 && !s.vaultDetached;
+      })
     : baseVisibleSubs;
 
   const totalSubs = visibleSubs.length;
@@ -2945,6 +3870,207 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
       ? '—'
       : n.toLocaleString(undefined, { maximumFractionDigits: 4 });
 
+  const unloadedOnly = unloadedVaults.filter((v) => !v.loaded && !v.dismissed);
+  const discoveredLoaded = unloadedVaults.filter((v) => v.loaded);
+  const dismissedOnly = unloadedVaults.filter((v) => v.dismissed && !v.loaded);
+
+  const renderUnloadedVaultsPanel = () => {
+    if (!isVaultFocus) return null;
+    return (
+      <div className="sw-card sw-card--unloaded">
+        <div className="sw-card-head">
+          <h4 className="sw-card-title">Unloaded vaults</h4>
+          <div className="sw-card-head-right">
+            <button
+              type="button"
+              className="btn secondary small"
+              disabled={unloadedBusy}
+              onClick={() => discoverUnloadedVaults()}
+            >
+              {unloadedBusy ? 'Scanning…' : 'Refresh'}
+            </button>
+          </div>
+        </div>
+        <p className="sw-card-empty-msg" style={{ marginTop: 0 }}>
+          History / cosigner vaults not on a card. <strong>Dismiss</strong> hides them (no auto-load;
+          funds stay on-chain). <strong>Load on sub</strong> is view-only without that vault’s{' '}
+          <code>d_user</code> share. Create new multi-sig vaults on the <strong>Sub wallets</strong>{' '}
+          tab.
+        </p>
+        {unloadedBusy && unloadedVaults.length === 0 ? (
+          <p className="sw-tab-empty">Scanning notices &amp; balances…</p>
+        ) : unloadedOnly.length === 0 ? (
+          <p className="sw-tab-empty">
+            {unloadedVaults.length === 0
+              ? 'No other vaults found for this L1 / sub history yet.'
+              : 'No undismissed unloaded vaults (see dismissed below if any).'}
+          </p>
+        ) : (
+          <ul className="sw-unloaded-list">
+            {unloadedOnly.map((v) => {
+              const short = `${v.vaultAddress.slice(0, 10)}…${v.vaultAddress.slice(-6)}`;
+              const subShort = v.subAddress
+                ? `${v.subAddress.slice(0, 6)}…${v.subAddress.slice(-4)}`
+                : '—';
+              const idxLabel =
+                v.subIndex != null && Number.isFinite(Number(v.subIndex))
+                  ? `#${v.subIndex}`
+                  : null;
+              return (
+                <li key={v.vaultAddress} className="sw-unloaded-row">
+                  <div className="sw-unloaded-main">
+                    <button
+                      type="button"
+                      className="sw-meta-v mono sw-link"
+                      title={v.vaultAddress}
+                      onClick={() => copyToClipboard(v.vaultAddress, 'Vault address')}
+                    >
+                      {short}
+                    </button>
+                    <span className="sw-unloaded-bal">
+                      {v.balance !== '—' ? `${v.balance} WART` : 'balance ?'}
+                    </span>
+                    <span className="sw-muted sw-unloaded-meta">
+                      {idxLabel ? (
+                        <button
+                          type="button"
+                          className="sw-link"
+                          title="Copy HD sub index — use Regen if sub is missing"
+                          onClick={() =>
+                            copyToClipboard(String(v.subIndex), 'Sub index')
+                          }
+                        >
+                          sub {idxLabel}
+                        </button>
+                      ) : (
+                        'sub index ?'
+                      )}
+                      {` · ${subShort}`}
+                      {v.lastType ? ` · ${v.lastType}` : ''}
+                    </span>
+                  </div>
+                  <div className="sw-unloaded-actions">
+                    <button
+                      type="button"
+                      className="btn primary small"
+                      title={
+                        idxLabel
+                          ? `Attach to sub ${idxLabel} (view only without user share)`
+                          : 'Attach to matching or first sub'
+                      }
+                      onClick={() => loadDiscoveredVaultOntoSub(v)}
+                    >
+                      {idxLabel ? `Load on sub ${idxLabel}` : 'Load on sub'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn secondary small"
+                      title="Hide from this list forever (until Undismiss). Funds stay on-chain."
+                      onClick={() => {
+                        dismissVaultAddress(v.vaultAddress);
+                        // Also detach from any sub still showing this vault
+                        setSubWallets((prev) =>
+                          prev.map((s) => {
+                            const va = String(
+                              s.vaultAddress || s.pendingVaultAddress || '',
+                            )
+                              .replace(/^0x/i, '')
+                              .toLowerCase();
+                            if (va !== v.vaultAddress) return s;
+                            return {
+                              ...s,
+                              vaultAddress: null,
+                              pendingVaultAddress: null,
+                              vaultBalance: null,
+                              vaultSpendable: null,
+                              vaultBalanceAt: null,
+                              vaultDetached: true,
+                              locked: false,
+                              locking: false,
+                              mintedE8: '0',
+                            };
+                          }),
+                        );
+                        toast.success(
+                          `Dismissed ${v.vaultAddress.slice(0, 10)}… — gone from Unloaded & cards`,
+                          { duration: 5000 },
+                        );
+                        // Optimistic UI — remove from list immediately
+                        setUnloadedVaults((prev) =>
+                          prev.map((row) =>
+                            row.vaultAddress === v.vaultAddress
+                              ? { ...row, dismissed: true, loaded: false }
+                              : row,
+                          ),
+                        );
+                      }}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {dismissedOnly.length > 0 && (
+          <details className="sw-unloaded-loaded">
+            <summary>Dismissed ({dismissedOnly.length}) — hidden until Undismiss</summary>
+            <ul className="sw-unloaded-list sw-unloaded-list--dim">
+              {dismissedOnly.map((v) => (
+                <li key={`dismissed-${v.vaultAddress}`} className="sw-unloaded-row">
+                  <span className="mono">
+                    {v.vaultAddress.slice(0, 10)}…{v.vaultAddress.slice(-6)}
+                  </span>
+                  <span className="sw-unloaded-bal">
+                    {v.balance !== '—' ? `${v.balance} WART` : '—'}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn secondary small"
+                    onClick={() => {
+                      undismissVaultAddress(v.vaultAddress);
+                      setUnloadedVaults((prev) =>
+                        prev.map((row) =>
+                          row.vaultAddress === v.vaultAddress
+                            ? { ...row, dismissed: false }
+                            : row,
+                        ),
+                      );
+                      toast.success('Undismissed — use Load on sub if needed');
+                    }}
+                  >
+                    Undismiss
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+        {discoveredLoaded.length > 0 && (
+          <details className="sw-unloaded-loaded">
+            <summary>
+              Also on chain/history ({discoveredLoaded.length} already on a card)
+            </summary>
+            <ul className="sw-unloaded-list sw-unloaded-list--dim">
+              {discoveredLoaded.map((v) => (
+                <li key={`loaded-${v.vaultAddress}`} className="sw-unloaded-row">
+                  <span className="mono">
+                    {v.vaultAddress.slice(0, 10)}…{v.vaultAddress.slice(-6)}
+                  </span>
+                  <span className="sw-unloaded-bal">
+                    {v.balance !== '—' ? `${v.balance} WART` : '—'}
+                  </span>
+                  <span className="sw-muted">loaded</span>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+      </div>
+    );
+  };
+
   return (
   <section className={`subwallet-section${isVaultFocus ? ' subwallet-section--vault-focus' : ''}`}>
     <div className="subwallet-top">
@@ -2958,8 +4084,8 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
         <summary>{isVaultFocus ? 'Vault tips' : 'Steps'}</summary>
         {isVaultFocus ? (
           <ol className="bridge-flow-steps">
-            <li><span className="step-num">1</span><span>Cycle vaults with the pager</span></li>
-            <li><span className="step-num">2</span><span>Refresh for live vault totals</span></li>
+            <li><span className="step-num">1</span><span>Only loaded vaults here — create new ones on <strong>Sub wallets</strong></span></li>
+            <li><span className="step-num">2</span><span><strong>Unloaded vaults</strong> → Load on sub or <strong>Dismiss</strong></span></li>
             <li><span className="step-num">3</span><span>Release locked WART if needed, then Vault → main</span></li>
           </ol>
         ) : (
@@ -3045,6 +4171,9 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
         against that capacity. MetaMask shows L1 ERC-20 after voucher execute.
       </p>
     </div>
+
+    {/* History vaults not on the active card (re-create / wrong local address) */}
+    {renderUnloadedVaultsPanel()}
 
     {/* Sub generation only on Sub wallets tab — not on Vault tab */}
     {!isVaultFocus && (
@@ -3290,14 +4419,25 @@ const pollForLockNotice = async (subAddress, timeoutMs = 45000) => {
                     className="btn primary small"
                     onClick={() => loadOrCreateVault(sub)}
                     disabled={loading || isUnlocking[sub.index]}
+                    title={
+                      sub.vaultDetached
+                        ? 'Create a new multi-sig vault on this sub (old vault was dismissed)'
+                        : 'Create multi-sig vault or restore local share'
+                    }
                   >
-                    Load / create vault
+                    {sub.vaultDetached ? 'Create new vault' : 'Load / create vault'}
                   </button>
                 )}
               </div>
-              {/* Import must work with vault hidden — share UI was only on vault card before */}
+              {/* Import / create vault stay on Sub wallets card — not the Vault tab */}
               {!hasVault && (
                 <div style={{ marginTop: '0.65rem' }}>
+                  {sub.vaultDetached ? (
+                    <p className="sw-hint" style={{ margin: '0 0 0.5rem' }}>
+                      Previous vault dismissed. Sub index #{sub.index} is free for a new vault
+                      or Import share.
+                    </p>
+                  ) : null}
                   {renderVaultShareControls(sub)}
                 </div>
               )}
