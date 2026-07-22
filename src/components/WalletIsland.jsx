@@ -23,7 +23,13 @@ import {
 } from '../utils/bridgeConfig.js';
 import { SHARE_TOKEN } from '../utils/tokenNames.js';
 import { LOCAL_WWART } from '../utils/localTokens.js';
-import { computeWliqMintAvailable, formatUnits18 } from '../utils/wliqCapacity.js';
+import {
+  computeWliqMintAvailable,
+  formatUnits18,
+  formatUnits18Exact,
+  portalWwart18,
+  wwartWithdrawable18,
+} from '../utils/wliqCapacity.js';
 import {
   loadVaultCache,
   saveVaultCache,
@@ -638,7 +644,10 @@ export default function WalletIsland() {
     if (!withdrawWwartAmt || loading) return Promise.resolve();
     return send({ type: "withdraw_wwart", amount: withdrawWwartAmt }).then(() => {
       setWithdrawWwartAmt('');
-      toast.success('wWART withdraw sent — open Vouchers tab to Execute on L1 (mints to MetaMask).');
+      toast.success(
+        'wWART withdraw sent — open Vouchers tab → Execute on L1 (portable = mint voucher; portal deposit = transfer voucher).',
+        { duration: 8000 },
+      );
     });
   };
 
@@ -740,6 +749,16 @@ export default function WalletIsland() {
   const liquid = format(vault.liquid, 18);
   // Portable wWART claims (mint_wwart) are 18-dec; do not mix with spoofed E8 in wWART field
   const wwartClaim = format(vault.l1WwartClaim || vault.wwartPortable || '0', 18);
+  // Withdrawable = portable (open claims) + portal deposits (MetaMask → rollup). Deposit ≠ portable.
+  const wwartPortableWei = (() => {
+    try {
+      return BigInt(vault?.wwartPortable || '0');
+    } catch {
+      return 0n;
+    }
+  })();
+  const wwartPortalWei = portalWwart18(vault);
+  const wwartWithdrawableWei = wwartWithdrawable18(vault);
   const CTSI = format(vault.CTSI, 18);
   const eth = Number(vault.eth || 0);
   const usdc = format(vault.usdc, 6);
@@ -1125,25 +1144,36 @@ export default function WalletIsland() {
                 {wwartClaim.toLocaleString(undefined, { maximumFractionDigits: 6 })}
               </strong>
               {' · '}
-              Withdrawable (portable):{' '}
+              Withdrawable:{' '}
               <strong>
-                {(() => {
-                  try {
-                    return Number(
-                      ethers.formatUnits(BigInt(vault?.wwartPortable || '0'), 18),
-                    ).toLocaleString(undefined, { maximumFractionDigits: 6 });
-                  } catch {
-                    return '0';
-                  }
-                })()}
+                {Number(formatUnits18(wwartWithdrawableWei)).toLocaleString(undefined, {
+                  maximumFractionDigits: 6,
+                })}
               </strong>
+              {' '}
+              <span className="wi-muted">
+                (portable{' '}
+                {Number(formatUnits18(wwartPortableWei)).toLocaleString(undefined, {
+                  maximumFractionDigits: 6,
+                })}
+                {' + '}
+                portal{' '}
+                {Number(formatUnits18(wwartPortalWei)).toLocaleString(undefined, {
+                  maximumFractionDigits: 6,
+                })}
+                )
+              </span>
               {' · '}
               Shared available: <strong>{mintCap.available}</strong>.
-              Withdraw moves portable → L1 mint voucher (claim stays until burn).
+            </p>
+            <p className="wi-muted" style={{ marginTop: '-0.25rem', marginBottom: '0.75rem' }}>
+              Portable = mint claims not yet withdrawn (mint voucher). Portal = MetaMask deposits
+              (transfer voucher). Deposit does <strong>not</strong> raise portable or free Used —
+              burn does for capacity; withdraw for sending out.
             </p>
             {WWART_ADDRESS ? (
               <div className="wi-portal-card wi-portal-card--focus">
-                <div className="wi-portal-title">Withdraw claim → L1</div>
+                <div className="wi-portal-title">Withdraw wWART → L1</div>
                 <div className="wi-portal-row">
                   <input
                     className="input"
@@ -1154,21 +1184,10 @@ export default function WalletIsland() {
                   <button
                     type="button"
                     className="btn secondary small"
-                    disabled={loading || !wwartClaim}
+                    disabled={loading || wwartWithdrawableWei <= 0n}
                     onClick={() => {
-                      // Withdrawable is portable only (capacity claim stays after withdraw)
-                      const raw = vault?.wwartPortable || '0';
-                      try {
-                        const bi = BigInt(raw);
-                        const whole = bi / 10n ** 18n;
-                        const frac = (bi % 10n ** 18n)
-                          .toString()
-                          .padStart(18, '0')
-                          .replace(/0+$/, '');
-                        setWithdrawWwartAmt(frac ? `${whole}.${frac}` : whole.toString());
-                      } catch {
-                        setWithdrawWwartAmt('0');
-                      }
+                      // Max = portable + portal inventory (same as backend withdraw_wwart)
+                      setWithdrawWwartAmt(formatUnits18Exact(wwartWithdrawableWei));
                     }}
                   >
                     Max
@@ -1176,7 +1195,7 @@ export default function WalletIsland() {
                   <button
                     type="button"
                     className="btn primary small"
-                    disabled={loading}
+                    disabled={loading || wwartWithdrawableWei <= 0n}
                     onClick={() => withdrawWwart()}
                   >
                     Withdraw
@@ -1205,9 +1224,10 @@ export default function WalletIsland() {
               <div className="wi-portal-card wi-portal-card--focus" style={{ marginBottom: '0.75rem' }}>
                 <div className="wi-portal-title">Deposit wWART (MetaMask → rollup)</div>
                 <p className="wi-portal-note" style={{ marginBottom: '0.5rem' }}>
-                  Adds app balance only. Used / Available unchanged until you{' '}
-                  <strong>Burn wWART claims</strong> on Warthog → Home. Unlock collateral is a
-                  separate <strong>Release</strong> on Bridge.
+                  Credits <strong>portal inventory</strong> (not portable). Used / Available
+                  unchanged until you <strong>Burn wWART claims</strong> on Warthog → Home.
+                  Withdraw Max includes portal + portable. Unlock collateral is a separate{' '}
+                  <strong>Release</strong> on Bridge.
                 </p>
                 <div className="wi-portal-row">
                   <input
@@ -1224,8 +1244,8 @@ export default function WalletIsland() {
                       try {
                         await depositWwart();
                         toast.success(
-                          'Deposited — rollup balance up; Used claim unchanged until burn',
-                          { duration: 7000 },
+                          'Deposited — portal inventory up (not portable). Max withdraw includes it; Used claim free only after burn.',
+                          { duration: 8000 },
                         );
                       } catch {
                         /* depositWwart already toasts errors */
@@ -1237,17 +1257,28 @@ export default function WalletIsland() {
                   </button>
                 </div>
                 <p className="wi-portal-note">
-                  Rollup portal wWART:{' '}
+                  Portal inventory:{' '}
                   <strong>
-                    {formatVaultToken(vault?.wWART, 18).toLocaleString(undefined, {
+                    {Number(formatUnits18(wwartPortalWei)).toLocaleString(undefined, {
                       maximumFractionDigits: 6,
                     })}
                   </strong>
                   {' · '}
-                  Used claim:{' '}
+                  Portable:{' '}
                   <strong>
-                    {(mintCap.claim || '0')}
+                    {Number(formatUnits18(wwartPortableWei)).toLocaleString(undefined, {
+                      maximumFractionDigits: 6,
+                    })}
                   </strong>
+                  {' · '}
+                  Withdrawable:{' '}
+                  <strong>
+                    {Number(formatUnits18(wwartWithdrawableWei)).toLocaleString(undefined, {
+                      maximumFractionDigits: 6,
+                    })}
+                  </strong>
+                  {' · '}
+                  Used claim: <strong>{mintCap.claim || '0'}</strong>
                 </p>
               </div>
             ) : null}

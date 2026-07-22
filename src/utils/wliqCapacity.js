@@ -46,6 +46,42 @@ export function formatUnits18(raw, maxFrac = 8) {
 }
 
 /**
+ * Portal-deposited wWART inventory (18-dec wei).
+ * Mirrors backend: values below 1e15 are legacy spoofed E8 pollution — ignore.
+ */
+export function portalWwart18(vault) {
+  const raw = toBigIntSafe(vault?.wWART);
+  if (raw > 0n && raw < 10n ** 15n) return 0n;
+  return raw;
+}
+
+/**
+ * Withdrawable wWART on rollup = open portable claims + portal deposits.
+ * Backend withdraw_wwart uses the same sum (portable first, then portal).
+ * Deposit does NOT increase portable — it increases portal inventory only.
+ */
+export function wwartWithdrawable18(vault) {
+  const portable = toBigIntSafe(vault?.wwartPortable);
+  return portable + portalWwart18(vault);
+}
+
+/** Human string for Max / amount inputs (full precision, no trailing zeros). */
+export function formatUnits18Exact(raw) {
+  try {
+    const bn = typeof raw === 'bigint' ? raw : BigInt(raw || 0);
+    if (bn <= 0n) return '0';
+    const whole = bn / 10n ** 18n;
+    const frac = (bn % 10n ** 18n)
+      .toString()
+      .padStart(18, '0')
+      .replace(/0+$/, '');
+    return frac ? `${whole}.${frac}` : whole.toString();
+  } catch {
+    return '0';
+  }
+}
+
+/**
  * @param {object|null} vault — inspect vault payload (WalletIsland state)
  */
 /**
