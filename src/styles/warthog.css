@@ -22,15 +22,58 @@
   flex-wrap: wrap;
 }
 
-.regen-group {
-  display: flex;
-  gap: 0.5rem;
-  align-items: center;
+/*
+ * Generate | Index | Regen — single horizontal row.
+ * Beats .warthog-section input[type=number] { width: 100% } which was
+ * stretching the index field and wrapping Generate onto its own line.
+ */
+.warthog-section .subwallet-controls {
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: nowrap !important;
+  align-items: center !important;
+  gap: 0.45rem !important;
+  width: 100%;
+  box-sizing: border-box;
 }
 
-.regen-group input {
-  width: 140px;
-  padding: 0.5rem;
+.warthog-section .subwallet-controls > .btn,
+.warthog-section .subwallet-controls > button {
+  width: auto !important;
+  max-width: none !important;
+  flex: 0 0 auto !important;
+  display: inline-flex !important;
+}
+
+.warthog-section .subwallet-controls .regen-group {
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: nowrap !important;
+  align-items: center !important;
+  gap: 0.35rem !important;
+  flex: 0 0 auto !important;
+  width: auto !important;
+  max-width: none !important;
+  min-width: 0;
+}
+
+.warthog-section .subwallet-controls .regen-group input,
+.warthog-section .subwallet-controls .regen-group input.regen-input,
+.warthog-section .subwallet-controls .regen-group input[type='number'],
+.warthog-section .subwallet-controls input.regen-input {
+  width: 6.5rem !important;
+  max-width: 6.5rem !important;
+  min-width: 5.5rem !important;
+  flex: 0 0 6.5rem !important;
+  padding: 0.35rem 0.5rem !important;
+  font-size: 0.8rem !important;
+  box-sizing: border-box !important;
+}
+
+.warthog-section .subwallet-controls .regen-group .btn,
+.warthog-section .subwallet-controls .regen-group button {
+  width: auto !important;
+  flex: 0 0 auto !important;
 }
 
 .secondary-btn {
@@ -126,6 +169,44 @@
   font-size: 16px;
   transition: border-color 0.3s, box-shadow 0.3s;
   box-sizing: border-box;
+}
+
+/* Compact index field in Generate/Regen toolbar (not full-width form fields) */
+.warthog-section .subwallet-controls input[type='number'],
+.warthog-section .subwallet-controls input.regen-input {
+  width: 6.5rem !important;
+  max-width: 6.5rem !important;
+}
+
+/* Fund/exit: 3-col grid fits card — input | Max | action, no horizontal overflow */
+.warthog-section .subwallet-section .action-group.deposit-group,
+.warthog-section .subwallet-section .action-group.sweep-group {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto auto !important;
+  align-items: center !important;
+  gap: 0.3rem !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  box-sizing: border-box !important;
+}
+.warthog-section .subwallet-section .action-group.deposit-group input[type='number'],
+.warthog-section .subwallet-section .action-group.deposit-group input.amount-input,
+.warthog-section .subwallet-section .action-group.sweep-group input[type='number'],
+.warthog-section .subwallet-section .action-group.sweep-group input.amount-input {
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: 100% !important;
+  box-sizing: border-box !important;
+}
+.warthog-section .subwallet-section .action-group.deposit-group .btn,
+.warthog-section .subwallet-section .action-group.deposit-group button,
+.warthog-section .subwallet-section .action-group.sweep-group .btn,
+.warthog-section .subwallet-section .action-group.sweep-group button {
+  width: auto !important;
+  margin: 0 !important;
+  padding: 0.28rem 0.5rem !important;
+  font-size: 0.7rem !important;
+  white-space: nowrap !important;
 }
 
 .warthog-section input[type="text"]:focus,
@@ -1174,6 +1255,45 @@
   }
 }
 
+/* ⋮ menu: keep square icon button (same as ETH), not warthog full-width pills */
+.warthog-section button.sw-menu-btn {
+  width: 2rem !important;
+  height: 2rem !important;
+  min-width: 2rem !important;
+  min-height: 2rem !important;
+  max-width: 2rem !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border-radius: 8px !important;
+  border: 1px solid color-mix(in srgb, #00ffcc 32%, rgba(255, 255, 255, 0.12)) !important;
+  background: rgba(0, 0, 0, 0.3) !important;
+  color: #9af5e0 !important;
+  box-shadow: none !important;
+  transform: none !important;
+}
+.warthog-section button.sw-menu-item {
+  width: 100% !important;
+  border-radius: 7px !important;
+  padding: 0.45rem 0.6rem !important;
+  margin: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  transform: none !important;
+}
+
+/* Voucher list lives under Get wWART — never full-width buttons that squash text */
+.warthog-section .voucher-exec-card,
+.warthog-section .voucher-exec-head {
+  width: 100%;
+  min-width: 0;
+}
+.warthog-section .voucher-exec-card > button.btn,
+.warthog-section .voucher-exec-head > button.btn {
+  width: auto !important;
+  max-width: none !important;
+  flex: 0 0 auto !important;
+}
+
 /* Action pills inside Warthog shell — keep pill radius, moderate size */
 .warthog-section .btn.primary {
   padding: 0.5rem 1.15rem;
@@ -1219,6 +1339,12 @@
   margin-bottom: 0.35rem;
 }
 
+/* Sub/vault card toolbars: no bulk margins (Refresh / Open vault stay in one tight row) */
+.warthog-section .subwallet-section .sw-card-toolbar .btn.small {
+  margin-right: 0 !important;
+  margin-bottom: 0 !important;
+}
+
 .warthog-section .btn:disabled {
   background: #ccc;
   cursor: not-allowed;
@@ -1230,7 +1356,7 @@
  * Fallback for bare <button> only — never tabs (wh-app-tab / wh-auth-tab).
  * Old rule painted every non-.btn control as square yellow (Overview/Send/…).
  */
-.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):not(.login-method-tab):not(.login-wallet-row):not(.login-password-toggle):not(.login-delete-link):not(.login-test-seed):not(.bca-path):not(.bca-back):not(.bca-password-toggle):not(.bca-cta):not(.sw-link):not(.sw-meta-v):not(.sw-pill-copy):not(.wh-address-chip):not(.wh-node-gear):not(.wh-section-btn):not(.wh-section-item) {
+.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):not(.login-method-tab):not(.login-wallet-row):not(.login-password-toggle):not(.login-delete-link):not(.login-test-seed):not(.bca-path):not(.bca-back):not(.bca-password-toggle):not(.bca-cta):not(.sw-link):not(.sw-meta-v):not(.sw-pill-copy):not(.wh-address-chip):not(.wh-node-gear):not(.wh-section-btn):not(.wh-section-item):not(.sw-menu-btn):not(.sw-menu-item) {
   background: linear-gradient(135deg, #00ffcc, #00b399);
   color: #041412;
   font-family: 'Montserrat', sans-serif;
@@ -1246,14 +1372,14 @@
   box-shadow: 0 0 16px color-mix(in srgb, #00ffcc 22%, transparent);
 }
 
-.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):not(.login-method-tab):not(.login-wallet-row):not(.login-password-toggle):not(.login-delete-link):not(.login-test-seed):not(.bca-path):not(.bca-back):not(.bca-password-toggle):not(.bca-cta):not(.sw-link):not(.sw-meta-v):not(.sw-pill-copy):not(.wh-address-chip):not(.wh-node-gear):not(.wh-section-btn):not(.wh-section-item):hover {
+.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):not(.login-method-tab):not(.login-wallet-row):not(.login-password-toggle):not(.login-delete-link):not(.login-test-seed):not(.bca-path):not(.bca-back):not(.bca-password-toggle):not(.bca-cta):not(.sw-link):not(.sw-meta-v):not(.sw-pill-copy):not(.wh-address-chip):not(.wh-node-gear):not(.wh-section-btn):not(.wh-section-item):not(.sw-menu-btn):not(.sw-menu-item):hover {
   transform: translateY(-1px);
   box-shadow: 0 8px 22px color-mix(in srgb, #00ffcc 35%, transparent);
   background: linear-gradient(135deg, #00ffcc, #00b399);
   color: #041412;
 }
 
-.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):not(.login-method-tab):not(.login-wallet-row):not(.login-password-toggle):not(.login-delete-link):not(.login-test-seed):not(.bca-path):not(.bca-back):not(.bca-password-toggle):not(.bca-cta):not(.sw-link):not(.sw-meta-v):not(.sw-pill-copy):not(.wh-address-chip):not(.wh-node-gear):not(.wh-section-btn):not(.wh-section-item):disabled {
+.warthog-section button:not(.btn):not(.wh-app-tab):not(.wh-auth-tab):not(.login-method-tab):not(.login-wallet-row):not(.login-password-toggle):not(.login-delete-link):not(.login-test-seed):not(.bca-path):not(.bca-back):not(.bca-password-toggle):not(.bca-cta):not(.sw-link):not(.sw-meta-v):not(.sw-pill-copy):not(.wh-address-chip):not(.wh-node-gear):not(.wh-section-btn):not(.wh-section-item):not(.sw-menu-btn):not(.sw-menu-item):disabled {
   background: #555;
   color: #aaa;
   cursor: not-allowed;
@@ -1436,11 +1562,34 @@
     padding: 8px;
   }
 
-  .warthog-section button:not(.wh-app-tab):not(.wh-auth-tab):not(.login-method-tab):not(.login-wallet-row):not(.login-password-toggle):not(.login-delete-link):not(.login-test-seed):not(.bca-path):not(.bca-back):not(.bca-password-toggle):not(.bca-cta):not(.login-primary-cta):not(.sw-link):not(.sw-meta-v):not(.sw-pill-copy):not(.wh-address-chip):not(.wh-node-gear):not(.wh-section-btn):not(.wh-section-item) {
+  .warthog-section button:not(.wh-app-tab):not(.wh-auth-tab):not(.login-method-tab):not(.login-wallet-row):not(.login-password-toggle):not(.login-delete-link):not(.login-test-seed):not(.bca-path):not(.bca-back):not(.bca-password-toggle):not(.bca-cta):not(.login-primary-cta):not(.sw-link):not(.sw-meta-v):not(.sw-pill-copy):not(.wh-address-chip):not(.wh-node-gear):not(.wh-section-btn):not(.wh-section-item):not(.sw-menu-btn):not(.sw-menu-item) {
     width: 100%;
     margin-right: 0;
     padding: 12px;
     font-size: 14px;
+  }
+
+  /* Keep Generate | Index | Regen on one row on small screens */
+  .warthog-section .subwallet-controls {
+    flex-wrap: nowrap !important;
+  }
+  .warthog-section .subwallet-controls > .btn,
+  .warthog-section .subwallet-controls > button,
+  .warthog-section .subwallet-controls .regen-group .btn,
+  .warthog-section .subwallet-controls .regen-group button {
+    width: auto !important;
+    max-width: none !important;
+    flex: 0 0 auto !important;
+    padding: 0.35rem 0.75rem !important;
+    font-size: 0.78rem !important;
+  }
+  .warthog-section .subwallet-controls input[type='number'],
+  .warthog-section .subwallet-controls input.regen-input {
+    width: 5.5rem !important;
+    max-width: 5.5rem !important;
+    flex: 0 0 5.5rem !important;
+    padding: 0.3rem 0.4rem !important;
+    font-size: 0.78rem !important;
   }
 
   .warthog-section button.wh-node-gear,

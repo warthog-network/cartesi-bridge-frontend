@@ -8,10 +8,21 @@
 
 import { secp256k1 } from '@noble/curves/secp256k1';
 import { generateRandomKeys, PublicKey, PrivateKey } from 'paillier-bigint';
-import { sha256, ripemd160, getBytes, hexlify, concat, toUtf8Bytes } from 'ethers-v6';
+import {
+  sha256,
+  ripemd160,
+  getBytes,
+  hexlify,
+  concat,
+  toUtf8Bytes,
+  computeAddress,
+  SigningKey,
+} from 'ethers-v6';
 import CryptoJS from 'crypto-js';
 
 export const MULTISIG_SCHEME = 'wart-2p-ecdsa-lindell-v1';
+/** Same 2P-ECDSA keygen; address is Ethereum (keccak) not Warthog. */
+export const MULTISIG_SCHEME_ETH = 'eth-2p-ecdsa-lindell-v1';
 
 export const CURVE_N = secp256k1.CURVE.n;
 const G = secp256k1.ProjectivePoint.BASE;
@@ -85,6 +96,17 @@ export function addressFromPubCompressedHex(pubHex) {
   const ripe = getBytes(ripemd160(sha));
   const checksum = getBytes(sha256(ripe)).slice(0, 4);
   return hexlify(concat([ripe, checksum])).slice(2);
+}
+
+/**
+ * Ethereum address from compressed secp256k1 pubkey (same Q as Warthog 2P vault).
+ * @returns {string} 0x-prefixed checksummed or lowercase address
+ */
+export function ethAddressFromPubCompressedHex(pubHex) {
+  const compressed = '0x' + String(pubHex).replace(/^0x/i, '');
+  // ethers accepts compressed pubkey for computeAddress via SigningKey
+  const uncompressed = SigningKey.computePublicKey(compressed, false);
+  return computeAddress(uncompressed);
 }
 
 function hashToScalar(hashHex) {
@@ -222,16 +244,29 @@ export function isAesGcmClientSecretBlob(encHex) {
 }
 
 /**
- * Keygen: additive shares + Paillier Enc(d_user) for cosigner.
- * Public key Q = d_user·G + d_dapp·G — full scalar d is NEVER formed.
+ * Shared 2P keygen core. `chain: 'wart' | 'eth'` selects address encoding only.
+ * Full scalar d is NEVER formed.
  */
-export async function createTwoPartyVault({ subAddress, index, owner } = {}) {
+async function createTwoPartyVaultCore({
+  subAddress,
+  index,
+  owner,
+  chain = 'wart',
+} = {}) {
   const dUser = randomScalar();
   const dDapp = randomScalar();
-  // Homomorphic aggregate pubkey — no d = dUser+dDapp scalar
   const Q = G.multiply(dUser).add(G.multiply(dDapp));
   const pubHex = pointToCompressedHex(Q);
-  const address = addressFromPubCompressedHex(pubHex);
+  const scheme = chain === 'eth' ? MULTISIG_SCHEME_ETH : MULTISIG_SCHEME;
+  const address =
+    chain === 'eth'
+      ? ethAddressFromPubCompressedHex(pubHex)
+      : addressFromPubCompressedHex(pubHex);
+  // Cosigner stores bare hex for both; keep 0x for ETH display consistency
+  const vaultAddressForCosigner =
+    chain === 'eth'
+      ? String(address).replace(/^0x/i, '').toLowerCase()
+      : String(address).replace(/^0x/i, '').toLowerCase();
 
   const envBits =
     typeof process !== 'undefined' && process.env?.PAILLIER_BITS
@@ -242,29 +277,36 @@ export async function createTwoPartyVault({ subAddress, index, owner } = {}) {
   const { publicKey, privateKey } = await generateRandomKeys(bits);
   const ckey = publicKey.encrypt(dUser);
 
-  const vault = {
-    scheme: MULTISIG_SCHEME,
-    address,
+  const displayAddress =
+    chain === 'eth'
+      ? (String(address).startsWith('0x') ? address : `0x${address}`).toLowerCase()
+      : vaultAddressForCosigner;
+
+  return {
+    scheme,
+    chain,
+    address: displayAddress,
     publicKey: pubHex,
     cosignerRegister: {
-      vaultAddress: address,
+      vaultAddress: vaultAddressForCosigner,
       dappShareHex: scalarToHex(dDapp),
       paillierN: publicKey.n.toString(),
       paillierG: publicKey.g.toString(),
       ckey: ckey.toString(),
       publicKey: pubHex,
-      scheme: MULTISIG_SCHEME,
+      scheme,
+      chain,
     },
     clientSecret: {
-      // d_user only — never d_dapp / never full d
       userShareHex: scalarToHex(dUser),
       paillierLambda: privateKey.lambda.toString(),
       paillierMu: privateKey.mu.toString(),
       paillierN: publicKey.n.toString(),
       paillierG: publicKey.g.toString(),
       publicKey: pubHex,
-      address,
-      scheme: MULTISIG_SCHEME,
+      address: displayAddress,
+      scheme,
+      chain,
       paillierBits: bits,
     },
     subAddress: subAddress
@@ -274,13 +316,35 @@ export async function createTwoPartyVault({ subAddress, index, owner } = {}) {
     owner: owner ? String(owner).toLowerCase() : null,
     createdAt: Date.now(),
   };
-  return vault;
 }
 
-function storageKey(mainAddress, subAddress) {
+/**
+ * Keygen: additive shares + Paillier Enc(d_user) for cosigner.
+ * Public key Q = d_user·G + d_dapp·G — full scalar d is NEVER formed.
+ * Warthog vault address (RIPEMD160+checksum).
+ */
+export async function createTwoPartyVault({ subAddress, index, owner } = {}) {
+  return createTwoPartyVaultCore({ subAddress, index, owner, chain: 'wart' });
+}
+
+/**
+ * Cosigner ETH vault — same 2P material, Ethereum address from Q.
+ * Fundable with native ETH; cosign ETH withdraw is a later step.
+ */
+export async function createTwoPartyEthVault({
+  subAddress,
+  index,
+  owner,
+} = {}) {
+  return createTwoPartyVaultCore({ subAddress, index, owner, chain: 'eth' });
+}
+
+function storageKey(mainAddress, subAddress, chain = 'wart') {
   const m = String(mainAddress || 'anon').replace(/^0x/i, '').toLowerCase();
   const s = String(subAddress || '').replace(/^0x/i, '').toLowerCase();
-  return `${USER_STORE_PREFIX}${m}:${s}`;
+  const prefix =
+    chain === 'eth' ? `${USER_STORE_PREFIX}eth:` : USER_STORE_PREFIX;
+  return `${prefix}${m}:${s}`;
 }
 
 /**
@@ -297,19 +361,34 @@ export function saveTwoPartyClientLocal({
   /** @deprecated ignored — cosigner half must not live in the browser */
   encryptedCosignerBackup: _ignoredCosignerBackup = null,
   scheme = MULTISIG_SCHEME,
+  chain = scheme === MULTISIG_SCHEME_ETH ? 'eth' : 'wart',
 }) {
   if (typeof localStorage === 'undefined') return;
+  const bareVault = String(vaultAddress).replace(/^0x/i, '').toLowerCase();
   localStorage.setItem(
-    storageKey(mainAddress, subAddress),
+    storageKey(mainAddress, subAddress, chain),
     JSON.stringify({
-      vaultAddress: String(vaultAddress).replace(/^0x/i, '').toLowerCase(),
+      vaultAddress: chain === 'eth' ? `0x${bareVault}` : bareVault,
       subAddress: String(subAddress).replace(/^0x/i, '').toLowerCase(),
       index: Number(index),
       encryptedClientSecret,
       scheme,
+      chain,
       savedAt: Date.now(),
     }),
   );
+}
+
+/** Load ETH cosigner vault user-half record for an ETH sub address. */
+export function loadTwoPartyEthClientLocal(mainAddress, subAddress) {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(storageKey(mainAddress, subAddress, 'eth'));
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 }
 
 /**

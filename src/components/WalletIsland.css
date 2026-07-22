@@ -14,9 +14,269 @@
   padding-top: 0.25rem;
 }
 
-.wi-stat-grid--focus {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+/* MetaMask helpers inside middle L1 card (Add network / Import token) */
+.wi-header .wi-l1-meta-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  width: 100%;
+  margin-top: 0.15rem;
+  padding-top: 0.55rem;
+  border-top: 1px solid color-mix(in srgb, #fdb913 22%, rgba(255, 255, 255, 0.08));
 }
+.wi-header .wi-l1-meta-actions .wi-token-copy {
+  margin-top: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* ETH section — one card shell like .warthog-section (blue accents) */
+.eth-section {
+  margin-top: 1.25rem;
+  background-color: color-mix(in srgb, #0a0a0a 92%, transparent);
+  backdrop-filter: blur(15px);
+  padding: 1rem 1.1rem 1.15rem;
+  border-radius: 16px;
+  border: 1px solid color-mix(in srgb, #3b82f6 48%, #333);
+  box-shadow: 0 4px 14px -2px rgba(37, 99, 235, 0.22);
+  color: #fff;
+  font-family: 'Roboto', 'Inter', sans-serif;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+/* Title row mirrors .warthog-section .wh-title-row */
+.eth-section .eth-title-row {
+  text-align: center;
+  margin-bottom: 1.25rem;
+}
+.eth-section .eth-title-row h2 {
+  font-family: 'Montserrat', sans-serif;
+  font-size: 1.8rem;
+  color: #60a5fa;
+  text-shadow: 2px 1px 0px #1e3a5f;
+  text-align: center;
+  margin: 0 0 0.25rem;
+}
+.eth-section .eth-subtitle {
+  color: #94a3b8;
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+/* Header inside eth-section (like .wh-header inside warthog-section) */
+.eth-section-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  margin-bottom: 0.75rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 14px;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, #3b82f6 14%, #0a0a0a),
+    color-mix(in srgb, #22d3ee 10%, #0a0a0a)
+  );
+  border: 1px solid color-mix(in srgb, #3b82f6 38%, rgba(255, 255, 255, 0.1));
+  text-align: left;
+}
+.eth-section-header-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+.eth-section-header-left {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.25rem;
+  min-width: 0;
+  flex: 1 1 8rem;
+}
+.eth-section-header-icons {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 0.35rem;
+  flex: 0 0 auto;
+  z-index: 6;
+}
+.eth-section-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  padding-top: 0.45rem;
+  border-top: 1px solid color-mix(in srgb, #3b82f6 18%, rgba(255, 255, 255, 0.08));
+}
+.eth-section-bar {
+  display: flex;
+  align-items: center;
+  margin: 0 0 0.55rem;
+  min-height: 0;
+}
+.eth-section-bar-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, #60a5fa 75%, #aaa);
+}
+
+/* Section grid menu — mirrors Warthog .wh-section-menu (blue accents) */
+.eth-section-menu {
+  position: relative;
+  flex: 0 0 auto;
+  z-index: 6;
+}
+.eth-section-dropdown {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  width: min(12.5rem, calc(100vw - 2rem));
+  padding: 0.4rem 0.35rem 0.4rem;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, #3b82f6 35%, #333);
+  background: linear-gradient(
+    160deg,
+    color-mix(in srgb, #0a0a0a 94%, #3b82f6),
+    #0a0a0a 55%
+  );
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  z-index: 25;
+}
+.eth-section-menu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.15rem 0.45rem 0.35rem;
+  margin-bottom: 0.1rem;
+  border-bottom: 1px solid color-mix(in srgb, #3b82f6 22%, transparent);
+}
+.eth-section-menu-title {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #94a3b8;
+}
+.eth-section-current {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #60a5fa;
+  opacity: 0.95;
+}
+button.eth-section-item {
+  display: flex !important;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100% !important;
+  margin: 0 !important;
+  padding: 0.4rem 0.55rem !important;
+  border-radius: 6px !important;
+  border: 1px solid transparent !important;
+  background: transparent !important;
+  color: #e8e8e8 !important;
+  font-size: 0.82rem !important;
+  font-weight: 600 !important;
+  text-align: left !important;
+  cursor: pointer;
+  box-shadow: none !important;
+  transform: none !important;
+  min-height: 0 !important;
+}
+button.eth-section-item:hover:not(:disabled) {
+  background: color-mix(in srgb, #3b82f6 14%, transparent) !important;
+  border-color: color-mix(in srgb, #3b82f6 30%, transparent) !important;
+  color: #fff !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+button.eth-section-item.is-active {
+  background: color-mix(in srgb, #3b82f6 18%, rgba(0, 0, 0, 0.35)) !important;
+  border-color: color-mix(in srgb, #3b82f6 42%, transparent) !important;
+  color: #bfdbfe !important;
+}
+button.eth-section-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.eth-section-check {
+  color: #60a5fa;
+  font-size: 0.75rem;
+}
+button.eth-section-btn.is-open {
+  border-color: color-mix(in srgb, #3b82f6 60%, transparent) !important;
+  background: color-mix(in srgb, #3b82f6 16%, rgba(0, 0, 0, 0.45)) !important;
+  color: #93c5fd !important;
+}
+/* Blue active tabs inside eth-section */
+.eth-section .sw-action-tab.is-active {
+  background: linear-gradient(135deg, #60a5fa, #2563eb) !important;
+  color: #041018 !important;
+  border-color: transparent !important;
+  box-shadow: 0 0 12px color-mix(in srgb, #3b82f6 30%, transparent) !important;
+}
+.eth-section .sw-action-tab:hover:not(.is-active) {
+  border-color: color-mix(in srgb, #3b82f6 40%, #555);
+  color: #93c5fd;
+}
+/* Nested eth bridge content sits flush in the section */
+.eth-section .eth-subwallet-section {
+  margin-top: 0.25rem;
+}
+.eth-section .wi-panel {
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
+/* ETH Balances across layers (toggleable) */
+.eth-section .eth-layers-card {
+  margin: 0 0 0.75rem;
+  border-color: color-mix(in srgb, #3b82f6 28%, #333);
+  background: color-mix(in srgb, #3b82f6 6%, rgba(0, 0, 0, 0.28));
+}
+.eth-section .eth-layers-card .sw-card-title {
+  color: #93c5fd;
+}
+.eth-section .eth-layers-card .sw-meta-k {
+  color: #94a3b8;
+}
+.eth-section .eth-layers-card .sw-meta-v {
+  color: #e8f4ff;
+}
+.eth-section .eth-layers-card .sw-l1-track-hint {
+  color: #94a3b8;
+}
+.eth-section .eth-layers-card .sw-card-head-right {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.28rem;
+  align-items: center;
+}
+.eth-section .eth-layers-card button.sw-icon-btn {
+  border-color: color-mix(in srgb, #3b82f6 40%, #555) !important;
+  background: color-mix(in srgb, #3b82f6 12%, #1a1a1a) !important;
+  color: #93c5fd !important;
+}
+.eth-section .eth-layers-card button.sw-icon-btn:hover:not(:disabled) {
+  border-color: #60a5fa !important;
+  color: #fff !important;
+  background: color-mix(in srgb, #3b82f6 20%, #1a1a1a) !important;
+}
+
+/* Defined early for reference — real 2×2 rule lives after .wi-stat-grid (specificity) */
 
 .wi-stat-hint {
   display: block;
@@ -200,7 +460,140 @@
   color: #666;
 }
 
-/* ── Header ── */
+/* ── L1 ETH wallet card (always-visible MetaMask card) ── */
+.eth-main-header,
+.wi-eth-wallet-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  margin: 0 0 0.75rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 14px;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, #3b82f6 16%, #0a0a0a),
+    color-mix(in srgb, #22d3ee 10%, #0a0a0a)
+  );
+  border: 1px solid color-mix(in srgb, #3b82f6 42%, rgba(255, 255, 255, 0.12));
+  text-align: left;
+}
+.eth-main-header-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+.eth-main-header-left {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.3rem;
+  min-width: 0;
+  flex: 1 1 8rem;
+}
+.eth-balance-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+.eth-balance-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, #93c5fd 80%, #fff);
+  opacity: 0.9;
+}
+.eth-balance-value {
+  font-size: 1.45rem;
+  font-weight: 800;
+  line-height: 1.15;
+  color: #e8f4ff;
+  letter-spacing: -0.02em;
+}
+.eth-balance-hint {
+  font-size: 0.7rem;
+  opacity: 0.65;
+  color: #b8d4ff;
+}
+.eth-main-connected {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+.eth-conn-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, #3b82f6 40%, rgba(255, 255, 255, 0.12));
+  background: rgba(0, 0, 0, 0.32);
+  color: #93c5fd;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.eth-conn-chip--wart {
+  border-color: color-mix(in srgb, #fdb913 40%, rgba(255, 255, 255, 0.12));
+  color: #ffe08a;
+}
+.eth-conn-chip--wart.is-empty {
+  opacity: 0.55;
+  border-style: dashed;
+}
+.eth-conn-chip:hover {
+  filter: brightness(1.1);
+}
+.eth-conn-tag {
+  font-size: 0.6rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  margin-right: 0.3rem;
+}
+.eth-main-header-icons {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 0.35rem;
+  flex: 0 0 auto;
+}
+button.eth-section-btn {
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  width: 2rem !important;
+  height: 2rem !important;
+  min-width: 2rem !important;
+  min-height: 2rem !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border-radius: 8px !important;
+  border: 1px solid color-mix(in srgb, #3b82f6 40%, rgba(255, 255, 255, 0.12)) !important;
+  background: rgba(0, 0, 0, 0.4) !important;
+  color: #60a5fa !important;
+  cursor: pointer;
+}
+button.eth-section-btn:hover {
+  border-color: color-mix(in srgb, #3b82f6 60%, transparent) !important;
+  background: color-mix(in srgb, #3b82f6 16%, rgba(0, 0, 0, 0.45)) !important;
+  color: #93c5fd !important;
+}
+.eth-main-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.15rem;
+  padding-top: 0.55rem;
+  border-top: 1px solid color-mix(in srgb, #3b82f6 22%, rgba(255, 255, 255, 0.08));
+}
+
+/* ── Header (legacy) ── */
 .wi-header {
   display: flex;
   flex-direction: column;
@@ -228,6 +621,51 @@
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
+  flex: 0 0 auto;
+}
+
+/* Center: connected ETH + WART addresses */
+.wi-header-connected {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.wi-addr-tag {
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  margin-right: 0.3rem;
+  opacity: 0.9;
+}
+
+.wi-address-chip--eth {
+  border-color: color-mix(in srgb, #3b82f6 45%, rgba(255, 255, 255, 0.12));
+  color: #93c5fd;
+}
+
+.wi-address-chip--eth:hover {
+  border-color: #60a5fa;
+  color: #dbeafe;
+}
+
+.wi-address-chip--wart {
+  border-color: color-mix(in srgb, #fdb913 40%, rgba(255, 255, 255, 0.12));
+  color: #ffe08a;
+}
+
+.wi-address-chip--wart:hover {
+  border-color: #fdb913;
+  color: #fff4c8;
+}
+
+.wi-address-chip--wart.is-empty {
+  opacity: 0.55;
+  border-style: dashed;
 }
 
 .wi-header-label {
@@ -331,6 +769,29 @@
   gap: 0.45rem;
 }
 
+/* Force 2×2 (Available | Used / Capacity | Main) — must beat auto-fit above */
+.wi-stat-grid.wi-stat-grid--focus {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem;
+}
+
+.eth-section .wi-stat-grid.wi-stat-grid--focus {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.eth-section .wi-stat--liquid {
+  border-color: color-mix(in srgb, #3b82f6 45%, #333);
+}
+
+.eth-section .wi-stat--liquid .wi-stat-icon {
+  color: #60a5fa;
+}
+
+.eth-section .wi-stat--spoof {
+  border-color: color-mix(in srgb, #22d3ee 40%, #333);
+}
+
 .wi-stat {
   background: rgba(0, 0, 0, 0.32);
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -340,6 +801,7 @@
   flex-direction: column;
   gap: 0.15rem;
   min-height: 3.4rem;
+  min-width: 0;
 }
 
 .wi-stat--liquid {
@@ -625,9 +1087,40 @@
   padding: 0.3rem 0.45rem;
   font-size: 0.74rem;
 }
+/* Density only — do not force narrow widths (squashes text to 1-letter columns) */
 .voucher-exec-card {
   border-radius: 8px !important;
-  padding: 0.45rem 0.55rem !important;
+  padding: 0.55rem 0.65rem !important;
 }
 .voucher-exec-title { font-size: 0.88rem !important; }
-.voucher-exec-sub { font-size: 0.72rem !important; }
+.voucher-exec-sub {
+  font-size: 0.72rem !important;
+  white-space: normal !important;
+  word-break: normal !important;
+  overflow-wrap: break-word !important;
+}
+.warthog-section .voucher-exec,
+.warthog-section .voucher-exec-list,
+.warthog-section .voucher-exec-card,
+.warthog-section .voucher-exec-card-main {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  box-sizing: border-box !important;
+}
+.warthog-section .voucher-exec-card > .btn,
+.warthog-section .voucher-exec-head > .btn {
+  width: auto !important;
+  max-width: none !important;
+  flex: 0 0 auto !important;
+}
+.warthog-section .voucher-exec-meta,
+.warthog-section .voucher-exec-card-title,
+.warthog-section .voucher-json {
+  white-space: normal !important;
+  word-break: normal !important;
+  overflow-wrap: break-word !important;
+}
+.warthog-section .voucher-json {
+  word-break: break-word !important;
+}

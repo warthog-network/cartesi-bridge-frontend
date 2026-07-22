@@ -1,8 +1,9 @@
 /**
  * Mirror cartesi-bridge-backend backingCapacity18 / shareClaimed18.
  *
- * Capacity (shared by WLIQ + wWART claims):
- *   spoofedOutstandingE8 * 1e10  + CTSI + ethWei + usdc*1e12
+ * Capacity (WART-backed only — shared by WLIQ + wWART claims):
+ *   spoofedOutstandingE8 * 1e10
+ * Portal ETH / CTSI / USDC are separate balances, not mint capacity.
  * Claimed:
  *   liquid + l1WwartClaim
  * Available:
@@ -173,13 +174,9 @@ export function computeWliqMintAvailable(vault) {
     }
 
     const spoofedE8 = toBigIntSafe(vault.outstandingE8);
-    const CTSI = toBigIntSafe(vault.CTSI);
-    const usdc = toBigIntSafe(vault.usdc);
-    const ethWei = toBigIntSafe(vault.eth);
 
-    // Capacity from locked spoofed WART + L1 portals (not raw wWART field)
-    const capacity18 =
-      spoofedE8 * 10n ** 10n + CTSI + ethWei + usdc * 10n ** 12n;
+    // Capacity from locked spoofed WART only (not portal ETH/CTSI/USDC)
+    const capacity18 = spoofedE8 * 10n ** 10n;
 
     const liquid18 = toBigIntSafe(vault.liquid);
     const claim18 = toBigIntSafe(vault.l1WwartClaim);

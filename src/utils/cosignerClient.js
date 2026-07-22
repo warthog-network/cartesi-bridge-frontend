@@ -45,12 +45,15 @@ export async function multiSigSignPartial({
   R1Hex,
   hashHex,
   amountE8 = null,
+  amountWei = null,
   force = false,
   toAddress = null,
   feeE8 = null,
   pinHash = null,
   pinHeight = null,
   nonceId = null,
+  /** 'eth' = skip Warthog preimage; sign EIP-1559 unsignedHash */
+  chain = null,
 }) {
   return cosignerFetch({
     method: 'POST',
@@ -62,11 +65,13 @@ export async function multiSigSignPartial({
       R1Hex,
       hashHex,
       ...(amountE8 != null ? { amountE8: String(amountE8) } : {}),
+      ...(amountWei != null ? { amountWei: String(amountWei) } : {}),
       ...(toAddress != null ? { toAddress: String(toAddress) } : {}),
       ...(feeE8 != null ? { feeE8: String(feeE8) } : {}),
       ...(pinHash != null ? { pinHash: String(pinHash) } : {}),
       ...(pinHeight != null ? { pinHeight: Number(pinHeight) } : {}),
       ...(nonceId != null ? { nonceId: Number(nonceId) } : {}),
+      ...(chain != null ? { chain: String(chain) } : {}),
       force,
     },
   });

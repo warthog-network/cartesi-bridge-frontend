@@ -4,13 +4,15 @@
 // README: This is the main component for the WalletIsland DApp, handling connection to MetaMask, vault management, deposits/withdrawals for backing assets, and toggling the Warthog native wallet section. It integrates Cartesi rollup interactions via portals and inputs. The Warthog section is conditionally rendered via a toggle, and it passes necessary props like the 'send' function for relaying proofs to the extracted WarthogWallet component.
 import './WalletIsland.css'; // Added external styles for modern, concise CSS
 
-import { useState, useEffect } from 'react';
-import { Wallet, Coins, RefreshCw } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Wallet, Coins, RefreshCw, LayoutGrid, Eye, EyeOff } from 'lucide-react';
 import { Toaster, toast } from 'react-hot-toast';
 import { ethers, toUtf8String, getBytes } from 'ethers-v6';
 import WarthogWallet from './WarthogWallet'; // Added import for WarthogWallet component
+import EthSubWallets from './EthSubWallets.jsx';
 import VoucherExecutor from './VoucherExecutor.jsx';
 import AnvilTestKeys from './AnvilTestKeys.jsx';
+import { useMmTxConfirm } from './MmTxConfirm.jsx';
 import '../styles/global.css'; // Assuming global styles (including new Warthog CSS) in Astro
 import '../styles/warthog.css';
 import {
@@ -40,6 +42,11 @@ import {
   fetchClaimsFromApi,
   claimsFromGraphQLNotices,
 } from '../utils/vaultStateCache.js';
+import {
+  describeRollupInput,
+  describePortalDeposit,
+  describeErc20Approve,
+} from '../utils/mmTxDescribe.js';
 
 // Active network address book (Anvil default; Sepolia when PUBLIC_NETWORK=sepolia)
 const ACTIVE_NETWORK = getNetwork();
@@ -79,6 +86,7 @@ const ERC20_ABI = [
 ];
 
 export default function WalletIsland() {
+  const [confirmMmTx, mmTxModal] = useMmTxConfirm();
   // STATES FROM ORIGINAL WalletIsland
   const [address, setAddress] = useState('');
   const [connected, setConnected] = useState(false);
@@ -99,9 +107,25 @@ export default function WalletIsland() {
 
   // NEW: Toggle for Warthog section (to keep UI optional in Astro island)
   const [showWarthog, setShowWarthog] = useState(true);
+  /** Collapse L1 tabs/panels under the ETH wallet card */
+  const [showEthWallet, setShowEthWallet] = useState(true);
+  /** MetaMask native ETH balance (human string) */
+  const [mainEthBal, setMainEthBal] = useState(null);
   const [rollupOnline, setRollupOnline] = useState(null);
-  /** L1 Cartesi panel tabs — mirrors Warthog Overview/Send pill pattern */
-  const [l1Tab, setL1Tab] = useState('home'); // home | claim | more
+  /**
+   * ETH section tabs — mirrors Warthog section menu:
+   * overview | subwallets | vault | getwweth
+   */
+  const [l1Tab, setL1Tab] = useState('overview');
+  const [showEthSectionMenu, setShowEthSectionMenu] = useState(false);
+  /** Toggle Balances across layers card under ETH wallet header */
+  const [showEthLayersCard, setShowEthLayersCard] = useState(true);
+  const ethSectionMenuRef = useRef(null);
+  /** Local Get wWETH burn amount */
+  const [burnWethAmt, setBurnWethAmt] = useState('');
+  const [mintWethAmt, setMintWethAmt] = useState('');
+  /** Warthog session (mnemonic) for ETH bridge sub-wallet derivation */
+  const [wartSession, setWartSession] = useState(null);
   /** true if UI is showing cached claims because inspect was empty */
   const [vaultFromCache, setVaultFromCache] = useState(false);
   /** Live MetaMask ERC-20 wWART balance (human units string) */
@@ -352,14 +376,30 @@ export default function WalletIsland() {
     }
   };
 
+  const refreshMainEth = async (addr) => {
+    try {
+      if (!window.ethereum || !addr) {
+        setMainEthBal(null);
+        return;
+      }
+      const browser = new ethers.BrowserProvider(window.ethereum);
+      const bal = await browser.getBalance(addr);
+      setMainEthBal(ethers.formatEther(bal));
+    } catch {
+      setMainEthBal(null);
+    }
+  };
+
   useEffect(() => {
     if (connected && address) {
       hydrateVaultPreferApi(address);
       refreshVault(address);
       refreshMmWwart(address);
+      refreshMainEth(address);
       const interval = setInterval(() => {
         refreshVault(address);
         refreshMmWwart(address);
+        refreshMainEth(address);
       }, 12000);
       return () => clearInterval(interval);
     }
@@ -561,10 +601,34 @@ export default function WalletIsland() {
       usdc: '0',
     });
     setSpoofedWwart({ history: [], burnHistory: [], total: '0', totalBurned: '0' });
-    setL1Tab('home');
+    setL1Tab('overview');
+    setBurnWethAmt('');
+    setMintWethAmt('');
     setWithdrawWwartAmt('');
     setWwartDepositAmt('');
   };
+
+  // Close ETH section menu on outside click / Escape
+  useEffect(() => {
+    if (!showEthSectionMenu) return undefined;
+    const onDoc = (e) => {
+      if (
+        ethSectionMenuRef.current &&
+        !ethSectionMenuRef.current.contains(e.target)
+      ) {
+        setShowEthSectionMenu(false);
+      }
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') setShowEthSectionMenu(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [showEthSectionMenu]);
 
   /**
    * Disconnect: leave the site session. Tries MetaMask wallet_revokePermissions
@@ -906,13 +970,22 @@ export default function WalletIsland() {
     }
   };
 
-  const send = async (payload, { successMessage = null } = {}) => {
+  const send = async (payload, { successMessage = null, skipConfirm = false } = {}) => {
     if (!signer) {
       toast.error("Wallet not connected!");
       throw new Error("Wallet not connected!");
     }
     try {
+      if (!skipConfirm) {
+        const desc = describeRollupInput(payload, { dappAddress: DAPP_ADDRESS });
+        const ok = await confirmMmTx(desc);
+        if (!ok) {
+          toast('Cancelled — nothing sent to MetaMask');
+          throw new Error('User rejected transaction preview');
+        }
+      }
       setLoading(true);
+      // UTF-8 JSON bytes — MetaMask may offer a UTF-8 view of the `input` param
       const message = JSON.stringify(payload);
       const payloadBytes = new TextEncoder().encode(message);
       const inputBox = new ethers.Contract(INPUT_BOX_ADDRESS, INPUT_BOX_ABI, signer);
@@ -928,7 +1001,13 @@ export default function WalletIsland() {
       setTimeout(() => refreshVault(address), 8000);
       return receipt;
     } catch (err) {
-      toast.error(`Failed: ${err.message || err}`);
+      const msg = err?.message || String(err);
+      if (/user rejected|cancelled|canceled/i.test(msg)) {
+        // already toasted or silent cancel
+        if (!/preview/i.test(msg)) toast.error(`Failed: ${msg}`);
+      } else {
+        toast.error(`Failed: ${msg}`);
+      }
       console.error(err);
       throw err; // Re-throw to propagate to callers
     } finally {
@@ -995,8 +1074,21 @@ export default function WalletIsland() {
   const depositEth = async () => {
     if (!ethDepositAmt || !signer) return;
     try {
-      setLoading(true);
       const amountWei = ethers.parseEther(ethDepositAmt);
+      const ok = await confirmMmTx(
+        describePortalDeposit({
+          kind: 'eth',
+          amount: amountWei,
+          amountHuman: ethDepositAmt,
+          dappAddress: DAPP_ADDRESS,
+          portalAddress: ETHER_PORTAL_ADDRESS,
+        }),
+      );
+      if (!ok) {
+        toast('Cancelled — nothing sent to MetaMask');
+        return;
+      }
+      setLoading(true);
       const portal = new ethers.Contract(ETHER_PORTAL_ADDRESS, ETHER_PORTAL_ABI, signer);
       const tx = await portal.depositEther(DAPP_ADDRESS, "0x", { value: amountWei, gasLimit: 200000 });
       await tx.wait();
@@ -1049,16 +1141,58 @@ export default function WalletIsland() {
   const depositErc20 = async (tokenAddress, amountStr, decimals, opts = {}) => {
     if (!amountStr || !signer) return;
     try {
-      setLoading(true);
       const amount = ethers.parseUnits(amountStr, decimals);
+      const tokenSym =
+        opts.tokenSymbol ||
+        (String(tokenAddress).toLowerCase() === String(WWART_ADDRESS).toLowerCase()
+          ? 'wWART'
+          : String(tokenAddress).toLowerCase() === String(CTSI_ADDRESS).toLowerCase()
+            ? 'CTSI'
+            : String(tokenAddress).toLowerCase() === String(USDC_ADDRESS).toLowerCase()
+              ? 'USDC'
+              : 'ERC-20');
+
       const token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
       // ethers-v6 returns bigint — never use BigNumber .lt()
       const allowance = await token.allowance(address, ERC20_PORTAL_ADDRESS);
       if (allowance < amount) {
+        const okApprove = await confirmMmTx(
+          describeErc20Approve({
+            tokenSymbol: tokenSym,
+            tokenAddress,
+            spender: ERC20_PORTAL_ADDRESS,
+            amount,
+            amountHuman: amountStr,
+          }),
+        );
+        if (!okApprove) {
+          toast('Cancelled — nothing sent to MetaMask');
+          return;
+        }
+        setLoading(true);
         const txApprove = await token.approve(ERC20_PORTAL_ADDRESS, amount, { gasLimit: 100000 });
         await txApprove.wait();
         toast.success('Approved!');
+        setLoading(false);
       }
+
+      const okDeposit = await confirmMmTx(
+        describePortalDeposit({
+          kind: 'erc20',
+          tokenSymbol: tokenSym,
+          tokenAddress,
+          amount,
+          amountHuman: amountStr,
+          dappAddress: DAPP_ADDRESS,
+          portalAddress: ERC20_PORTAL_ADDRESS,
+        }),
+      );
+      if (!okDeposit) {
+        toast('Cancelled — nothing sent to MetaMask');
+        return;
+      }
+
+      setLoading(true);
       const portal = new ethers.Contract(ERC20_PORTAL_ADDRESS, ERC20_PORTAL_ABI, signer);
       const tx = await portal.depositERC20Tokens(tokenAddress, DAPP_ADDRESS, amount, "0x", { gasLimit: 200000 });
       await tx.wait();
@@ -1176,11 +1310,77 @@ export default function WalletIsland() {
     }
   })();
 
-  const L1_TABS = [
-    { id: 'home', label: 'Overview' },
-    { id: 'claim', label: 'Get wWART' },
-    { id: 'more', label: 'More' },
+  /** ETH wallet section menu — same shape as Warthog APP_TABS dropdown */
+  const ETH_TABS = [
+    { id: 'overview', label: 'Overview' },
+    { id: 'subwallets', label: 'Sub wallets' },
+    { id: 'vault', label: 'Vaults' },
+    { id: 'getwweth', label: 'Get wWETH' },
   ];
+
+  const ethCapSummary = (() => {
+    const human = (weiStr) => {
+      try {
+        return ethers.formatEther(BigInt(String(weiStr || '0')));
+      } catch {
+        return '0';
+      }
+    };
+    const pretty = (h) => {
+      const n = Number(h);
+      if (!Number.isFinite(n)) return String(h);
+      return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
+    };
+    const capacityH = human(vault?.ethCapacity18);
+    const usedH = human(vault?.ethClaimed18);
+    const availableH = human(vault?.ethRemaining18);
+    const claimH = human(vault?.l1WethClaim);
+    const portableH = human(vault?.wethPortable);
+    return {
+      capacity: pretty(capacityH),
+      used: pretty(usedH),
+      available: pretty(availableH),
+      claim: pretty(claimH),
+      portable: pretty(portableH),
+      capacityRaw: capacityH,
+      usedRaw: usedH,
+      availableRaw: availableH,
+      claimRaw: claimH,
+      portableRaw: portableH,
+    };
+  })();
+
+  const mintWethClaim = async () => {
+    const amt = String(mintWethAmt || '').trim();
+    if (!amt) return toast.error('Enter mint amount');
+    try {
+      setLoading(true);
+      await send({ type: 'mint_weth_claim', amount: amt });
+      toast.success(`Minted ${amt} wETH claim (rollup)`);
+      setMintWethAmt('');
+      setTimeout(() => refreshVault(address), 4000);
+    } catch (e) {
+      /* send toasts */
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const burnWethClaim = async () => {
+    const amt = String(burnWethAmt || '').trim();
+    if (!amt) return toast.error('Enter burn amount');
+    try {
+      setLoading(true);
+      await send({ type: 'burn_weth_claim', amount: amt });
+      toast.success(`Burned ${amt} wETH claim — Available ↑`);
+      setBurnWethAmt('');
+      setTimeout(() => refreshVault(address), 4000);
+    } catch (e) {
+      /* send toasts */
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const renderPortalAsset = ({
     label,
@@ -1251,20 +1451,6 @@ export default function WalletIsland() {
             <Wallet className="inline" size={18} style={{ marginRight: 8, verticalAlign: -3 }} />
             Connect MetaMask (L1)
           </button>
-          <button
-            type="button"
-            className="wi-token-copy"
-            onClick={async () => {
-              try {
-                await ensureCartesiNetwork();
-              } catch {
-                /* toasts handled inside */
-              }
-            }}
-          >
-            Add network · {ACTIVE_NETWORK?.label || 'Cartesi Local'} (chain{' '}
-            {ACTIVE_NETWORK?.chainId ?? 31337})
-          </button>
           {(getNetworkId() === 'anvil' || ACTIVE_NETWORK?.isDemo) && (
             <AnvilTestKeys rpcUrl={RPC_URL} compact />
           )}
@@ -1295,6 +1481,7 @@ export default function WalletIsland() {
   return (
     <div className="wi-shell vault-section">
       <Toaster position="top-right" />
+      {mmTxModal}
 
       {/* ── 1) Warthog first (primary bridge path) ── */}
       {showWarthog && (
@@ -1308,6 +1495,213 @@ export default function WalletIsland() {
           setBurnAmt={setBurnAmt}
           l1Vault={vault}
           onRefreshL1Vault={() => refreshVault(address)}
+          onSessionChange={setWartSession}
+          onToggleShowWallet={() => setShowWarthog(false)}
+          showWalletVisible
+          capacityOverviewPanel={
+            <div className="wi-panel" style={{ margin: 0, padding: 0, background: 'transparent', border: 0 }}>
+              <div className="wi-stat-grid wi-stat-grid--focus">
+                <div className="wi-stat wi-stat--liquid">
+                  <Coins size={18} className="wi-stat-icon" />
+                  <span className="wi-stat-k">Available</span>
+                  <span className="wi-stat-v">{mintCap.available}</span>
+                  <span className="wi-stat-hint">WART-backed mint headroom</span>
+                </div>
+                <div className="wi-stat">
+                  <span className="wi-stat-k">Used</span>
+                  <span className="wi-stat-v">{capacityUsedLabel}</span>
+                  <span className="wi-stat-hint">
+                    {SHARE_TOKEN.symbol} {mintCap.liquid} + wWART {mintCap.claim || '0'}
+                  </span>
+                </div>
+                <div className="wi-stat">
+                  <span className="wi-stat-k">Capacity</span>
+                  <span className="wi-stat-v">{mintCap.capacity}</span>
+                  <span className="wi-stat-hint">
+                    locked WART only · {lockedWart.toFixed(4)} WART
+                    {mintCap.hasLockedWart ? '' : ' · lock first'}
+                  </span>
+                </div>
+                <div className="wi-stat wi-stat--spoof">
+                  <span className="wi-stat-k">MetaMask wWART</span>
+                  <span className="wi-stat-v">
+                    {mmWwartBal != null
+                      ? Number(mmWwartBal).toLocaleString(undefined, {
+                          maximumFractionDigits: 4,
+                        })
+                      : '—'}
+                  </span>
+                  <span className="wi-stat-hint">L1 ERC-20 (after voucher)</span>
+                </div>
+              </div>
+              <p className="wi-muted" style={{ marginTop: '0.5rem', marginBottom: 0 }}>
+                <strong>Capacity</strong> = locked WART only (ETH/CTSI/USDC portals are separate
+                inventory — not mint headroom). <strong>Used</strong> = {SHARE_TOKEN.symbol} +
+                wWART claims. <strong>Open</strong> claims can burn immediately;{' '}
+                <strong>filled</strong> claims need deposit-back then burn.{' '}
+                <strong>Release</strong> unlocks native collateral separately.
+              </p>
+              <ol className="wi-steps">
+                <li>
+                  <strong>Register L1</strong> — on the middle L1 · MetaMask card (once per MetaMask)
+                </li>
+                <li>
+                  <strong>Bridge</strong> — fund sub, sweep → lock capacity
+                </li>
+                <li>
+                  Mint wWART / {SHARE_TOKEN.symbol} (uses capacity) → optional{' '}
+                  <button type="button" className="wi-linkish" data-goto="getwwart">
+                    Get wWART
+                  </button>{' '}
+                  to MetaMask (claim becomes <em>filled</em>)
+                </li>
+                <li>
+                  To free filled capacity: deposit MetaMask wWART (Get wWART tab) →{' '}
+                  <strong>Burn wWART claims</strong>
+                </li>
+                <li>
+                  Open (unfilled) claims: burn on Warthog Home without deposit
+                </li>
+                <li>
+                  Optional: <strong>Release</strong> locked WART → Vault → main
+                </li>
+              </ol>
+            </div>
+          }
+          getWwartPanel={
+            <div className="wi-panel" style={{ margin: 0, padding: 0, background: 'transparent', border: 0 }}>
+              <p className="wi-muted wi-claim-lead">
+                Capacity used by wWART claim:{' '}
+                <strong>
+                  {wwartClaim.toLocaleString(undefined, { maximumFractionDigits: 6 })}
+                </strong>
+                {' · '}
+                Withdrawable:{' '}
+                <strong>
+                  {Number(formatUnits18(wwartWithdrawableWei)).toLocaleString(undefined, {
+                    maximumFractionDigits: 6,
+                  })}
+                </strong>{' '}
+                <span className="wi-muted">
+                  (portable{' '}
+                  {Number(formatUnits18(wwartPortableWei)).toLocaleString(undefined, {
+                    maximumFractionDigits: 6,
+                  })}
+                  {' + '}
+                  portal{' '}
+                  {Number(formatUnits18(wwartPortalWei)).toLocaleString(undefined, {
+                    maximumFractionDigits: 6,
+                  })}
+                  )
+                </span>
+                {' · '}
+                Shared available: <strong>{mintCap.available}</strong>.
+              </p>
+              <p className="wi-muted" style={{ marginTop: '-0.25rem', marginBottom: '0.75rem' }}>
+                Portable = mint claims not yet withdrawn. Portal = MetaMask deposits. Deposit
+                does <strong>not</strong> free Used — burn does.
+              </p>
+              {WWART_ADDRESS ? (
+                <>
+                  <div className="wi-portal-card wi-portal-card--focus" style={{ marginBottom: '0.75rem' }}>
+                    <div className="wi-portal-title">Withdraw wWART → L1</div>
+                    <div className="wi-portal-row">
+                      <input
+                        className="input"
+                        placeholder="Amount"
+                        value={withdrawWwartAmt}
+                        onChange={(e) => setWithdrawWwartAmt(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="btn secondary small"
+                        disabled={loading || wwartWithdrawableWei <= 0n}
+                        onClick={() => {
+                          setWithdrawWwartAmt(formatUnits18Exact(wwartWithdrawableWei));
+                        }}
+                      >
+                        Max
+                      </button>
+                      <button
+                        type="button"
+                        className="btn primary small"
+                        disabled={loading || wwartWithdrawableWei <= 0n}
+                        onClick={() => withdrawWwart()}
+                      >
+                        Withdraw
+                      </button>
+                    </div>
+                  </div>
+                  <div className="wi-portal-card wi-portal-card--focus" style={{ marginBottom: '0.75rem' }}>
+                    <div className="wi-portal-title">Deposit wWART (MetaMask → rollup)</div>
+                    <p className="wi-portal-note" style={{ marginBottom: '0.5rem' }}>
+                      Credits <strong>portal inventory</strong> (not portable). Used / Available
+                      unchanged until you <strong>Burn wWART claims</strong> on Home. Withdraw Max
+                      includes portal + portable.
+                    </p>
+                    <div className="wi-portal-row">
+                      <input
+                        className="input wi-portal-input"
+                        placeholder="Amount (e.g. 2)"
+                        value={wwartDepositAmt}
+                        onChange={(e) => setWwartDepositAmt(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="btn primary small"
+                        disabled={loading || !wwartDepositAmt}
+                        onClick={async () => {
+                          try {
+                            await depositWwart();
+                            toast.success(
+                              'Deposited — portal inventory up. Used free only after burn.',
+                              { duration: 8000 },
+                            );
+                          } catch {
+                            /* depositWwart toasts */
+                          }
+                          setTimeout(() => refreshVault(address), 10000);
+                        }}
+                      >
+                        Deposit wWART
+                      </button>
+                    </div>
+                    <p className="wi-portal-note">
+                      Portal:{' '}
+                      <strong>
+                        {Number(formatUnits18(wwartPortalWei)).toLocaleString(undefined, {
+                          maximumFractionDigits: 6,
+                        })}
+                      </strong>
+                      {' · '}
+                      Portable:{' '}
+                      <strong>
+                        {Number(formatUnits18(wwartPortableWei)).toLocaleString(undefined, {
+                          maximumFractionDigits: 6,
+                        })}
+                      </strong>
+                      {' · '}
+                      Withdrawable:{' '}
+                      <strong>
+                        {Number(formatUnits18(wwartWithdrawableWei)).toLocaleString(undefined, {
+                          maximumFractionDigits: 6,
+                        })}
+                      </strong>
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <p className="wi-muted">wWART token not configured.</p>
+              )}
+              <VoucherExecutor
+                address={address}
+                signer={signer}
+                provider={provider}
+                onlyMine
+                compact
+              />
+            </div>
+          }
           onOptimisticShareMint={({ kind, amountHuman, direction = 'mint' }) => {
             // Immediate UI delta. Callers should apply once (before send) and
             // reverse on failure. Do not apply again after send — refresh will
@@ -1356,22 +1750,52 @@ export default function WalletIsland() {
         />
       )}
 
-      {/* ── 2) L1 MetaMask (claim / execute) ── */}
+      {/* ── 2) Middle: L1 · MetaMask control card (original style — leave alone) ── */}
       <section className="wi-l1-block">
         <header className="wi-header">
           <div className="wi-header-main">
             <div className="wi-header-id">
               <span className="wi-header-label">L1 · MetaMask</span>
+            </div>
+            <div className="wi-header-connected" aria-label="Connected wallets">
               <button
                 type="button"
-                className="wi-address-chip"
-                title={address}
+                className="wi-address-chip wi-address-chip--eth"
+                title={address ? `ETH L1 · ${address}` : 'ETH not connected'}
                 onClick={() => {
+                  if (!address) return;
                   navigator.clipboard?.writeText(address);
-                  toast.success('Address copied');
+                  toast.success('ETH L1 address copied');
                 }}
               >
-                {address.slice(0, 6)}…{address.slice(-4)}
+                <span className="wi-addr-tag">ETH</span>
+                {address ? `${address.slice(0, 6)}…${address.slice(-4)}` : '—'}
+              </button>
+              <button
+                type="button"
+                className={`wi-address-chip wi-address-chip--wart${
+                  wartSession?.address ? '' : ' is-empty'
+                }`}
+                title={
+                  wartSession?.address
+                    ? `WART · ${wartSession.address}`
+                    : 'Warthog wallet not unlocked'
+                }
+                onClick={() => {
+                  if (!wartSession?.address) {
+                    toast('Unlock Warthog wallet to connect WART address');
+                    return;
+                  }
+                  navigator.clipboard?.writeText(wartSession.address);
+                  toast.success('WART address copied');
+                }}
+              >
+                <span className="wi-addr-tag">WART</span>
+                {wartSession?.address
+                  ? `${String(wartSession.address).slice(0, 6)}…${String(
+                      wartSession.address,
+                    ).slice(-4)}`
+                  : 'not connected'}
               </button>
             </div>
             <span
@@ -1406,6 +1830,7 @@ export default function WalletIsland() {
               onClick={() => {
                 refreshVault(address);
                 refreshMmWwart(address);
+                refreshMainEth(address);
               }}
               disabled={loading}
             >
@@ -1415,9 +1840,26 @@ export default function WalletIsland() {
             <button
               type="button"
               className="btn small secondary"
-              onClick={() => setShowWarthog(!showWarthog)}
+              title={
+                showWarthog
+                  ? 'Hide Warthog wallet panel'
+                  : 'Show Warthog wallet panel'
+              }
+              onClick={() => setShowWarthog((v) => !v)}
             >
-              {showWarthog ? 'Hide wallet' : 'Show wallet'}
+              {showWarthog ? 'Hide WART wallet' : 'Show WART wallet'}
+            </button>
+            <button
+              type="button"
+              className="btn small secondary"
+              title={
+                showEthWallet
+                  ? 'Hide ETH wallet panel'
+                  : 'Show ETH wallet panel'
+              }
+              onClick={() => setShowEthWallet((v) => !v)}
+            >
+              {showEthWallet ? 'Hide ETH wallet' : 'Show ETH wallet'}
             </button>
             <button
               type="button"
@@ -1436,109 +1878,11 @@ export default function WalletIsland() {
               Log out
             </button>
           </div>
-        </header>
-
-        <nav className="sw-action-tabs wi-l1-tabs" role="tablist" aria-label="L1 actions">
-          {L1_TABS.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              role="tab"
-              aria-selected={l1Tab === t.id}
-              className={`sw-action-tab ${l1Tab === t.id ? 'is-active' : ''}`}
-              onClick={() => setL1Tab(t.id)}
-            >
-              {t.label}
-            </button>
-          ))}
-        </nav>
-
-        {l1Tab === 'home' && (
-          <div className="wi-panel">
-            <div className="wi-stat-grid wi-stat-grid--focus">
-              <div className="wi-stat wi-stat--liquid">
-                <Coins size={18} className="wi-stat-icon" />
-                <span className="wi-stat-k">Available</span>
-                <span className="wi-stat-v">{mintCap.available}</span>
-                <span className="wi-stat-hint">shared mint headroom</span>
-              </div>
-              <div className="wi-stat">
-                <span className="wi-stat-k">Used</span>
-                <span className="wi-stat-v">{capacityUsedLabel}</span>
-                <span className="wi-stat-hint">
-                  {SHARE_TOKEN.symbol} {mintCap.liquid} + wWART {mintCap.claim || '0'}
-                </span>
-              </div>
-              <div className="wi-stat">
-                <span className="wi-stat-k">Capacity</span>
-                <span className="wi-stat-v">{mintCap.capacity}</span>
-                <span className="wi-stat-hint">
-                  from {lockedWart.toFixed(4)} WART collateral
-                  {mintCap.hasLockedWart ? '' : ' · lock first'}
-                </span>
-              </div>
-              <div className="wi-stat wi-stat--spoof">
-                <span className="wi-stat-k">MetaMask wWART</span>
-                <span className="wi-stat-v">
-                  {mmWwartBal != null
-                    ? Number(mmWwartBal).toLocaleString(undefined, {
-                        maximumFractionDigits: 4,
-                      })
-                    : '—'}
-                </span>
-                <span className="wi-stat-hint">L1 ERC-20 (after voucher)</span>
-              </div>
-            </div>
-            <p className="wi-muted" style={{ marginTop: '0.5rem', marginBottom: 0 }}>
-              <strong>Capacity</strong> = locked WART. <strong>Used</strong> = {SHARE_TOKEN.symbol} +
-              wWART claims. <strong>Open</strong> claims (not withdrawn) can burn immediately.{' '}
-              <strong>Filled</strong> claims (ERC-20 already on MetaMask) keep Used until you{' '}
-              <strong>deposit L1 wWART back</strong> and then <strong>Burn wWART claims</strong>.
-              <strong> Release</strong> unlocks native collateral separately.
-            </p>
-            <ol className="wi-steps">
-              <li>
-                <strong>Register L1</strong> — use the button in the L1 · MetaMask header (once per
-                wallet)
-              </li>
-              <li>
-                <strong>Bridge</strong> — fund sub, sweep → lock capacity
-              </li>
-              <li>
-                Mint wWART / {SHARE_TOKEN.symbol} (uses capacity) → optional{' '}
-                <button type="button" className="wi-linkish" onClick={() => setL1Tab('claim')}>
-                  Get wWART
-                </button>{' '}
-                to MetaMask (claim becomes <em>filled</em>)
-              </li>
-              <li>
-                To free filled capacity: deposit MetaMask wWART → <strong>Burn wWART claims</strong>
-              </li>
-              <li>
-                Open (unfilled) claims: burn on Warthog Home without deposit
-              </li>
-              <li>
-                Optional: <strong>Release</strong> locked WART → Vault → main
-              </li>
-            </ol>
-            <div className="wi-header-tools" style={{ margin: '0.75rem 0' }}>
-              <button
-                type="button"
-                className={`btn small ${l1Registered === true ? 'secondary' : 'primary'}`}
-                onClick={() => registerL1Address()}
-                disabled={loading || rollupOnline === false}
-              >
-                {registerL1ButtonLabel}
-              </button>
-              <span className="wi-muted" style={{ fontSize: '0.8rem', alignSelf: 'center' }}>
-                {l1Registered === true
-                  ? 'This MetaMask wallet is the rollup vault owner'
-                  : 'Sends your MetaMask address to the rollup as vault owner'}
-              </span>
-            </div>
+          <div className="wi-l1-meta-actions" role="group" aria-label="MetaMask helpers">
             <button
               type="button"
               className="wi-token-copy"
+              title={`Add or switch to ${ACTIVE_NETWORK?.label || 'Cartesi Local'} in MetaMask`}
               onClick={async () => {
                 try {
                   await ensureCartesiNetwork();
@@ -1547,38 +1891,29 @@ export default function WalletIsland() {
                 }
               }}
             >
-              Add network · {ACTIVE_NETWORK?.label || 'Cartesi Local'} · RPC{' '}
-              {(ACTIVE_NETWORK?.rpcUrl || RPC_URL || '').replace(/^https?:\/\//, '').slice(0, 28)}
-              …
+              Add network · {ACTIVE_NETWORK?.label || 'Cartesi Local'} (chain{' '}
+              {ACTIVE_NETWORK?.chainId ?? 31337})
             </button>
             {WWART_ADDRESS ? (
               <button
                 type="button"
                 className="wi-token-copy"
+                title={`Import ${LOCAL_WWART?.symbol || 'wWART'} into MetaMask`}
                 onClick={async () => {
                   const addr = WWART_ADDRESS;
                   const symbol = LOCAL_WWART?.symbol || 'wWART';
                   const decimals = LOCAL_WWART?.decimals ?? 18;
                   try {
-                    if (!window.ethereum) {
-                      throw new Error('MetaMask not found');
-                    }
-                    // EIP-747 — MetaMask prompt to add the token to the asset list
+                    if (!window.ethereum) throw new Error('MetaMask not found');
                     const added = await window.ethereum.request({
                       method: 'wallet_watchAsset',
                       params: {
                         type: 'ERC20',
-                        options: {
-                          address: addr,
-                          symbol,
-                          decimals,
-                        },
+                        options: { address: addr, symbol, decimals },
                       },
                     });
-                    if (added) {
-                      toast.success(`${symbol} added to MetaMask`);
-                    } else {
-                      // User dismissed — still offer address
+                    if (added) toast.success(`${symbol} added to MetaMask`);
+                    else {
                       await navigator.clipboard?.writeText(addr);
                       toast('Import cancelled — address copied', { duration: 4000 });
                     }
@@ -1586,7 +1921,7 @@ export default function WalletIsland() {
                     try {
                       await navigator.clipboard?.writeText(addr);
                       toast.error(
-                        `Auto-import failed (${e?.message || e}). Address copied — add token manually.`,
+                        `Auto-import failed (${e?.message || e}). Address copied.`,
                         { duration: 7000 },
                       );
                     } catch {
@@ -1599,92 +1934,313 @@ export default function WalletIsland() {
               </button>
             ) : null}
           </div>
-        )}
+        </header>
+      </section>
 
-        {l1Tab === 'claim' && (
-          <div className="wi-panel">
-            <p className="wi-muted wi-claim-lead">
-              Capacity used by wWART claim:{' '}
-              <strong>
-                {wwartClaim.toLocaleString(undefined, { maximumFractionDigits: 6 })}
-              </strong>
-              {' · '}
-              Withdrawable:{' '}
-              <strong>
-                {Number(formatUnits18(wwartWithdrawableWei)).toLocaleString(undefined, {
-                  maximumFractionDigits: 6,
-                })}
-              </strong>
-              {' '}
-              <span className="wi-muted">
-                (portable{' '}
-                {Number(formatUnits18(wwartPortableWei)).toLocaleString(undefined, {
-                  maximumFractionDigits: 6,
-                })}
-                {' + '}
-                portal{' '}
-                {Number(formatUnits18(wwartPortalWei)).toLocaleString(undefined, {
-                  maximumFractionDigits: 6,
-                })}
-                )
-              </span>
-              {' · '}
-              Shared available: <strong>{mintCap.available}</strong>.
-            </p>
-            <p className="wi-muted" style={{ marginTop: '-0.25rem', marginBottom: '0.75rem' }}>
-              Portable = mint claims not yet withdrawn (mint voucher). Portal = MetaMask deposits
-              (transfer voucher). Deposit does <strong>not</strong> raise portable or free Used —
-              burn does for capacity; withdraw for sending out.
-            </p>
-            {WWART_ADDRESS ? (
-              <div className="wi-portal-card wi-portal-card--focus">
-                <div className="wi-portal-title">Withdraw wWART → L1</div>
-                <div className="wi-portal-row">
-                  <input
-                    className="input"
-                    placeholder="Amount"
-                    value={withdrawWwartAmt}
-                    onChange={(e) => setWithdrawWwartAmt(e.target.value)}
-                  />
-                  <button
-                    type="button"
-                    className="btn secondary small"
-                    disabled={loading || wwartWithdrawableWei <= 0n}
-                    onClick={() => {
-                      // Max = portable + portal inventory (same as backend withdraw_wwart)
-                      setWithdrawWwartAmt(formatUnits18Exact(wwartWithdrawableWei));
-                    }}
+      {/* ── 3) ETH section: one card shell matching warthog-section ── */}
+      {showEthWallet && (
+      <section className="eth-section">
+        <div className="eth-title-row">
+          <h2>ETH Wallet</h2>
+          <p className="eth-subtitle">L1 MetaMask · bridge vaults · multi-sig</p>
+        </div>
+
+        {/* Header mirrors Warthog wh-header: balance · section grid menu · tools */}
+        <header className="eth-section-header">
+          <div className="eth-section-header-main">
+            <div className="eth-section-header-left">
+              <div className="eth-balance-block">
+                <span className="eth-balance-label">Main L1 ETH</span>
+                <span className="eth-balance-value">
+                  {mainEthBal != null
+                    ? `${Number(mainEthBal).toLocaleString(undefined, {
+                        maximumFractionDigits: 6,
+                      })} ETH`
+                    : '…'}
+                </span>
+                <span className="eth-balance-hint">MetaMask</span>
+              </div>
+            </div>
+            <div className="eth-section-header-icons">
+              {/* Section nav — grid icon (same role as Warthog wh-section-btn) */}
+              <div className="eth-section-menu" ref={ethSectionMenuRef}>
+                <button
+                  type="button"
+                  className={`eth-section-btn${showEthSectionMenu ? ' is-open' : ''}`}
+                  aria-label="ETH sections"
+                  aria-expanded={showEthSectionMenu}
+                  aria-haspopup="menu"
+                  title={`Section · ${ETH_TABS.find((t) => t.id === l1Tab)?.label || 'Overview'}`}
+                  onClick={() => setShowEthSectionMenu((v) => !v)}
+                >
+                  <LayoutGrid size={16} strokeWidth={2.25} aria-hidden />
+                </button>
+                {showEthSectionMenu && (
+                  <div className="eth-section-dropdown" role="menu" aria-label="ETH sections">
+                    <div className="eth-section-menu-head">
+                      <span className="eth-section-menu-title">Go to</span>
+                      <span className="eth-section-current">
+                        {ETH_TABS.find((t) => t.id === l1Tab)?.label || 'Overview'}
+                      </span>
+                    </div>
+                    {ETH_TABS.map((tab) => {
+                      const needsSeed =
+                        tab.id === 'subwallets' || tab.id === 'vault';
+                      const disabled = needsSeed && !wartSession?.mnemonic;
+                      const active = l1Tab === tab.id;
+                      return (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          role="menuitem"
+                          disabled={disabled}
+                          className={`eth-section-item${active ? ' is-active' : ''}`}
+                          title={
+                            disabled
+                              ? 'Unlock Warthog wallet first (seed required)'
+                              : tab.id === 'overview'
+                                ? 'ETH capacity Overview'
+                                : tab.id === 'subwallets'
+                                  ? 'ETH sub-wallets · fund & create vault'
+                                  : tab.id === 'vault'
+                                    ? 'ETH multi-sig vaults only'
+                                    : tab.id === 'getwweth'
+                                      ? 'Mint / burn wETH claims'
+                                      : undefined
+                          }
+                          onClick={() => {
+                            if (disabled) return;
+                            setL1Tab(tab.id);
+                            setShowEthSectionMenu(false);
+                          }}
+                        >
+                          <span>{tab.label}</span>
+                          {active ? (
+                            <span className="eth-section-check" aria-hidden>
+                              ✓
+                            </span>
+                          ) : null}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              <button
+                type="button"
+                className="eth-section-btn"
+                title="Refresh L1 vault + ETH balance"
+                onClick={() => {
+                  refreshVault(address);
+                  refreshMmWwart(address);
+                  refreshMainEth(address);
+                }}
+                disabled={loading}
+              >
+                <RefreshCw size={16} strokeWidth={2.25} aria-hidden />
+              </button>
+            </div>
+          </div>
+          <div className="eth-section-tools" role="group" aria-label="ETH wallet actions">
+            <button
+              type="button"
+              className="btn primary small"
+              onClick={() => {
+                refreshVault(address);
+                refreshMmWwart(address);
+                refreshMainEth(address);
+              }}
+              disabled={loading}
+            >
+              Refresh
+            </button>
+          </div>
+        </header>
+
+        <div
+          className={`sw-card sw-card--l1-track eth-layers-card${
+            showEthLayersCard ? '' : ' is-collapsed'
+          }`}
+        >
+          <div className="sw-card-head">
+            <h4 className="sw-card-title">Balances across layers</h4>
+            <div className="sw-card-head-right sw-layers-actions">
+              <button
+                type="button"
+                className="sw-icon-btn"
+                title="Refresh layer balances"
+                aria-label="Refresh layer balances"
+                onClick={() => {
+                  refreshVault(address);
+                  refreshMainEth(address);
+                }}
+                disabled={loading}
+              >
+                <RefreshCw size={14} strokeWidth={2.25} aria-hidden />
+              </button>
+              <button
+                type="button"
+                className="sw-icon-btn"
+                title={
+                  showEthLayersCard
+                    ? 'Hide balances across layers'
+                    : 'Show balances across layers'
+                }
+                aria-label={
+                  showEthLayersCard
+                    ? 'Hide balances across layers'
+                    : 'Show balances across layers'
+                }
+                aria-expanded={showEthLayersCard}
+                onClick={() => setShowEthLayersCard((v) => !v)}
+              >
+                {showEthLayersCard ? (
+                  <EyeOff size={14} strokeWidth={2.25} aria-hidden />
+                ) : (
+                  <Eye size={14} strokeWidth={2.25} aria-hidden />
+                )}
+              </button>
+            </div>
+          </div>
+          {showEthLayersCard && (
+            <>
+              <div className="sw-card-meta">
+                <div className="sw-meta-row">
+                  <span
+                    className="sw-meta-k"
+                    title="Native ETH in your connected MetaMask account"
                   >
-                    Max
-                  </button>
-                  <button
-                    type="button"
-                    className="btn primary small"
-                    disabled={loading || wwartWithdrawableWei <= 0n}
-                    onClick={() => withdrawWwart()}
+                    Main L1 ETH
+                  </span>
+                  <span className="sw-meta-v">
+                    {mainEthBal != null
+                      ? `${Number(mainEthBal).toLocaleString(undefined, {
+                          maximumFractionDigits: 6,
+                        })} ETH`
+                      : '—'}
+                  </span>
+                </div>
+                <div className="sw-meta-row">
+                  <span
+                    className="sw-meta-k"
+                    title="Locked vault ETH capacity (ETH pool only — not WART)"
                   >
-                    Withdraw
-                  </button>
+                    ETH capacity
+                  </span>
+                  <span className="sw-meta-v">{ethCapSummary.capacity} ETH</span>
+                </div>
+                <div className="sw-meta-row">
+                  <span
+                    className="sw-meta-k"
+                    title="wETH claims using ETH capacity"
+                  >
+                    ETH used (claims)
+                  </span>
+                  <span className="sw-meta-v">{ethCapSummary.used} ETH</span>
+                </div>
+                <div className="sw-meta-row">
+                  <span className="sw-meta-k" title="Remaining ETH mint headroom">
+                    ETH available
+                  </span>
+                  <span className="sw-meta-v">{ethCapSummary.available} ETH</span>
+                </div>
+                <div className="sw-meta-row">
+                  <span
+                    className="sw-meta-k"
+                    title="Rollup wETH claim / portable inventory"
+                  >
+                    wETH claim
+                  </span>
+                  <span className="sw-meta-v">
+                    {ethCapSummary.claim} · port {ethCapSummary.portable}
+                  </span>
+                </div>
+                <div className="sw-meta-row">
+                  <span
+                    className="sw-meta-k"
+                    title="ETH deposited via portal (inventory, not mint capacity)"
+                  >
+                    Rollup portal ETH
+                  </span>
+                  <span className="sw-meta-v">
+                    {vault?.eth != null
+                      ? `${Number(vault.eth).toLocaleString(undefined, {
+                          maximumFractionDigits: 6,
+                        })} ETH`
+                      : '—'}
+                  </span>
                 </div>
               </div>
-            ) : (
-              <p className="wi-muted">wWART token not configured.</p>
-            )}
-            <VoucherExecutor
-              address={address}
-              signer={signer}
-              provider={provider}
-              onlyMine
-            />
-          </div>
-        )}
+              <p className="wh-hint sw-l1-track-hint">
+                <strong>Locked vault ETH</strong> is capacity (not WART).{' '}
+                <strong>wETH claims</strong> are rollup-only until DeFi WETH. Portal ETH is
+                inventory only.
+              </p>
+            </>
+          )}
+        </div>
 
-        {l1Tab === 'more' && (
-          <div className="wi-panel">
-            <p className="wi-muted">
-              Optional portals &amp; diagnostics. wWART deposit returns L1 tokens to the rollup
-              balance — it does <strong>not</strong> free Used capacity (burn does).
+        <div className="eth-section-bar" aria-live="polite">
+          <span className="eth-section-bar-label">
+            {ETH_TABS.find((t) => t.id === l1Tab)?.label || 'Overview'}
+          </span>
+        </div>
+
+        {l1Tab === 'overview' && (
+          <div className="wi-panel eth-overview-panel">
+            {/* 2×2: Available | Used / Capacity | Main L1 ETH (same as Warthog Overview) */}
+            <div className="wi-stat-grid wi-stat-grid--focus eth-overview-stats">
+              <div className="wi-stat wi-stat--liquid">
+                <Coins size={18} className="wi-stat-icon" />
+                <span className="wi-stat-k">Available</span>
+                <span className="wi-stat-v">{ethCapSummary.available}</span>
+                <span className="wi-stat-hint">ETH-backed mint headroom</span>
+              </div>
+              <div className="wi-stat">
+                <span className="wi-stat-k">Used</span>
+                <span className="wi-stat-v">{ethCapSummary.used}</span>
+                <span className="wi-stat-hint">wETH claims</span>
+              </div>
+              <div className="wi-stat">
+                <span className="wi-stat-k">Capacity</span>
+                <span className="wi-stat-v">{ethCapSummary.capacity}</span>
+                <span className="wi-stat-hint">locked vault ETH only</span>
+              </div>
+              <div className="wi-stat wi-stat--spoof">
+                <span className="wi-stat-k">Main L1 ETH</span>
+                <span className="wi-stat-v">
+                  {mainEthBal != null
+                    ? Number(mainEthBal).toLocaleString(undefined, {
+                        maximumFractionDigits: 6,
+                      })
+                    : '—'}
+                </span>
+                <span className="wi-stat-hint">MetaMask</span>
+              </div>
+            </div>
+            <p className="wi-muted" style={{ marginTop: '0.65rem', marginBottom: 0 }}>
+              <strong>Capacity</strong> = locked ETH in cosigner vaults (separate from WART
+              capacity). <strong>Used</strong> = wETH claims. Mint / burn under{' '}
+              <button
+                type="button"
+                className="wi-linkish"
+                onClick={() => setL1Tab('getwweth')}
+              >
+                Get wWETH
+              </button>
+              . Fund &amp; lock via Sub wallets → Vaults.
             </p>
+            <ol className="wi-steps">
+              <li>
+                <strong>Sub wallets</strong> — generate · fund main → sub · create vault
+              </li>
+              <li>
+                <strong>Vaults</strong> — sub → vault · lock capacity · release · cosign
+              </li>
+              <li>
+                <strong>Get wWETH</strong> — mint / burn rollup wETH claims (until DeFi WETH)
+              </li>
+            </ol>
             {(getNetworkId() === 'anvil' || ACTIVE_NETWORK?.isDemo) && (
               <AnvilTestKeys
                 rpcUrl={RPC_URL}
@@ -1692,138 +2248,155 @@ export default function WalletIsland() {
                 highlightAddress={address}
               />
             )}
-            {WWART_ADDRESS ? (
-              <div className="wi-portal-card wi-portal-card--focus" style={{ marginBottom: '0.75rem' }}>
-                <div className="wi-portal-title">Deposit wWART (MetaMask → rollup)</div>
-                <p className="wi-portal-note" style={{ marginBottom: '0.5rem' }}>
-                  Credits <strong>portal inventory</strong> (not portable). Used / Available
-                  unchanged until you <strong>Burn wWART claims</strong> on Warthog → Home.
-                  Withdraw Max includes portal + portable. Unlock collateral is a separate{' '}
-                  <strong>Release</strong> on Bridge.
-                </p>
-                <div className="wi-portal-row">
-                  <input
-                    className="input wi-portal-input"
-                    placeholder="Amount (e.g. 2)"
-                    value={wwartDepositAmt}
-                    onChange={(e) => setWwartDepositAmt(e.target.value)}
-                  />
-                  <button
-                    type="button"
-                    className="btn primary small"
-                    disabled={loading || !wwartDepositAmt}
-                    onClick={async () => {
-                      try {
-                        await depositWwart();
-                        toast.success(
-                          'Deposited — portal inventory up (not portable). Max withdraw includes it; Used claim free only after burn.',
-                          { duration: 8000 },
-                        );
-                      } catch {
-                        /* depositWwart already toasts errors */
-                      }
-                      setTimeout(() => refreshVault(address), 10000);
-                    }}
-                  >
-                    Deposit wWART
-                  </button>
-                </div>
-                <p className="wi-portal-note">
-                  Portal inventory:{' '}
-                  <strong>
-                    {Number(formatUnits18(wwartPortalWei)).toLocaleString(undefined, {
-                      maximumFractionDigits: 6,
-                    })}
-                  </strong>
-                  {' · '}
-                  Portable:{' '}
-                  <strong>
-                    {Number(formatUnits18(wwartPortableWei)).toLocaleString(undefined, {
-                      maximumFractionDigits: 6,
-                    })}
-                  </strong>
-                  {' · '}
-                  Withdrawable:{' '}
-                  <strong>
-                    {Number(formatUnits18(wwartWithdrawableWei)).toLocaleString(undefined, {
-                      maximumFractionDigits: 6,
-                    })}
-                  </strong>
-                  {' · '}
-                  Used claim: <strong>{mintCap.claim || '0'}</strong>
-                </p>
+            <details className="wi-guide" style={{ marginTop: '0.75rem' }}>
+              <summary>Optional portals (ETH / CTSI / USDC inventory)</summary>
+              <div className="wi-portal-grid" style={{ marginTop: '0.65rem' }}>
+                {renderPortalAsset({
+                  label: 'ETH',
+                  depositVal: ethDepositAmt,
+                  setDeposit: setEthDepositAmt,
+                  onDeposit: depositEth,
+                  withdrawVal: withdrawEthAmt,
+                  setWithdraw: setWithdrawEthAmt,
+                  onWithdraw: withdrawEth,
+                  note: `Inventory only (rollup ETH: ${vault?.eth ?? '0'}) — not ETH mint capacity. Use Sub wallets for indexed path.`,
+                })}
+                {renderPortalAsset({
+                  label: 'CTSI',
+                  depositVal: ctsiDepositAmt,
+                  setDeposit: setCtsiDepositAmt,
+                  onDeposit: depositCtsi,
+                  withdrawVal: withdrawCtsiAmt,
+                  setWithdraw: setWithdrawCtsiAmt,
+                  onWithdraw: withdrawCtsi,
+                  note: 'CTSI inventory only — not WART or ETH mint capacity.',
+                })}
+                {renderPortalAsset({
+                  label: 'USDC',
+                  depositVal: usdcDepositAmt,
+                  setDeposit: setUsdcDepositAmt,
+                  onDeposit: depositUsdc,
+                  withdrawVal: withdrawUsdcAmt,
+                  setWithdraw: setWithdrawUsdcAmt,
+                  onWithdraw: withdrawUsdc,
+                  note: 'USDC inventory only — not mint capacity.',
+                })}
               </div>
-            ) : null}
-            <div className="wi-portal-grid">
-              {renderPortalAsset({
-                label: 'ETH',
-                depositVal: ethDepositAmt,
-                setDeposit: setEthDepositAmt,
-                onDeposit: depositEth,
-                withdrawVal: withdrawEthAmt,
-                setWithdraw: setWithdrawEthAmt,
-                onWithdraw: withdrawEth,
-                note: 'Execute vouchers under Get wWART.',
-              })}
-              {renderPortalAsset({
-                label: 'CTSI',
-                depositVal: ctsiDepositAmt,
-                setDeposit: setCtsiDepositAmt,
-                onDeposit: depositCtsi,
-                withdrawVal: withdrawCtsiAmt,
-                setWithdraw: setWithdrawCtsiAmt,
-                onWithdraw: withdrawCtsi,
-                note: 'Execute under Get wWART.',
-              })}
-              {renderPortalAsset({
-                label: 'USDC',
-                depositVal: usdcDepositAmt,
-                setDeposit: setUsdcDepositAmt,
-                onDeposit: depositUsdc,
-                withdrawVal: withdrawUsdcAmt,
-                setWithdraw: setWithdrawUsdcAmt,
-                onWithdraw: withdrawUsdc,
-                note: 'Execute under Get wWART.',
-              })}
-            </div>
-            <details className="wi-guide">
-              <summary>Collateral lock history (native WART, not ERC-20 wWART)</summary>
-              <div className="wi-stat-grid" style={{ marginTop: '0.5rem' }}>
-                <div className="wi-stat">
-                  <span className="wi-stat-k">Ever locked</span>
-                  <span className="wi-stat-v">{formatWart(spoofedWwart.total)} WART</span>
-                </div>
-                <div className="wi-stat">
-                  <span className="wi-stat-k">Released</span>
-                  <span className="wi-stat-v">{formatWart(spoofedWwart.totalBurned)} WART</span>
-                </div>
-              </div>
-              {spoofedWwart.history?.length ? (
-                <ul className="wi-history">
-                  {spoofedWwart.history.slice(0, 5).map((m, i) => (
-                    <li key={`m-${i}`}>
-                      Collateral +{formatWart(m.amount)} WART ·{' '}
-                      {new Date(m.timestamp).toLocaleString()}
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="wi-muted">No history yet.</p>
-              )}
             </details>
-            <div className="wi-header-tools" style={{ marginTop: '0.75rem' }}>
-              <button
-                type="button"
-                className={`btn small ${l1Registered === true ? 'secondary' : 'primary'}`}
-                onClick={() => registerL1Address()}
-                disabled={loading || rollupOnline === false}
-              >
-                {registerL1ButtonLabel}
-              </button>
+          </div>
+        )}
+
+        {(l1Tab === 'subwallets' || l1Tab === 'vault') && (
+          <EthSubWallets
+            mainMnemonic={wartSession?.mnemonic || null}
+            wartAddress={wartSession?.address || null}
+            l1Address={address}
+            signer={signer}
+            provider={provider}
+            send={send}
+            loading={loading}
+            setLoading={setLoading}
+            vault={vault}
+            onRefreshVault={() => {
+              refreshVault(address);
+              refreshMainEth(address);
+            }}
+            confirmMmTx={confirmMmTx}
+            hideMainCard
+            focusMode={l1Tab === 'vault' ? 'vaults' : 'subs'}
+            hideTopChrome
+            hideCapacityTrack
+          />
+        )}
+
+        {l1Tab === 'getwweth' && (
+          <div className="wi-panel eth-getwweth-panel">
+            <p className="wi-muted wi-claim-lead">
+              wETH claim:{' '}
+              <strong>{ethCapSummary.claim}</strong>
+              {' · '}
+              Portable: <strong>{ethCapSummary.portable}</strong>
+              {' · '}
+              Available: <strong>{ethCapSummary.available}</strong>
+              {' · '}
+              Capacity: <strong>{ethCapSummary.capacity}</strong>
+            </p>
+            <p className="wi-muted" style={{ marginTop: '-0.25rem', marginBottom: '0.75rem' }}>
+              Rollup-only claims until Warthog DeFi WETH. Mint uses ETH capacity (locked vault
+              ETH). Burn frees Available. Not the same as MetaMask WETH.
+            </p>
+            <div className="wi-portal-card wi-portal-card--focus" style={{ marginBottom: '0.75rem' }}>
+              <div className="wi-portal-title">Mint wETH claim</div>
+              <div className="wi-portal-row">
+                <input
+                  className="input"
+                  placeholder="Amount"
+                  value={mintWethAmt}
+                  onChange={(e) => setMintWethAmt(e.target.value)}
+                  disabled={loading}
+                />
+                <button
+                  type="button"
+                  className="btn secondary small"
+                  disabled={
+                    loading ||
+                    !ethCapSummary.availableRaw ||
+                    Number(ethCapSummary.availableRaw) <= 0
+                  }
+                  onClick={() => setMintWethAmt(ethCapSummary.availableRaw)}
+                >
+                  Max
+                </button>
+                <button
+                  type="button"
+                  className="btn primary small"
+                  disabled={loading || !mintWethAmt}
+                  onClick={() => mintWethClaim()}
+                >
+                  Mint claim
+                </button>
+              </div>
             </div>
+            <div className="wi-portal-card wi-portal-card--focus" style={{ marginBottom: '0.75rem' }}>
+              <div className="wi-portal-title">Burn wETH claim</div>
+              <div className="wi-portal-row">
+                <input
+                  className="input"
+                  placeholder="Amount"
+                  value={burnWethAmt}
+                  onChange={(e) => setBurnWethAmt(e.target.value)}
+                  disabled={loading}
+                />
+                <button
+                  type="button"
+                  className="btn secondary small"
+                  disabled={
+                    loading ||
+                    !ethCapSummary.portableRaw ||
+                    Number(ethCapSummary.portableRaw) <= 0
+                  }
+                  onClick={() => setBurnWethAmt(ethCapSummary.portableRaw)}
+                >
+                  Max
+                </button>
+                <button
+                  type="button"
+                  className="btn primary small"
+                  disabled={loading || !burnWethAmt}
+                  onClick={() => burnWethClaim()}
+                >
+                  Burn claim
+                </button>
+              </div>
+            </div>
+            <p className="wi-muted" style={{ marginBottom: 0 }}>
+              Lock ETH capacity under <strong>Vaults</strong> first. Sub wallets fund the path.
+            </p>
           </div>
         )}
       </section>
+      )}
+      {/* end eth-section */}
     </div>
   );
 }

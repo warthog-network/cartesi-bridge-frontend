@@ -118,6 +118,8 @@ const TEST_SEED_PHRASE =
 
 const APP_TABS = [
   { id: 'overview', label: 'Home' },
+  { id: 'capacity', label: 'Overview' },
+  { id: 'getwwart', label: 'Get wWART' },
   { id: 'subwallets', label: 'Sub wallets' },
   { id: 'send', label: 'Send' },
   { id: 'vault', label: 'Vault' },
@@ -180,6 +182,15 @@ const WarthogWallet = ({
   onRefreshL1Vault,
   /** Optimistic capacity update after mint_liquid / mint_wwart */
   onOptimisticShareMint,
+  /** Notify parent when unlock/lock changes (ETH bridge subs need mnemonic) */
+  onSessionChange,
+  /** Hide Warthog section (parent toggles showWarthog) */
+  onToggleShowWallet,
+  showWalletVisible = true,
+  /** L1 capacity Overview panel (moved under Warthog) */
+  capacityOverviewPanel = null,
+  /** Get wWART + deposit panel (moved under Warthog) */
+  getWwartPanel = null,
 }) => {
   const [deferredPrompt, setDeferredPrompt] = useState(null);
   const [walletData, setWalletData] = useState(null);
@@ -627,6 +638,14 @@ const WarthogWallet = ({
       console.warn('Signing worker unlock failed; using session keys:', err);
     }
     setWallet(data);
+    try {
+      onSessionChange?.({
+        mnemonic: data?.mnemonic || null,
+        address: data?.address || null,
+      });
+    } catch {
+      /* parent optional */
+    }
     if (nameTag) {
       setWalletName(nameTag);
       setLastWalletName(nameTag);
@@ -772,6 +791,11 @@ const WarthogWallet = ({
     await lockSigningWorker();
     terminateSigningWorker();
     setWallet(null);
+    try {
+      onSessionChange?.(null);
+    } catch {
+      /* parent optional */
+    }
     setBalance(null);
     setSpendableBalance(null);
     setMempoolBalance(null);
@@ -1589,7 +1613,11 @@ const WarthogWallet = ({
                               ? 'WART multi-sig vaults only'
                               : tab.id === 'subwallets'
                                 ? 'Sub-wallets · fund & sweep'
-                                : undefined
+                                : tab.id === 'capacity'
+                                  ? 'WART mint capacity Overview'
+                                  : tab.id === 'getwwart'
+                                    ? 'Withdraw / deposit wWART + vouchers'
+                                    : undefined
                         }
                         onClick={() => {
                           if (disabled) return;
@@ -1682,6 +1710,31 @@ const WarthogWallet = ({
       </div>
 
       <div className="wh-panel">
+        {appTab === 'capacity' && (
+          <div
+            className="wh-panel-stack"
+            onClick={(e) => {
+              const t = e.target.closest?.('[data-goto="getwwart"]');
+              if (t) {
+                e.preventDefault();
+                setAppTab('getwwart');
+              }
+            }}
+          >
+            {capacityOverviewPanel || (
+              <p className="wh-muted">Capacity overview unavailable.</p>
+            )}
+          </div>
+        )}
+
+        {appTab === 'getwwart' && (
+          <div className="wh-panel-stack">
+            {getWwartPanel || (
+              <p className="wh-muted">Get wWART panel unavailable.</p>
+            )}
+          </div>
+        )}
+
         {appTab === 'overview' && (
           <div className="wh-panel-stack">
             <nav className="sw-action-tabs wh-overview-tabs" role="tablist" aria-label="Overview">
@@ -1802,9 +1855,10 @@ const WarthogWallet = ({
                   <summary>Capacity details</summary>
                   <div className="wh-details-body">
                     <p className="wh-hint">
-                      Shared pool: locked WART → capacity. Mint uses capacity (Used ↑). Open
-                      claims can burn immediately; filled claims (MetaMask ERC-20) need deposit
-                      back before burn frees Available. Release locked WART is separate.
+                      Capacity is locked WART only (not portal ETH/CTSI/USDC). Mint uses
+                      capacity (Used ↑). Open claims can burn immediately; filled claims
+                      (MetaMask ERC-20) need deposit back before burn frees Available. Release
+                      locked WART is separate. ETH/CTSI are their own inventory balances.
                     </p>
                     <div className="wh-stat-grid">
                       <div className="wh-stat">
@@ -2376,6 +2430,7 @@ const WarthogWallet = ({
             getWartTxProof={getWartTxProof}
             sentTransactions={sentTransactions}
             focusMode={appTab === 'vault' ? 'vault' : 'bridge'}
+            onOpenVaultTab={() => setAppTab('vault')}
             l1Vault={l1Vault}
             mmWwartBal={mmWwartBal}
             onRefreshL1Vault={onRefreshL1Vault}

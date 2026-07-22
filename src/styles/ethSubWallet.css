@@ -1,0 +1,379 @@
+/**
+ * ETH bridge subs / vaults — same shape as Warthog SubWallet,
+ * blue (ETH/CTSI) accents instead of teal/gold.
+ */
+
+.eth-subwallet-section {
+  --eth-accent: #3b82f6;
+  --eth-accent-bright: #60a5fa;
+  --eth-accent-soft: #93c5fd;
+  --eth-accent-glow: #38bdf8;
+  padding: 0;
+  border-radius: 0;
+  border: none;
+  background: transparent;
+}
+
+.eth-subwallet-section .subwallet-top h3 {
+  color: var(--eth-accent-soft);
+}
+
+.eth-subwallet-section .sw-top-lead {
+  opacity: 0.75;
+}
+
+/* Steps / tips — blue */
+.eth-subwallet-section .bridge-flow-guide {
+  border-color: color-mix(in srgb, var(--eth-accent) 28%, #333);
+  background: color-mix(in srgb, var(--eth-accent) 6%, rgba(0, 0, 0, 0.22));
+}
+.eth-subwallet-section .bridge-flow-guide summary {
+  color: var(--eth-accent-bright);
+}
+.eth-subwallet-section .step-num {
+  background: color-mix(in srgb, var(--eth-accent) 22%, #1a1a1a);
+  border-color: color-mix(in srgb, var(--eth-accent) 40%, #555);
+  color: var(--eth-accent-soft);
+}
+
+/* Cross-layer capacity track card */
+.eth-subwallet-section .sw-card--l1-track {
+  border-color: color-mix(in srgb, var(--eth-accent) 32%, #333);
+  background: linear-gradient(
+    145deg,
+    color-mix(in srgb, var(--eth-accent) 10%, rgba(0, 0, 0, 0.35)) 0%,
+    rgba(0, 0, 0, 0.22) 55%,
+    transparent 100%
+  );
+}
+.eth-subwallet-section .sw-card--l1-track .sw-card-title {
+  color: var(--eth-accent-soft);
+}
+.eth-subwallet-section .sw-meta-k {
+  color: color-mix(in srgb, var(--eth-accent-soft) 70%, #aaa);
+}
+.eth-subwallet-section .sw-meta-v {
+  color: #e8f4ff;
+}
+
+/* Pager — blue accents; compact ‹ n/m › shared layout from subWallet.css */
+.eth-subwallet-section .sw-pager {
+  border-color: color-mix(in srgb, var(--eth-accent) 22%, #333);
+  background: color-mix(in srgb, var(--eth-accent) 5%, rgba(0, 0, 0, 0.28));
+}
+.eth-subwallet-section .sw-pager-count {
+  color: var(--eth-accent-bright);
+}
+.eth-subwallet-section .sw-pager-step {
+  border-color: color-mix(in srgb, var(--eth-accent) 42%, #555) !important;
+  background: color-mix(in srgb, var(--eth-accent) 12%, #1a1a1a) !important;
+  color: var(--eth-accent-soft) !important;
+}
+.eth-subwallet-section .sw-pager-step:hover:not(:disabled) {
+  border-color: var(--eth-accent-bright) !important;
+  color: #fff !important;
+  background: color-mix(in srgb, var(--eth-accent) 20%, #1a1a1a) !important;
+}
+.eth-subwallet-section .sw-dot {
+  border-color: color-mix(in srgb, var(--eth-accent) 40%, #555);
+  background: color-mix(in srgb, var(--eth-accent) 14%, #1a1a1a);
+  color: var(--eth-accent-soft);
+}
+.eth-subwallet-section .sw-dot:hover {
+  border-color: var(--eth-accent-bright);
+  color: #fff;
+}
+.eth-subwallet-section .sw-dot.is-active {
+  background: linear-gradient(135deg, #60a5fa, #2563eb);
+  border-color: transparent;
+  color: #041018;
+  box-shadow: 0 0 12px #3b82f655;
+}
+.eth-subwallet-section .sw-dot.is-locked:not(.is-active) {
+  border-color: color-mix(in srgb, var(--eth-accent-glow) 50%, #555);
+  background: color-mix(in srgb, var(--eth-accent-glow) 16%, #1a1a1a);
+  color: #bae6fd;
+}
+
+/* Cards */
+.eth-subwallet-section .sw-card {
+  border-radius: 14px;
+  padding: 0.7rem 0.8rem;
+  background: color-mix(in srgb, #1a1a1a 75%, #000);
+  border: 1px solid #333;
+  text-align: left;
+}
+.eth-subwallet-section .sw-card--sub {
+  border-color: color-mix(in srgb, var(--eth-accent) 32%, #333);
+}
+.eth-subwallet-section .sw-card--vault {
+  border-color: color-mix(in srgb, var(--eth-accent-glow) 40%, #333);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--eth-accent) 12%, transparent);
+}
+.eth-subwallet-section.eth-subwallet-section--vault-focus .sw-cards--vault-only {
+  grid-template-columns: 1fr;
+}
+.eth-subwallet-section.eth-subwallet-section--vault-focus .sw-card--vault {
+  max-width: 28rem;
+  margin: 0 auto;
+  width: 100%;
+}
+.eth-subwallet-section .sw-card-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--eth-accent-soft);
+}
+.eth-subwallet-section .sw-card--vault .sw-card-title {
+  color: var(--eth-accent-glow);
+}
+.eth-subwallet-section .sw-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  margin-bottom: 0.45rem;
+}
+.eth-subwallet-section .sw-card-head-right {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  justify-content: flex-end;
+}
+.eth-subwallet-section .sw-pill {
+  border-radius: 999px;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  border: 1px solid color-mix(in srgb, var(--eth-accent) 35%, #444);
+  background: color-mix(in srgb, var(--eth-accent) 12%, transparent);
+  color: var(--eth-accent-soft);
+}
+.eth-subwallet-section .sw-pill-muted {
+  opacity: 0.85;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  cursor: pointer;
+  background: rgba(0, 0, 0, 0.28);
+}
+.eth-subwallet-section .sw-pill-muted:hover {
+  border-color: var(--eth-accent-bright);
+  color: #fff;
+}
+.eth-subwallet-section .sw-live-tag {
+  font-size: 0.72rem;
+  font-weight: 600;
+  opacity: 0.75;
+  color: var(--eth-accent-soft);
+}
+
+/* Meta rows */
+.eth-subwallet-section .sw-card-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-bottom: 0.5rem;
+}
+.eth-subwallet-section .sw-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.35rem 0.75rem;
+}
+.eth-subwallet-section .sw-meta-k {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  opacity: 0.8;
+}
+.eth-subwallet-section .sw-meta-v {
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.eth-subwallet-section .sw-meta-v.mono,
+.eth-subwallet-section button.sw-meta-v {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+}
+.eth-subwallet-section button.sw-link.sw-meta-v,
+.eth-subwallet-section button.sw-meta-v {
+  background: none;
+  border: none;
+  color: var(--eth-accent-soft);
+  cursor: pointer;
+  padding: 0;
+  text-align: right;
+}
+.eth-subwallet-section button.sw-link.sw-meta-v:hover {
+  color: #fff;
+  text-decoration: underline;
+}
+
+/* Details panels */
+.eth-subwallet-section .sw-details {
+  margin: 0.4rem 0;
+  border: 1px solid color-mix(in srgb, var(--eth-accent) 18%, #333);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.22);
+  overflow: hidden;
+}
+.eth-subwallet-section .sw-details summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--eth-accent-bright);
+  user-select: none;
+}
+.eth-subwallet-section .sw-details summary::-webkit-details-marker {
+  display: none;
+}
+.eth-subwallet-section .sw-details summary::before {
+  content: '▸ ';
+  opacity: 0.75;
+}
+.eth-subwallet-section .sw-details[open] summary::before {
+  content: '▾ ';
+}
+.eth-subwallet-section .sw-details-body {
+  padding: 0 0.7rem 0.7rem;
+  border-top: 1px solid color-mix(in srgb, var(--eth-accent) 12%, #2a2a2a);
+}
+.eth-subwallet-section .sw-hint {
+  font-size: 0.75rem;
+  opacity: 0.8;
+  margin: 0.35rem 0 0.5rem;
+  line-height: 1.35;
+}
+
+/* Toolbar / controls */
+.eth-subwallet-section .subwallet-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+  margin-bottom: 0.65rem;
+}
+.eth-subwallet-section .regen-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+}
+.eth-subwallet-section .regen-input {
+  width: 6.5rem !important;
+  max-width: 100%;
+}
+.eth-subwallet-section .action-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  margin-top: 0.35rem;
+}
+.eth-subwallet-section .amount-input {
+  flex: 1 1 7rem;
+  min-width: 5rem;
+  max-width: 12rem;
+}
+.eth-subwallet-section .sw-card-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.35rem 0 0.5rem;
+}
+.eth-subwallet-section .sw-empty {
+  padding: 1.25rem 1rem;
+  text-align: center;
+  border: 1px dashed color-mix(in srgb, var(--eth-accent) 30%, #444);
+  border-radius: 12px;
+  opacity: 0.85;
+  font-size: 0.9rem;
+  color: var(--eth-accent-soft);
+}
+
+/* ⋮ card menu — blue shell (same layout as prior eth menu) */
+.eth-subwallet-section .eth-card-menu {
+  position: relative;
+}
+.eth-subwallet-section .eth-menu-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--eth-accent) 32%, rgba(255, 255, 255, 0.12));
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--eth-accent-soft);
+  cursor: pointer;
+  padding: 0;
+}
+.eth-subwallet-section .eth-menu-btn:hover {
+  border-color: var(--eth-accent-bright);
+  background: color-mix(in srgb, var(--eth-accent) 14%, transparent);
+}
+.eth-subwallet-section .eth-menu-dropdown {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 40;
+  min-width: 11.5rem;
+  padding: 0.3rem;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--eth-accent) 30%, rgba(255, 255, 255, 0.12));
+  background: rgba(10, 14, 28, 0.98);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.5);
+}
+.eth-subwallet-section .eth-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0.45rem 0.6rem;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #e8f4ff;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.eth-subwallet-section .eth-menu-item:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--eth-accent) 16%, transparent);
+}
+.eth-subwallet-section .eth-menu-item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.eth-subwallet-section .eth-menu-item.is-danger {
+  color: #ff8f8f;
+}
+
+/* Network badges inside eth section */
+.eth-subwallet-section .network-badge {
+  font-size: 0.65rem;
+}
+
+/* Action tabs — blue active state */
+.eth-subwallet-section .sw-action-tab.is-active {
+  border-color: color-mix(in srgb, var(--eth-accent) 55%, transparent);
+  background: color-mix(in srgb, var(--eth-accent) 18%, rgba(0, 0, 0, 0.35));
+  color: var(--eth-accent-soft);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--eth-accent) 18%, transparent);
+}
+.eth-subwallet-section .sw-action-tab:hover:not(.is-active) {
+  border-color: color-mix(in srgb, var(--eth-accent) 35%, #555);
+  color: var(--eth-accent-soft);
+}
+
+/* Primary buttons in eth section keep global primary (gold) or soft blue outline secondary */
+.eth-subwallet-section .btn.secondary.small {
+  border-color: color-mix(in srgb, var(--eth-accent) 35%, #555);
+  color: var(--eth-accent-soft);
+}
+.eth-subwallet-section .btn.secondary.small:hover:not(:disabled) {
+  border-color: var(--eth-accent-bright);
+  background: color-mix(in srgb, var(--eth-accent) 12%, transparent);
+}

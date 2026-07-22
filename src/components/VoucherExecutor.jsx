@@ -1,6 +1,7 @@
 /**
  * In-app L1 voucher list + execute (wWART mint, ERC-20 transfer, ETH, etc.).
  * Replaces the old "go use Portals explorer" dead-end.
+ * Shows decoded JSON before MetaMask executeVoucher.
  */
 import { useCallback, useEffect, useState } from 'react';
 import { toast } from 'react-hot-toast';
@@ -10,6 +11,8 @@ import {
   wasVoucherExecuted,
   getDappAddress,
 } from '../utils/vouchers.js';
+import { describeVoucherExecute, formatDescribeJson } from '../utils/mmTxDescribe.js';
+import { useMmTxConfirm } from './MmTxConfirm.jsx';
 
 export default function VoucherExecutor({
   address,
@@ -23,6 +26,8 @@ export default function VoucherExecutor({
   const [loading, setLoading] = useState(false);
   const [executing, setExecuting] = useState(null); // key
   const [statusMap, setStatusMap] = useState({}); // key -> 'ready'|'pending'|'done'|'error'
+  const [expanded, setExpanded] = useState({}); // key -> bool
+  const [confirmMmTx, mmTxModal] = useMmTxConfirm();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -89,6 +94,12 @@ export default function VoucherExecutor({
       return;
     }
     const key = `${v.inputIndex}:${v.voucherIndex}`;
+    const desc = describeVoucherExecute(v, { dappAddress: getDappAddress() });
+    const ok = await confirmMmTx(desc);
+    if (!ok) {
+      toast('Cancelled — nothing sent to MetaMask');
+      return;
+    }
     setExecuting(key);
     try {
       const { hash } = await executeVoucherOnL1(signer, v);
@@ -104,81 +115,96 @@ export default function VoucherExecutor({
     }
   };
 
+  const statusLabel = (st) =>
+    st === 'done' ? 'done' : st === 'ready' ? 'ready' : 'pending';
+
   return (
-    <div className={`voucher-exec ${compact ? 'voucher-exec--compact' : ''}`}>
+    <div className={`voucher-exec voucher-exec--compact ${compact ? '' : ''}`.trim()}>
+      {mmTxModal}
       <div className="voucher-exec-head">
-        <div>
+        <div className="voucher-exec-head-left">
           <h3 className="voucher-exec-title">L1 vouchers</h3>
           <p className="voucher-exec-sub">
-            After <strong>Withdraw</strong>, execute here so MetaMask receives wWART / ERC-20 / ETH.
-            Proofs appear after the rollup epoch (local demo is fast).
-          </p>
-          <p className="voucher-exec-sub mono">
-            Application {getDappAddress()?.slice(0, 10)}…
+            After Withdraw → Execute so MetaMask receives the token.
           </p>
         </div>
         <button type="button" className="btn small secondary" onClick={load} disabled={loading}>
-          {loading ? 'Loading…' : 'Refresh'}
+          {loading ? '…' : 'Refresh'}
         </button>
       </div>
 
       {rows.length === 0 && !loading ? (
-        <p className="voucher-exec-empty">
-          No vouchers yet. Mint/claim wWART, then use <strong>Withdraw voucher</strong> on Portals —
-          the mint voucher will show up here.
-        </p>
+        <p className="voucher-exec-empty">None yet — withdraw first, then execute here.</p>
       ) : (
         <ul className="voucher-exec-list">
           {rows.map((v) => {
             const key = `${v.inputIndex}:${v.voucherIndex}`;
             const st = statusMap[key] || (v.hasProof ? 'ready' : 'pending');
             const busy = executing === key;
+            const isOpen = !!expanded[key];
+            const detail = describeVoucherExecute(v, { dappAddress: getDappAddress() });
+            const when = v.timestamp
+              ? new Date(v.timestamp * 1000).toLocaleString(undefined, {
+                  month: 'short',
+                  day: 'numeric',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })
+              : null;
             return (
               <li key={key} className="voucher-exec-card">
                 <div className="voucher-exec-card-main">
                   <div className="voucher-exec-card-title">
                     {v.token ? <span className="voucher-pill">{v.token}</span> : null}
-                    <span>{v.summary}</span>
-                  </div>
-                  <div className="voucher-exec-meta mono">
-                    input #{v.inputIndex} · voucher #{v.voucherIndex}
-                    {v.timestamp
-                      ? ` · ${new Date(v.timestamp * 1000).toLocaleString()}`
-                      : ''}
-                  </div>
-                  <div className="voucher-exec-meta">
-                    dest {v.destination?.slice(0, 10)}… · status:{' '}
-                    <strong
-                      className={
-                        st === 'done'
-                          ? 'st-done'
-                          : st === 'ready'
-                            ? 'st-ready'
-                            : 'st-pending'
-                      }
-                    >
-                      {st === 'done'
-                        ? 'executed'
-                        : st === 'ready'
-                          ? 'ready to execute'
-                          : 'waiting for proof'}
+                    <span className="voucher-summary">{v.summary}</span>
+                    <strong className={`voucher-status st-${st === 'done' ? 'done' : st === 'ready' ? 'ready' : 'pending'}`}>
+                      {statusLabel(st)}
                     </strong>
                   </div>
+                  <div className="voucher-exec-meta mono">
+                    #{v.inputIndex}/{v.voucherIndex}
+                    {v.destination ? ` · ${v.destination.slice(0, 6)}…${v.destination.slice(-4)}` : ''}
+                    {when ? ` · ${when}` : ''}
+                    {' · '}
+                    <button
+                      type="button"
+                      className="voucher-json-toggle"
+                      onClick={() => setExpanded((m) => ({ ...m, [key]: !m[key] }))}
+                    >
+                      {isOpen ? 'hide JSON' : 'JSON'}
+                    </button>
+                  </div>
+                  {isOpen ? (
+                    <div className="voucher-json-blocks">
+                      {detail.sections.map((sec, i) => (
+                        <details
+                          key={`${key}-sec-${i}`}
+                          className="voucher-json-block"
+                          open={i === 0}
+                        >
+                          <summary>{sec.label}</summary>
+                          <pre className="voucher-json mono">
+                            {formatDescribeJson(sec.json)}
+                          </pre>
+                        </details>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
                 <button
                   type="button"
-                  className="btn primary small"
+                  className="btn primary small voucher-exec-btn"
                   disabled={busy || st === 'done' || st === 'pending' || !signer}
                   onClick={() => onExecute(v)}
                   title={
                     st === 'pending'
-                      ? 'Epoch proof not available yet'
+                      ? 'Waiting for epoch proof'
                       : st === 'done'
                         ? 'Already executed'
-                        : 'Call Application.executeVoucher via MetaMask'
+                        : 'Execute voucher on L1'
                   }
                 >
-                  {busy ? 'Executing…' : st === 'done' ? 'Done' : 'Execute on L1'}
+                  {busy ? '…' : st === 'done' ? 'Done' : 'Execute'}
                 </button>
               </li>
             );
@@ -189,32 +215,56 @@ export default function VoucherExecutor({
       <style>{`
         .voucher-exec {
           text-align: left;
-          margin-top: 0.75rem;
+          margin-top: 0.55rem;
+          width: 100%;
+          max-width: 100%;
+          min-width: 0;
+          box-sizing: border-box;
         }
         .voucher-exec-head {
           display: flex;
+          flex-wrap: wrap;
           justify-content: space-between;
-          gap: 0.75rem;
-          align-items: flex-start;
-          margin-bottom: 0.65rem;
+          gap: 0.4rem 0.65rem;
+          align-items: center;
+          margin-bottom: 0.45rem;
+          width: 100%;
+          min-width: 0;
+        }
+        .voucher-exec-head-left {
+          flex: 1 1 10rem;
+          min-width: 0;
+        }
+        .voucher-exec-head > .btn,
+        .voucher-exec-card > .btn,
+        .warthog-section .voucher-exec-head > .btn,
+        .warthog-section .voucher-exec-card > .btn {
+          width: auto !important;
+          max-width: none !important;
+          flex: 0 0 auto !important;
+          margin: 0 !important;
+          padding: 0.28rem 0.6rem !important;
+          font-size: 0.72rem !important;
         }
         .voucher-exec-title {
           margin: 0;
-          font-size: 0.95rem;
+          font-size: 0.82rem;
+          font-weight: 700;
           color: #00ffcc;
+          letter-spacing: 0.02em;
         }
         .voucher-exec-sub {
-          margin: 0.25rem 0 0;
-          font-size: 0.78rem;
-          opacity: 0.8;
-          line-height: 1.4;
-          max-width: 36rem;
-          overflow-wrap: anywhere;
+          margin: 0.12rem 0 0;
+          font-size: 0.7rem;
+          opacity: 0.7;
+          line-height: 1.3;
+          max-width: 100%;
+          white-space: normal;
         }
         .voucher-exec-empty {
-          font-size: 0.84rem;
-          opacity: 0.75;
-          margin: 0.5rem 0;
+          font-size: 0.74rem;
+          opacity: 0.7;
+          margin: 0.35rem 0;
         }
         .voucher-exec-list {
           list-style: none;
@@ -222,48 +272,133 @@ export default function VoucherExecutor({
           padding: 0;
           display: flex;
           flex-direction: column;
-          gap: 0.55rem;
+          gap: 0.35rem;
+          width: 100%;
+          min-width: 0;
         }
         .voucher-exec-card {
           display: flex;
+          flex-direction: row;
+          flex-wrap: wrap;
+          gap: 0.4rem 0.55rem;
+          align-items: flex-start;
           justify-content: space-between;
-          gap: 0.75rem;
-          align-items: center;
           border: 1px solid #2a2a2a;
-          border-radius: 12px;
-          padding: 0.65rem 0.75rem;
-          background: rgba(0, 0, 0, 0.35);
+          border-radius: 8px;
+          padding: 0.45rem 0.55rem;
+          background: rgba(0, 0, 0, 0.32);
+          width: 100%;
           min-width: 0;
+          max-width: 100%;
+          box-sizing: border-box;
         }
         .voucher-exec-card-main {
           min-width: 0;
-          flex: 1;
+          flex: 1 1 10rem;
+          max-width: 100%;
+          text-align: left;
         }
         .voucher-exec-card-title {
-          font-size: 0.84rem;
+          font-size: 0.78rem;
           display: flex;
           flex-wrap: wrap;
-          gap: 0.35rem;
+          gap: 0.25rem 0.35rem;
           align-items: center;
-          overflow-wrap: anywhere;
+          line-height: 1.3;
+        }
+        .voucher-summary {
+          flex: 1 1 auto;
+          min-width: 0;
+          white-space: normal;
+          overflow-wrap: break-word;
+        }
+        .voucher-status {
+          flex: 0 0 auto;
+          font-size: 0.65rem;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.03em;
         }
         .voucher-pill {
-          font-size: 0.7rem;
+          flex: 0 0 auto;
+          font-size: 0.62rem;
           font-weight: 700;
           color: #0a0a0a;
           background: #fdb913;
-          border-radius: 6px;
-          padding: 0.1rem 0.4rem;
+          border-radius: 4px;
+          padding: 0.05rem 0.32rem;
         }
         .voucher-exec-meta {
-          font-size: 0.72rem;
-          opacity: 0.7;
-          margin-top: 0.2rem;
-          overflow-wrap: anywhere;
+          font-size: 0.66rem;
+          opacity: 0.72;
+          margin-top: 0.15rem;
+          line-height: 1.35;
+          white-space: normal;
+          overflow-wrap: break-word;
         }
         .voucher-exec-meta.mono,
-        .mono {
+        .voucher-exec .mono {
           font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+        .voucher-json-toggle {
+          display: inline !important;
+          width: auto !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          border: none !important;
+          background: none !important;
+          color: color-mix(in srgb, #00ffcc 85%, #fff) !important;
+          font: inherit;
+          font-size: inherit;
+          font-weight: 600;
+          cursor: pointer;
+          box-shadow: none !important;
+          transform: none !important;
+        }
+        .voucher-json-toggle:hover {
+          text-decoration: underline;
+        }
+        .voucher-json-blocks {
+          margin-top: 0.3rem;
+          display: flex;
+          flex-direction: column;
+          gap: 0.25rem;
+          width: 100%;
+          min-width: 0;
+        }
+        .voucher-json-block {
+          border-radius: 6px;
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          background: rgba(0, 0, 0, 0.28);
+          overflow: hidden;
+          width: 100%;
+          min-width: 0;
+        }
+        .voucher-json-block summary {
+          cursor: pointer;
+          padding: 0.22rem 0.4rem;
+          font-size: 0.65rem;
+          font-weight: 600;
+          color: color-mix(in srgb, #fdb913 65%, #fff);
+          list-style: none;
+          user-select: none;
+        }
+        .voucher-json-block summary::-webkit-details-marker { display: none; }
+        .voucher-json {
+          margin: 0;
+          padding: 0.3rem 0.4rem 0.4rem;
+          border-top: 1px solid rgba(255, 255, 255, 0.06);
+          font-size: 0.64rem;
+          line-height: 1.35;
+          white-space: pre-wrap;
+          word-break: break-word;
+          overflow-wrap: break-word;
+          max-height: 9rem;
+          overflow: auto;
+          color: #d8fff6;
+          width: 100%;
+          max-width: 100%;
+          box-sizing: border-box;
         }
         .st-ready { color: #4ade80; }
         .st-pending { color: #fbbf24; }

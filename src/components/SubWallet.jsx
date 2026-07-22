@@ -1,8 +1,9 @@
 // src/components/SubWallet.jsx
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { gql, GraphQLClient } from 'graphql-request';
 import { keccak256, toUtf8Bytes, toUtf8String } from 'ethers-v6';
 import { Toaster, toast } from 'react-hot-toast';
+import { RefreshCw, Eye, EyeOff, MoreVertical } from 'lucide-react';
 import '../styles/subWallet.css';
 import { createWarthogApi, signAndSubmitTransaction } from '../utils/warthogClient.js';
 import { getTxConfirmationStatus } from '../utils/txProof.js';
@@ -70,6 +71,8 @@ function SubWallet({
   mmWwartBal = null,
   onRefreshL1Vault,
   onRefreshMmWwart,
+  /** Parent switches to Vault tab (⋮ menu / Open vault) */
+  onOpenVaultTab = null,
 }) {
   const [subError, setSubError] = useState(null);
   const [subDeposits, setSubDeposits] = useState({});
@@ -93,6 +96,8 @@ function SubWallet({
    */
   const [unloadedVaults, setUnloadedVaults] = useState([]);
   const [unloadedBusy, setUnloadedBusy] = useState(false);
+  /** Unloaded vaults panel starts collapsed — open only via toggle. */
+  const [unloadedPanelOpen, setUnloadedPanelOpen] = useState(false);
   /** Vault addresses user hid / dismissed (persist — do not auto-reattach). */
   const [dismissedVaults, setDismissedVaults] = useState([]);
   // Controlled <details> open flags per sub (survive re-renders; default closed)
@@ -117,6 +122,11 @@ function SubWallet({
   const [vaultActionTab, setVaultActionTab] = useState('withdraw'); // burn | withdraw
   /** Include subs marked hidden (stuck old vaults) in the carousel */
   const [showHiddenSubs, setShowHiddenSubs] = useState(false);
+  /** Toggle Balances across layers body (header stays for show/hide) */
+  const [showLayersCard, setShowLayersCard] = useState(true);
+  /** Which card ⋮ menu is open: `sub:3` | `vault:3` | null */
+  const [openMenuKey, setOpenMenuKey] = useState(null);
+  const cardMenuRef = useRef(null);
 
   // Screen size state
   const [isSmallScreen, setIsSmallScreen] = useState(window.innerWidth <= 688);
@@ -1561,6 +1571,27 @@ function SubWallet({
       ...prev,
       [sub.index]: sub.balance || '0'
     }));
+  };
+
+  /** Max main → sub from main wallet spendable (ETH-style fund row). */
+  const setMaxDeposit = async (sub) => {
+    try {
+      if (!mainWallet?.address || !fetchBalanceAndNonce) return;
+      const live = await fetchBalanceAndNonce(mainWallet.address, true);
+      const free = String(live.spendable || live.balance || '0');
+      const feeWart = 0.01;
+      let maxStr = String(Math.max(0, Number(free) - feeWart));
+      try {
+        const spendE8 = BigInt(wartToE8String(free));
+        const feeE8 = BigInt(wartToE8String('0.01'));
+        maxStr = e8ToWartDisplay(spendE8 > feeE8 ? spendE8 - feeE8 : 0n);
+      } catch {
+        /* use Number path */
+      }
+      setSubDeposits((prev) => ({ ...prev, [sub.index]: maxStr }));
+    } catch (e) {
+      console.warn('setMaxDeposit', e);
+    }
   };
 
   const setMaxSweep = async (sub) => {
@@ -3333,12 +3364,20 @@ function SubWallet({
     const openBurn = openVaultPanels[detailsKey]?.burn === true;
     const openDetails = openVaultPanels[detailsKey]?.details === true;
 
+    const lockedTag =
+      sub.locked || outE8 > 0n ? (
+        <span className="sw-live-tag"> · locked</span>
+      ) : null;
+
     return (
       <div
         className={`sw-card sw-card--vault ${sub.locking ? 'is-busy' : ''}`}
       >
         <div className="sw-card-head">
-          <h4 className="sw-card-title">Vault</h4>
+          <h4 className="sw-card-title">
+            WART vault
+            {lockedTag}
+          </h4>
           <div className="sw-card-head-right">
             <button
               type="button"
@@ -3346,38 +3385,35 @@ function SubWallet({
               title={`Copy sub index ${sub.index}`}
               onClick={() => copyToClipboard(String(sub.index), 'Sub index')}
             >
-              sub #{sub.index}
+              {isSmallScreen ? `#${String(sub.index).slice(0, 6)}…` : `#${sub.index}`}
             </button>
             <span className={`sw-pill ${st.className}`}>{st.label}</span>
+            {renderCardMenu(`vault:${sub.index}`, [
+              {
+                label: 'Copy vault address',
+                onClick: () => copyToClipboard(vaultAddr, 'Vault address'),
+              },
+              {
+                label: 'Copy sub address',
+                onClick: () => copyToClipboard(sub.address, 'Sub address'),
+              },
+              {
+                label: 'Refresh vault balance',
+                onClick: () => {
+                  if (typeof onRefreshL1Vault === 'function') onRefreshL1Vault();
+                  refreshSubBalance?.(sub.address);
+                },
+              },
+              {
+                label: 'Hide linked sub',
+                onClick: () => hideSubWallet(sub),
+              },
+            ])}
           </div>
         </div>
 
-        {/* Always-visible summary — clear collateral vs withdrawable */}
+        {/* Always-visible summary — same density as ETH vault card */}
         <div className="sw-card-meta">
-          <div className="sw-meta-row">
-            <span className="sw-meta-k">Sub index</span>
-            <button
-              type="button"
-              className="sw-meta-v mono sw-link"
-              title="Copy HD sub index"
-              onClick={() => copyToClipboard(String(sub.index), 'Sub index')}
-            >
-              #{sub.index}
-            </button>
-          </div>
-          <div className="sw-meta-row">
-            <span className="sw-meta-k">Sub address</span>
-            <button
-              type="button"
-              className="sw-meta-v mono sw-link"
-              title={sub.address}
-              onClick={() => copyToClipboard(sub.address, 'Sub address')}
-            >
-              {isSmallScreen
-                ? `${String(sub.address).slice(0, 6)}…${String(sub.address).slice(-4)}`
-                : sub.address}
-            </button>
-          </div>
           <div className="sw-meta-row">
             <span className="sw-meta-k" title="Total native WART sitting on the vault address">
               In vault
@@ -3394,24 +3430,21 @@ function SubWallet({
               ) : null}
             </span>
           </div>
-          {outE8 > 0n && (
-            <div className="sw-meta-row">
-              <span
-                className="sw-meta-k"
-                title="Native WART on the vault pinned as mint capacity (not MetaMask ERC-20 wWART). One figure only — same as capacity credit."
-              >
-                Locked collateral
-              </span>
-              <span className="sw-meta-v">
-                {e8ToWartDisplay(sub.mintedE8 || '0')} WART
-                <span className="sw-live-tag">· capacity pin</span>
-              </span>
-            </div>
-          )}
           <div className="sw-meta-row">
             <span
               className="sw-meta-k"
-              title="Native WART you can Vault → main after Release (in vault − locked collateral)"
+              title="Native WART on the vault pinned as mint capacity"
+            >
+              Locked
+            </span>
+            <span className="sw-meta-v">
+              {outE8 > 0n ? e8ToWartDisplay(sub.mintedE8 || '0') : '0'} WART
+            </span>
+          </div>
+          <div className="sw-meta-row">
+            <span
+              className="sw-meta-k"
+              title="Native WART you can Vault → main after Release"
             >
               Withdrawable
             </span>
@@ -3419,17 +3452,48 @@ function SubWallet({
               {outE8 > 0n ? freeable : totalInVault === '…' ? '…' : freeable} WART
             </span>
           </div>
+          <div className="sw-meta-row">
+            <span className="sw-meta-k">Vault</span>
+            <button
+              type="button"
+              className="sw-meta-v mono sw-link"
+              title={vaultAddr}
+              onClick={() => copyToClipboard(vaultAddr, 'Vault address')}
+            >
+              {displayedVaultAddr}
+            </button>
+          </div>
+          <div className="sw-meta-row">
+            <span className="sw-meta-k">Sub free</span>
+            <span className="sw-meta-v">{sub.balance ?? '0'} WART</span>
+          </div>
         </div>
 
-        {/* Offline vault-share — also on empty vault / sub card when hidden */}
-        <div className="sw-card-actions sw-vault-share-backup">
-          <p className="wh-hint sw-l1-track-hint" style={{ marginBottom: '0.5rem' }}>
-            <strong>Vault share backup</strong> — your half of the key is only in this browser.
-            Download <code>{VAULT_SHARE_DOWNLOAD_NAME}</code> as an opaque password blob (like{' '}
-            <code>warthog_wallet.txt</code>). Cosigner still holds <code>d_dapp</code> separately.
-          </p>
-          {renderVaultShareControls(sub, { compact: true })}
+        <div className="sw-card-toolbar">
+          <button
+            type="button"
+            className="btn primary small"
+            onClick={() => {
+              if (typeof onRefreshL1Vault === 'function') onRefreshL1Vault();
+              refreshSubBalance?.(sub.address);
+            }}
+            disabled={loading}
+          >
+            Refresh
+          </button>
         </div>
+
+        <details className="sw-details">
+          <summary>Vault share backup</summary>
+          <div className="sw-details-body">
+            <p className="sw-hint" style={{ marginBottom: '0.5rem' }}>
+              Your half of the key is only in this browser. Download{' '}
+              <code>{VAULT_SHARE_DOWNLOAD_NAME}</code> as an opaque password blob. Cosigner still
+              holds <code>d_dapp</code> separately.
+            </p>
+            {renderVaultShareControls(sub, { compact: true })}
+          </div>
+        </details>
 
         <details
           className="sw-details"
@@ -3794,6 +3858,73 @@ function SubWallet({
 
   const isVaultFocus = focusMode === 'vault';
 
+  useEffect(() => {
+    if (!openMenuKey) return undefined;
+    const onDoc = (e) => {
+      if (cardMenuRef.current && !cardMenuRef.current.contains(e.target)) {
+        setOpenMenuKey(null);
+      }
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') setOpenMenuKey(null);
+    };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [openMenuKey]);
+
+  const toggleCardMenu = (key) => {
+    setOpenMenuKey((prev) => (prev === key ? null : key));
+  };
+
+  /** ⋮ menu — same pattern as ETH sub/vault cards */
+  const renderCardMenu = (menuKey, items) => {
+    const open = openMenuKey === menuKey;
+    return (
+      <div
+        className="sw-card-menu"
+        ref={open ? cardMenuRef : undefined}
+        style={{ position: 'relative', marginLeft: 'auto' }}
+      >
+        <button
+          type="button"
+          className="sw-menu-btn"
+          aria-label="Card menu"
+          aria-expanded={open}
+          title="More actions"
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleCardMenu(menuKey);
+          }}
+        >
+          <MoreVertical size={16} />
+        </button>
+        {open ? (
+          <div className="sw-menu-dropdown" role="menu">
+            {items.map((item) => (
+              <button
+                key={item.label}
+                type="button"
+                role="menuitem"
+                className={`sw-menu-item${item.danger ? ' is-danger' : ''}`}
+                disabled={item.disabled}
+                onClick={() => {
+                  setOpenMenuKey(null);
+                  item.onClick?.();
+                }}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
   // Sub wallets tab: all non-hidden subs (create vault lives here).
   // Vault tab: only subs that currently have a vault attached — no empty "create vault" hang.
   const visibleSubs = isVaultFocus
@@ -3876,197 +4007,219 @@ function SubWallet({
 
   const renderUnloadedVaultsPanel = () => {
     if (!isVaultFocus) return null;
+    const n = unloadedOnly.length;
+    const value =
+      unloadedBusy && unloadedVaults.length === 0
+        ? '…'
+        : n > 0
+          ? String(n)
+          : '—';
     return (
-      <div className="sw-card sw-card--unloaded">
-        <div className="sw-card-head">
-          <h4 className="sw-card-title">Unloaded vaults</h4>
-          <div className="sw-card-head-right">
-            <button
-              type="button"
-              className="btn secondary small"
-              disabled={unloadedBusy}
-              onClick={() => discoverUnloadedVaults()}
-            >
-              {unloadedBusy ? 'Scanning…' : 'Refresh'}
-            </button>
-          </div>
+      <div
+        className={`sw-unloaded-panel${unloadedPanelOpen ? ' is-open' : ''}`}
+      >
+        <div className="sw-meta-row sw-unloaded-toggle-row">
+          <span className="sw-meta-k">Unloaded</span>
+          <button
+            type="button"
+            className="sw-meta-v mono sw-link sw-unloaded-toggle"
+            aria-expanded={unloadedPanelOpen}
+            title="History / cosigner vaults not on a card — click to expand"
+            onClick={() => setUnloadedPanelOpen((open) => !open)}
+          >
+            {unloadedPanelOpen ? '▾' : '▸'} {value}
+          </button>
         </div>
-        <p className="sw-card-empty-msg" style={{ marginTop: 0 }}>
-          History / cosigner vaults not on a card. <strong>Dismiss</strong> hides them (no auto-load;
-          funds stay on-chain). <strong>Load on sub</strong> is view-only without that vault’s{' '}
-          <code>d_user</code> share. Create new multi-sig vaults on the <strong>Sub wallets</strong>{' '}
-          tab.
-        </p>
-        {unloadedBusy && unloadedVaults.length === 0 ? (
-          <p className="sw-tab-empty">Scanning notices &amp; balances…</p>
-        ) : unloadedOnly.length === 0 ? (
-          <p className="sw-tab-empty">
-            {unloadedVaults.length === 0
-              ? 'No other vaults found for this L1 / sub history yet.'
-              : 'No undismissed unloaded vaults (see dismissed below if any).'}
-          </p>
-        ) : (
-          <ul className="sw-unloaded-list">
-            {unloadedOnly.map((v) => {
-              const short = `${v.vaultAddress.slice(0, 10)}…${v.vaultAddress.slice(-6)}`;
-              const subShort = v.subAddress
-                ? `${v.subAddress.slice(0, 6)}…${v.subAddress.slice(-4)}`
-                : '—';
-              const idxLabel =
-                v.subIndex != null && Number.isFinite(Number(v.subIndex))
-                  ? `#${v.subIndex}`
-                  : null;
-              return (
-                <li key={v.vaultAddress} className="sw-unloaded-row">
-                  <div className="sw-unloaded-main">
-                    <button
-                      type="button"
-                      className="sw-meta-v mono sw-link"
-                      title={v.vaultAddress}
-                      onClick={() => copyToClipboard(v.vaultAddress, 'Vault address')}
-                    >
-                      {short}
-                    </button>
-                    <span className="sw-unloaded-bal">
-                      {v.balance !== '—' ? `${v.balance} WART` : 'balance ?'}
-                    </span>
-                    <span className="sw-muted sw-unloaded-meta">
-                      {idxLabel ? (
+        {unloadedPanelOpen ? (
+          <div className="sw-unloaded-panel-body">
+            <div className="sw-card-head sw-unloaded-head">
+              <p className="sw-card-empty-msg" style={{ margin: 0, flex: 1 }}>
+                Not on a card. <strong>Load</strong> (view-only without{' '}
+                <code>d_user</code>) or <strong>Dismiss</strong>. New vaults: Sub wallets.
+              </p>
+              <div className="sw-card-head-right">
+                <button
+                  type="button"
+                  className="btn secondary small"
+                  disabled={unloadedBusy}
+                  onClick={() => discoverUnloadedVaults()}
+                >
+                  {unloadedBusy ? '…' : '↻'}
+                </button>
+              </div>
+            </div>
+            {unloadedBusy && unloadedVaults.length === 0 ? (
+              <p className="sw-tab-empty">Scanning notices &amp; balances…</p>
+            ) : unloadedOnly.length === 0 ? (
+              <p className="sw-tab-empty">
+                {unloadedVaults.length === 0
+                  ? 'No other vaults found for this L1 / sub history yet.'
+                  : 'No undismissed unloaded vaults (see dismissed below if any).'}
+              </p>
+            ) : (
+              <ul className="sw-unloaded-list">
+                {unloadedOnly.map((v) => {
+                  const short = `${v.vaultAddress.slice(0, 10)}…${v.vaultAddress.slice(-6)}`;
+                  const subShort = v.subAddress
+                    ? `${v.subAddress.slice(0, 6)}…${v.subAddress.slice(-4)}`
+                    : '—';
+                  const idxLabel =
+                    v.subIndex != null && Number.isFinite(Number(v.subIndex))
+                      ? `#${v.subIndex}`
+                      : null;
+                  return (
+                    <li key={v.vaultAddress} className="sw-unloaded-row">
+                      <div className="sw-unloaded-main">
                         <button
                           type="button"
-                          className="sw-link"
-                          title="Copy HD sub index — use Regen if sub is missing"
-                          onClick={() =>
-                            copyToClipboard(String(v.subIndex), 'Sub index')
-                          }
+                          className="sw-meta-v mono sw-link"
+                          title={v.vaultAddress}
+                          onClick={() => copyToClipboard(v.vaultAddress, 'Vault address')}
                         >
-                          sub {idxLabel}
+                          {short}
                         </button>
-                      ) : (
-                        'sub index ?'
-                      )}
-                      {` · ${subShort}`}
-                      {v.lastType ? ` · ${v.lastType}` : ''}
-                    </span>
-                  </div>
-                  <div className="sw-unloaded-actions">
-                    <button
-                      type="button"
-                      className="btn primary small"
-                      title={
-                        idxLabel
-                          ? `Attach to sub ${idxLabel} (view only without user share)`
-                          : 'Attach to matching or first sub'
-                      }
-                      onClick={() => loadDiscoveredVaultOntoSub(v)}
-                    >
-                      {idxLabel ? `Load on sub ${idxLabel}` : 'Load on sub'}
-                    </button>
-                    <button
-                      type="button"
-                      className="btn secondary small"
-                      title="Hide from this list forever (until Undismiss). Funds stay on-chain."
-                      onClick={() => {
-                        dismissVaultAddress(v.vaultAddress);
-                        // Also detach from any sub still showing this vault
-                        setSubWallets((prev) =>
-                          prev.map((s) => {
-                            const va = String(
-                              s.vaultAddress || s.pendingVaultAddress || '',
-                            )
-                              .replace(/^0x/i, '')
-                              .toLowerCase();
-                            if (va !== v.vaultAddress) return s;
-                            return {
-                              ...s,
-                              vaultAddress: null,
-                              pendingVaultAddress: null,
-                              vaultBalance: null,
-                              vaultSpendable: null,
-                              vaultBalanceAt: null,
-                              vaultDetached: true,
-                              locked: false,
-                              locking: false,
-                              mintedE8: '0',
-                            };
-                          }),
-                        );
-                        toast.success(
-                          `Dismissed ${v.vaultAddress.slice(0, 10)}… — gone from Unloaded & cards`,
-                          { duration: 5000 },
-                        );
-                        // Optimistic UI — remove from list immediately
-                        setUnloadedVaults((prev) =>
-                          prev.map((row) =>
-                            row.vaultAddress === v.vaultAddress
-                              ? { ...row, dismissed: true, loaded: false }
-                              : row,
-                          ),
-                        );
-                      }}
-                    >
-                      Dismiss
-                    </button>
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-        {dismissedOnly.length > 0 && (
-          <details className="sw-unloaded-loaded">
-            <summary>Dismissed ({dismissedOnly.length}) — hidden until Undismiss</summary>
-            <ul className="sw-unloaded-list sw-unloaded-list--dim">
-              {dismissedOnly.map((v) => (
-                <li key={`dismissed-${v.vaultAddress}`} className="sw-unloaded-row">
-                  <span className="mono">
-                    {v.vaultAddress.slice(0, 10)}…{v.vaultAddress.slice(-6)}
-                  </span>
-                  <span className="sw-unloaded-bal">
-                    {v.balance !== '—' ? `${v.balance} WART` : '—'}
-                  </span>
-                  <button
-                    type="button"
-                    className="btn secondary small"
-                    onClick={() => {
-                      undismissVaultAddress(v.vaultAddress);
-                      setUnloadedVaults((prev) =>
-                        prev.map((row) =>
-                          row.vaultAddress === v.vaultAddress
-                            ? { ...row, dismissed: false }
-                            : row,
-                        ),
-                      );
-                      toast.success('Undismissed — use Load on sub if needed');
-                    }}
-                  >
-                    Undismiss
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </details>
-        )}
-        {discoveredLoaded.length > 0 && (
-          <details className="sw-unloaded-loaded">
-            <summary>
-              Also on chain/history ({discoveredLoaded.length} already on a card)
-            </summary>
-            <ul className="sw-unloaded-list sw-unloaded-list--dim">
-              {discoveredLoaded.map((v) => (
-                <li key={`loaded-${v.vaultAddress}`} className="sw-unloaded-row">
-                  <span className="mono">
-                    {v.vaultAddress.slice(0, 10)}…{v.vaultAddress.slice(-6)}
-                  </span>
-                  <span className="sw-unloaded-bal">
-                    {v.balance !== '—' ? `${v.balance} WART` : '—'}
-                  </span>
-                  <span className="sw-muted">loaded</span>
-                </li>
-              ))}
-            </ul>
-          </details>
-        )}
+                        <span className="sw-unloaded-bal">
+                          {v.balance !== '—' ? `${v.balance} WART` : 'balance ?'}
+                        </span>
+                        <span className="sw-muted sw-unloaded-meta">
+                          {idxLabel ? (
+                            <button
+                              type="button"
+                              className="sw-link"
+                              title="Copy HD sub index — use Regen if sub is missing"
+                              onClick={() =>
+                                copyToClipboard(String(v.subIndex), 'Sub index')
+                              }
+                            >
+                              sub {idxLabel}
+                            </button>
+                          ) : (
+                            'sub index ?'
+                          )}
+                          {` · ${subShort}`}
+                          {v.lastType ? ` · ${v.lastType}` : ''}
+                        </span>
+                      </div>
+                      <div className="sw-unloaded-actions">
+                        <button
+                          type="button"
+                          className="btn primary small"
+                          title={
+                            idxLabel
+                              ? `Attach to sub ${idxLabel} (view only without user share)`
+                              : 'Attach to matching or first sub'
+                          }
+                          onClick={() => loadDiscoveredVaultOntoSub(v)}
+                        >
+                          {idxLabel ? `Load on sub ${idxLabel}` : 'Load on sub'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn secondary small"
+                          title="Hide from this list forever (until Undismiss). Funds stay on-chain."
+                          onClick={() => {
+                            dismissVaultAddress(v.vaultAddress);
+                            // Also detach from any sub still showing this vault
+                            setSubWallets((prev) =>
+                              prev.map((s) => {
+                                const va = String(
+                                  s.vaultAddress || s.pendingVaultAddress || '',
+                                )
+                                  .replace(/^0x/i, '')
+                                  .toLowerCase();
+                                if (va !== v.vaultAddress) return s;
+                                return {
+                                  ...s,
+                                  vaultAddress: null,
+                                  pendingVaultAddress: null,
+                                  vaultBalance: null,
+                                  vaultSpendable: null,
+                                  vaultBalanceAt: null,
+                                  vaultDetached: true,
+                                  locked: false,
+                                  locking: false,
+                                  mintedE8: '0',
+                                };
+                              }),
+                            );
+                            toast.success(
+                              `Dismissed ${v.vaultAddress.slice(0, 10)}… — gone from Unloaded & cards`,
+                              { duration: 5000 },
+                            );
+                            // Optimistic UI — remove from list immediately
+                            setUnloadedVaults((prev) =>
+                              prev.map((row) =>
+                                row.vaultAddress === v.vaultAddress
+                                  ? { ...row, dismissed: true, loaded: false }
+                                  : row,
+                              ),
+                            );
+                          }}
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            {dismissedOnly.length > 0 && (
+              <details className="sw-unloaded-loaded">
+                <summary>Dismissed ({dismissedOnly.length}) — hidden until Undismiss</summary>
+                <ul className="sw-unloaded-list sw-unloaded-list--dim">
+                  {dismissedOnly.map((v) => (
+                    <li key={`dismissed-${v.vaultAddress}`} className="sw-unloaded-row">
+                      <span className="mono">
+                        {v.vaultAddress.slice(0, 10)}…{v.vaultAddress.slice(-6)}
+                      </span>
+                      <span className="sw-unloaded-bal">
+                        {v.balance !== '—' ? `${v.balance} WART` : '—'}
+                      </span>
+                      <button
+                        type="button"
+                        className="btn secondary small"
+                        onClick={() => {
+                          undismissVaultAddress(v.vaultAddress);
+                          setUnloadedVaults((prev) =>
+                            prev.map((row) =>
+                              row.vaultAddress === v.vaultAddress
+                                ? { ...row, dismissed: false }
+                                : row,
+                            ),
+                          );
+                          toast.success('Undismissed — use Load on sub if needed');
+                        }}
+                      >
+                        Undismiss
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
+            {discoveredLoaded.length > 0 && (
+              <details className="sw-unloaded-loaded">
+                <summary>
+                  Also on chain/history ({discoveredLoaded.length} already on a card)
+                </summary>
+                <ul className="sw-unloaded-list sw-unloaded-list--dim">
+                  {discoveredLoaded.map((v) => (
+                    <li key={`loaded-${v.vaultAddress}`} className="sw-unloaded-row">
+                      <span className="mono">
+                        {v.vaultAddress.slice(0, 10)}…{v.vaultAddress.slice(-6)}
+                      </span>
+                      <span className="sw-unloaded-bal">
+                        {v.balance !== '—' ? `${v.balance} WART` : '—'}
+                      </span>
+                      <span className="sw-muted">loaded</span>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </div>
+        ) : null}
       </div>
     );
   };
@@ -4085,7 +4238,7 @@ function SubWallet({
         {isVaultFocus ? (
           <ol className="bridge-flow-steps">
             <li><span className="step-num">1</span><span>Only loaded vaults here — create new ones on <strong>Sub wallets</strong></span></li>
-            <li><span className="step-num">2</span><span><strong>Unloaded vaults</strong> → Load on sub or <strong>Dismiss</strong></span></li>
+            <li><span className="step-num">2</span><span>Open <strong>Unloaded vaults</strong> → Load on sub or <strong>Dismiss</strong></span></li>
             <li><span className="step-num">3</span><span>Release locked WART if needed, then Vault → main</span></li>
           </ol>
         ) : (
@@ -4105,141 +4258,174 @@ function SubWallet({
     </div>
 
     {/* Cross-layer: locked vault WART · WLIQ · wWART claim · MetaMask ERC-20 */}
-    <div className="sw-card sw-card--l1-track">
+    <div
+      className={`sw-card sw-card--l1-track${showLayersCard ? '' : ' is-collapsed'}`}
+    >
       <div className="sw-card-head">
         <h4 className="sw-card-title">Balances across layers</h4>
-        <div className="sw-card-head-right">
+        <div className="sw-card-head-right sw-layers-actions">
           <button
             type="button"
-            className="btn secondary small"
+            className="sw-icon-btn"
+            title="Refresh L1 balances"
+            aria-label="Refresh L1 balances"
             onClick={() => {
               if (typeof onRefreshL1Vault === 'function') onRefreshL1Vault();
               if (typeof onRefreshMmWwart === 'function') onRefreshMmWwart();
             }}
           >
-            Refresh L1
+            <RefreshCw size={14} strokeWidth={2.25} aria-hidden />
+          </button>
+          <button
+            type="button"
+            className="sw-icon-btn"
+            title={
+              showLayersCard
+                ? 'Hide balances across layers'
+                : 'Show balances across layers'
+            }
+            aria-label={
+              showLayersCard
+                ? 'Hide balances across layers'
+                : 'Show balances across layers'
+            }
+            aria-expanded={showLayersCard}
+            onClick={() => setShowLayersCard((v) => !v)}
+          >
+            {showLayersCard ? (
+              <EyeOff size={14} strokeWidth={2.25} aria-hidden />
+            ) : (
+              <Eye size={14} strokeWidth={2.25} aria-hidden />
+            )}
           </button>
         </div>
       </div>
-      <div className="sw-card-meta">
-        <div className="sw-meta-row">
-          <span
-            className="sw-meta-k"
-            title="Native WART still locked as collateral on your vaults. Release this to free withdrawable WART."
-          >
-            Locked WART
-          </span>
-          <span className="sw-meta-v">
-            {e8ToWartDisplay(clientSpoofedE8)} WART
-          </span>
-        </div>
-        <div className="sw-meta-row">
-          <span
-            className="sw-meta-k"
-            title={`${SHARE_TOKEN.symbol} share held on the rollup (mint/burn on Warthog Home). Uses the same capacity pool as wWART claims.`}
-          >
-            Rollup {SHARE_TOKEN.symbol}
-          </span>
-          <span className="sw-meta-v">
-            {fmtAmt(rollupWliqHuman)} {SHARE_TOKEN.symbol}
-          </span>
-        </div>
-        <div className="sw-meta-row">
-          <span
-            className="sw-meta-k"
-            title="Rollup wWART capacity claim — withdraw + execute voucher to mint ERC-20 in MetaMask"
-          >
-            Rollup wWART claim
-          </span>
-          <span className="sw-meta-v">{fmtAmt(rollupClaimHuman)} wWART</span>
-        </div>
-        <div className="sw-meta-row">
-          <span
-            className="sw-meta-k"
-            title="ERC-20 wWART already in your connected MetaMask wallet"
-          >
-            MetaMask
-          </span>
-          <span className="sw-meta-v">
-            {mmHuman != null ? `${fmtAmt(mmHuman)} wWART` : '— connect MM'}
-          </span>
-        </div>
-      </div>
-      <p className="wh-hint sw-l1-track-hint">
-        <strong>Locked WART</strong> is vault collateral.{' '}
-        <strong>{SHARE_TOKEN.symbol}</strong> and <strong>wWART claim</strong> are rollup shares
-        against that capacity. MetaMask shows L1 ERC-20 after voucher execute.
-      </p>
+      {showLayersCard && (
+        <>
+          <div className="sw-card-meta">
+            <div className="sw-meta-row">
+              <span
+                className="sw-meta-k"
+                title="Native WART still locked as collateral on your vaults. Release this to free withdrawable WART."
+              >
+                Locked WART
+              </span>
+              <span className="sw-meta-v">
+                {e8ToWartDisplay(clientSpoofedE8)} WART
+              </span>
+            </div>
+            <div className="sw-meta-row">
+              <span
+                className="sw-meta-k"
+                title={`${SHARE_TOKEN.symbol} share held on the rollup (mint/burn on Warthog Home). Uses the same capacity pool as wWART claims.`}
+              >
+                Rollup {SHARE_TOKEN.symbol}
+              </span>
+              <span className="sw-meta-v">
+                {fmtAmt(rollupWliqHuman)} {SHARE_TOKEN.symbol}
+              </span>
+            </div>
+            <div className="sw-meta-row">
+              <span
+                className="sw-meta-k"
+                title="Rollup wWART capacity claim — withdraw + execute voucher to mint ERC-20 in MetaMask"
+              >
+                Rollup wWART claim
+              </span>
+              <span className="sw-meta-v">{fmtAmt(rollupClaimHuman)} wWART</span>
+            </div>
+            <div className="sw-meta-row">
+              <span
+                className="sw-meta-k"
+                title="ERC-20 wWART already in your connected MetaMask wallet"
+              >
+                MetaMask
+              </span>
+              <span className="sw-meta-v">
+                {mmHuman != null ? `${fmtAmt(mmHuman)} wWART` : '— connect MM'}
+              </span>
+            </div>
+          </div>
+          <p className="wh-hint sw-l1-track-hint">
+            <strong>Locked WART</strong> is vault collateral.{' '}
+            <strong>{SHARE_TOKEN.symbol}</strong> and <strong>wWART claim</strong> are rollup
+            shares against that capacity. MetaMask shows L1 ERC-20 after voucher execute.
+          </p>
+        </>
+      )}
     </div>
 
     {/* History vaults not on the active card (re-create / wrong local address) */}
     {renderUnloadedVaultsPanel()}
 
-    {/* Sub generation only on Sub wallets tab — not on Vault tab */}
+    {/* Sub generation only on Sub wallets tab — not on Vault tab.
+        Layout matches ETH: Generate | Index | Regen on one neat row. */}
     {!isVaultFocus && (
-    <div className="subwallet-controls">
-      <button
-        onClick={generateAndFocus}
-        disabled={loading}
-        className="btn primary small"
-      >
-        + Generate sub
-      </button>
-
-      <div className="regen-group">
-        <input
-          type="number"
-          placeholder="Index"
-          value={regenIndex}
-          onChange={(e) => setRegenIndex(e.target.value)}
-          className="input regen-input"
-          title="HD index to regenerate (click sub index to copy)"
-        />
-        <button
-          onClick={async () => {
-            const idx = Number(regenIndex);
-            await regenerateSubWallet();
-            setShowHiddenSubs(false);
-            if (!Number.isNaN(idx)) {
-              setTimeout(() => {
-                setActiveSubPos(0);
-                // focus after list updates — match by index in visible list
-                setActiveSubPos((_) => {
-                  const list = subWallets.filter((s) => !s.hidden || s.index === idx);
-                  const pos = list.findIndex((s) => s.index === idx);
-                  return pos >= 0 ? pos : 9999;
-                });
-              }, 100);
-            }
-          }}
-          disabled={loading || !regenIndex}
-          className="btn secondary small"
-        >
-          Regen
-        </button>
-      </div>
-
-      {hiddenCount > 0 && (
-        <div className="sw-hidden-controls">
+      <>
+        <div className="subwallet-controls">
           <button
             type="button"
-            className="btn secondary small"
-            onClick={() => setShowHiddenSubs((v) => !v)}
-            title="Show or hide subs marked hidden"
+            onClick={generateAndFocus}
+            disabled={loading}
+            className="btn primary small"
           >
-            {showHiddenSubs ? 'Hide stuck' : `Show hidden (${hiddenCount})`}
+            + Generate sub
           </button>
-          <button
-            type="button"
-            className="btn danger small"
-            onClick={clearAllHiddenSubs}
-            title="Permanently remove all hidden subs from this UI list"
-          >
-            Clear hidden
-          </button>
+          <div className="regen-group">
+            <input
+              type="number"
+              placeholder="Index"
+              value={regenIndex}
+              onChange={(e) => setRegenIndex(e.target.value)}
+              className="input regen-input"
+              title="HD index to regenerate (click sub index to copy)"
+            />
+            <button
+              type="button"
+              onClick={async () => {
+                const idx = Number(regenIndex);
+                await regenerateSubWallet();
+                setShowHiddenSubs(false);
+                if (!Number.isNaN(idx)) {
+                  setTimeout(() => {
+                    setActiveSubPos(0);
+                    // focus after list updates — match by index in visible list
+                    setActiveSubPos((_) => {
+                      const list = subWallets.filter((s) => !s.hidden || s.index === idx);
+                      const pos = list.findIndex((s) => s.index === idx);
+                      return pos >= 0 ? pos : 9999;
+                    });
+                  }, 100);
+                }
+              }}
+              disabled={loading || !regenIndex}
+              className="btn secondary small"
+            >
+              Regen
+            </button>
+          </div>
         </div>
-      )}
-    </div>
+        {hiddenCount > 0 && (
+          <div className="sw-hidden-controls">
+            <button
+              type="button"
+              className="btn secondary small"
+              onClick={() => setShowHiddenSubs((v) => !v)}
+              title="Show or hide subs marked hidden"
+            >
+              {showHiddenSubs ? 'Hide stuck' : `Show hidden (${hiddenCount})`}
+            </button>
+            <button
+              type="button"
+              className="btn danger small"
+              onClick={clearAllHiddenSubs}
+              title="Permanently remove all hidden subs from this UI list"
+            >
+              Clear hidden
+            </button>
+          </div>
+        )}
+      </>
     )}
 
     {totalSubs === 0 && (
@@ -4279,113 +4465,127 @@ function SubWallet({
             role="navigation"
             aria-label={isVaultFocus ? 'Vault switcher' : 'Sub-wallet switcher'}
           >
-            <button
-              type="button"
-              className="btn secondary small sw-pager-btn"
-              onClick={goPrevSub}
-              disabled={totalSubs <= 1}
-              title={isVaultFocus ? 'Previous vault' : 'Previous sub-wallet'}
-              aria-label={isVaultFocus ? 'Previous vault' : 'Previous sub-wallet'}
-            >
-              ← Prev
-            </button>
-
-            <div className="sw-pager-center">
-              <span className="sw-pager-count">
-                {safePos + 1} / {totalSubs}
-              </span>
-              <select
-                className="input sw-pager-select"
-                value={safePos}
-                onChange={(e) => setActiveSubPos(Number(e.target.value))}
-                title={isVaultFocus ? 'Jump to vault' : 'Jump to sub-wallet'}
-                aria-label={isVaultFocus ? 'Select vault' : 'Select sub-wallet'}
+            <div className="sw-pager-nav">
+              <button
+                type="button"
+                className="sw-pager-step"
+                onClick={goPrevSub}
+                disabled={totalSubs <= 1}
+                title={isVaultFocus ? 'Previous vault' : 'Previous sub-wallet'}
+                aria-label={isVaultFocus ? 'Previous vault' : 'Previous sub-wallet'}
               >
-                {visibleSubs.map((s, i) => {
-                  const short = `${String(s.address).slice(0, 6)}…${String(s.address).slice(-4)}`;
-                  const vAddr = String(s.vaultAddress || s.pendingVaultAddress || '');
-                  const vShort = vAddr ? `${vAddr.slice(0, 6)}…${vAddr.slice(-4)}` : '';
-                  const locked = s.locked || (s.mintedE8 && BigInt(s.mintedE8 || '0') > 0n);
-                  return (
-                    <option key={s.index} value={i}>
-                      {isVaultFocus
-                        ? `${i + 1}. vault ${vShort || short}${locked ? ' · locked' : ''}${
-                            s.vaultBalance != null && Number(s.vaultBalance) > 0
-                              ? ` · ${s.vaultBalance} WART`
-                              : ''
-                          }`
-                        : `${i + 1}. #${s.index} · ${short}${s.hidden ? ' · hidden' : ''}${
-                            locked ? ' · locked' : ''
-                          }${s.balance && Number(s.balance) > 0 ? ` · ${s.balance} WART` : ''}`}
-                    </option>
-                  );
-                })}
-              </select>
-              <div className="sw-pager-dots">
-                {visibleSubs.map((s, i) => {
-                  const locked =
-                    s.locked || (s.mintedE8 && BigInt(s.mintedE8 || '0') > 0n);
-                  return (
-                    <button
-                      key={s.index}
-                      type="button"
-                      className={`sw-dot ${i === safePos ? 'is-active' : ''} ${
-                        locked ? 'is-locked' : ''
-                      }`}
-                      onClick={() => setActiveSubPos(i)}
-                      title={
-                        isVaultFocus
-                          ? `Vault ${i + 1}`
-                          : `Sub-wallet ${i + 1} (index ${s.index})`
-                      }
-                      aria-label={
-                        isVaultFocus
-                          ? `Show vault ${i + 1} of ${totalSubs}`
-                          : `Show sub-wallet ${i + 1} of ${totalSubs}`
-                      }
-                      aria-current={i === safePos ? 'true' : undefined}
-                    >
-                      {i + 1}
-                    </button>
-                  );
-                })}
-              </div>
+                ‹
+              </button>
+              <span className="sw-pager-count" title={isVaultFocus ? 'Vault position' : 'Sub position'}>
+                {safePos + 1}
+                <span className="sw-pager-count-sep">/</span>
+                {totalSubs}
+              </span>
+              <button
+                type="button"
+                className="sw-pager-step"
+                onClick={goNextSub}
+                disabled={totalSubs <= 1}
+                title={isVaultFocus ? 'Next vault' : 'Next sub-wallet'}
+                aria-label={isVaultFocus ? 'Next vault' : 'Next sub-wallet'}
+              >
+                ›
+              </button>
             </div>
-
-            <button
-              type="button"
-              className="btn secondary small sw-pager-btn"
-              onClick={goNextSub}
-              disabled={totalSubs <= 1}
-              title={isVaultFocus ? 'Next vault' : 'Next sub-wallet'}
-              aria-label={isVaultFocus ? 'Next vault' : 'Next sub-wallet'}
+            <select
+              className="input sw-pager-select"
+              value={safePos}
+              onChange={(e) => setActiveSubPos(Number(e.target.value))}
+              title={isVaultFocus ? 'Jump to vault' : 'Jump to sub-wallet'}
+              aria-label={isVaultFocus ? 'Select vault' : 'Select sub-wallet'}
             >
-              Next →
-            </button>
+              {visibleSubs.map((s, i) => {
+                const short = `${String(s.address).slice(0, 6)}…${String(s.address).slice(-4)}`;
+                const vAddr = String(s.vaultAddress || s.pendingVaultAddress || '');
+                const vShort = vAddr ? `${vAddr.slice(0, 6)}…${vAddr.slice(-4)}` : '';
+                const locked = s.locked || (s.mintedE8 && BigInt(s.mintedE8 || '0') > 0n);
+                return (
+                  <option key={s.index} value={i}>
+                    {isVaultFocus
+                      ? `${i + 1}. vault ${vShort || short}${locked ? ' · locked' : ''}${
+                          s.vaultBalance != null && Number(s.vaultBalance) > 0
+                            ? ` · ${s.vaultBalance} WART`
+                            : ''
+                        }`
+                      : `${i + 1}. #${s.index} · ${short}${s.hidden ? ' · hidden' : ''}${
+                          locked ? ' · locked' : ''
+                        }${s.balance && Number(s.balance) > 0 ? ` · ${s.balance} WART` : ''}`}
+                  </option>
+                );
+              })}
+            </select>
           </div>
 
           <div className={`sw-cards${isVaultFocus ? ' sw-cards--vault-only' : ''}`}>
-            {/* ── Sub wallet card (Sub wallets tab only) ── */}
+            {/* ── Sub wallet card — layout matches ETH sub card ── */}
             {!isVaultFocus && (
             <div className={`sw-card sw-card--sub ${sub.hidden ? 'is-hidden-sub' : ''}`}>
               <div className="sw-card-head">
                 <h4 className="sw-card-title">
                   Sub-wallet
-                  {sub.hidden ? (
-                    <span className="sw-live-tag"> · hidden</span>
-                  ) : null}
+                  {sub.hidden ? <span className="sw-live-tag"> · hidden</span> : null}
+                  {hasVault ? (
+                    <span className="sw-live-tag"> · vault</span>
+                  ) : (
+                    <span className="sw-live-tag"> · no vault</span>
+                  )}
                 </h4>
-                <button
-                  type="button"
-                  className="sw-pill sw-pill-muted sw-pill-copy"
-                  title={`Click to copy full index: ${sub.index}`}
-                  onClick={() => copyToClipboard(String(sub.index), 'Index copied')}
-                >
-                  {shortPill}
-                </button>
+                <div className="sw-card-head-right">
+                  <button
+                    type="button"
+                    className="sw-pill sw-pill-muted sw-pill-copy"
+                    title={`Copy index ${sub.index}`}
+                    onClick={() => copyToClipboard(String(sub.index), 'Index copied')}
+                  >
+                    {shortPill}
+                  </button>
+                  {renderCardMenu(`sub:${sub.index}`, [
+                    {
+                      label: 'Copy sub address',
+                      onClick: () => copyToClipboard(sub.address, 'Address copied'),
+                    },
+                    {
+                      label: 'Copy index',
+                      onClick: () => copyToClipboard(String(sub.index), 'Index copied'),
+                    },
+                    hasVault
+                      ? {
+                          label: 'Open WART vault',
+                          onClick: () => {
+                            if (typeof onOpenVaultTab === 'function') onOpenVaultTab();
+                            else toast('Open the Vault tab in the section menu');
+                          },
+                        }
+                      : {
+                          label: sub.vaultDetached
+                            ? 'Create new vault'
+                            : 'Load / create vault',
+                          onClick: () => loadOrCreateVault(sub),
+                          disabled: loading || isUnlocking[sub.index],
+                        },
+                    sub.hidden
+                      ? {
+                          label: 'Unhide',
+                          onClick: () => unhideSubWallet(sub),
+                        }
+                      : {
+                          label: 'Hide from list',
+                          onClick: () => hideSubWallet(sub),
+                        },
+                    {
+                      label: 'Remove from UI',
+                      onClick: () => removeSubWallet(sub),
+                      danger: true,
+                    },
+                  ].filter(Boolean))}
+                </div>
               </div>
 
-              {/* Always-visible summary */}
               <div className="sw-card-meta">
                 <div className="sw-meta-row">
                   <span className="sw-meta-k">Balance</span>
@@ -4404,7 +4604,7 @@ function SubWallet({
                 </div>
               </div>
 
-              <div className="sw-card-toolbar" style={{ flexWrap: 'wrap', gap: '0.5rem' }}>
+              <div className="sw-card-toolbar">
                 <button
                   type="button"
                   className="btn primary small"
@@ -4413,7 +4613,7 @@ function SubWallet({
                 >
                   Refresh
                 </button>
-                {!hasVault && (
+                {!hasVault ? (
                   <button
                     type="button"
                     className="btn primary small"
@@ -4427,11 +4627,22 @@ function SubWallet({
                   >
                     {sub.vaultDetached ? 'Create new vault' : 'Load / create vault'}
                   </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn secondary small"
+                    onClick={() => {
+                      if (typeof onOpenVaultTab === 'function') onOpenVaultTab();
+                      else toast('Open the Vault tab in the section menu');
+                    }}
+                  >
+                    Open vault
+                  </button>
                 )}
               </div>
-              {/* Import / create vault stay on Sub wallets card — not the Vault tab */}
+
               {!hasVault && (
-                <div style={{ marginTop: '0.65rem' }}>
+                <div className="sw-vault-share-inline">
                   {sub.vaultDetached ? (
                     <p className="sw-hint" style={{ margin: '0 0 0.5rem' }}>
                       Previous vault dismissed. Sub index #{sub.index} is free for a new vault
@@ -4442,56 +4653,13 @@ function SubWallet({
                 </div>
               )}
 
-              <details className="sw-details">
-                <summary>Sub details &amp; list tools</summary>
-                <div className="sw-details-body">
-                  <div className="sw-card-meta">
-                    <div className="sw-meta-row">
-                      <span className="sw-meta-k">Index</span>
-                      <button
-                        type="button"
-                        className="sw-meta-v mono sw-link"
-                        onClick={() => copyToClipboard(String(sub.index), 'Index copied')}
-                        title={`Full HD index: ${sub.index}`}
-                      >
-                        {sub.index}
-                      </button>
-                    </div>
-                  </div>
-                  <div className="sw-card-toolbar">
-                    {sub.hidden ? (
-                      <button
-                        type="button"
-                        className="btn secondary small"
-                        onClick={() => unhideSubWallet(sub)}
-                      >
-                        Unhide
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        className="btn secondary small"
-                        onClick={() => hideSubWallet(sub)}
-                      >
-                        Hide from list
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="btn danger small"
-                      onClick={() => removeSubWallet(sub)}
-                      title="Remove from UI only — does not move on-chain WART"
-                    >
-                      Remove from UI
-                    </button>
-                  </div>
-                </div>
-              </details>
-
-              <details className="sw-details">
+              <details className="sw-details" open>
                 <summary>Fund / exit (main ↔ sub)</summary>
                 <div className="sw-details-body">
-                  <p className="sw-hint">Main → sub deposit or return free sub balance to main (not vault).</p>
+                  <p className="sw-hint">
+                    Main = Warthog main wallet. Fund pulls from main; withdraw returns free sub
+                    balance (not vault).
+                  </p>
                   <div className="action-group deposit-group">
                     <input
                       type="number"
@@ -4509,12 +4677,22 @@ function SubWallet({
                     />
                     <button
                       type="button"
+                      className="btn secondary small"
+                      onClick={() => setMaxDeposit(sub)}
+                      disabled={isDepositing[sub.index] || loading}
+                    >
+                      Max
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => depositToSub(sub)}
                       disabled={isDepositing[sub.index] || loading}
                       className="btn primary small"
                     >
                       {isDepositing[sub.index] ? '…' : 'Main → sub'}
                     </button>
+                  </div>
+                  <div className="action-group deposit-group">
                     <input
                       type="number"
                       step="0.00000001"
@@ -4583,7 +4761,7 @@ function SubWallet({
                 </div>
               </details>
 
-              <details className="sw-details">
+              <details className="sw-details" open={!!hasVault}>
                 <summary>Sweep &amp; mint (sub → vault)</summary>
                 <div className="sw-details-body">
                   <p className="sw-hint">
@@ -4601,13 +4779,13 @@ function SubWallet({
                           [sub.index]: e.target.value,
                         }))
                       }
-                      disabled={isSweeping[sub.index] || loading}
+                      disabled={isSweeping[sub.index] || loading || !hasVault}
                       className="input amount-input"
                     />
                     <button
                       type="button"
                       onClick={() => setMaxSweep(sub)}
-                      disabled={isSweeping[sub.index] || loading}
+                      disabled={isSweeping[sub.index] || loading || !hasVault}
                       className="btn secondary small"
                     >
                       Max
@@ -4615,7 +4793,7 @@ function SubWallet({
                     <button
                       type="button"
                       onClick={() => sweepToVault(sub, subSweepAmounts[sub.index])}
-                      disabled={isSweeping[sub.index] || loading}
+                      disabled={isSweeping[sub.index] || loading || !hasVault}
                       className="btn primary small"
                     >
                       {isSweeping[sub.index] ? 'Sweeping…' : 'Sweep & mint'}
