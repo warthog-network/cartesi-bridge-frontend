@@ -15,6 +15,256 @@ import {
   formatSubmitResult,
 } from '../utils/warthogClient.js';
 import {
+  listWethWatch,
+  addWethWatch,
+  mergeEthWartAssetLinks,
+  listLocalEthWartAssets,
+} from '../utils/mintEthWarthogAsset.js';
+import { getInspectUrl } from '../utils/bridgeConfig.js';
+
+function decodeInspectPayloadLocal(payload) {
+  if (!payload) return null;
+  try {
+    const hex = String(payload).startsWith('0x')
+      ? String(payload).slice(2)
+      : String(payload);
+    const bytes = new Uint8Array(hex.match(/.{1,2}/g).map((b) => parseInt(b, 16)));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+}
+
+/** Bridge-minted WETH assets watched for this Warthog address (linked to rollup claims). */
+function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Vault }) {
+  const [items, setItems] = useState([]);
+  const [balances, setBalances] = useState({});
+  const [refreshing, setRefreshing] = useState(false);
+
+  const loadItems = () => {
+    if (!wartAddress) {
+      setItems([]);
+      return [];
+    }
+    const list = listWethWatch(wartAddress);
+    setItems(list);
+    return list;
+  };
+
+  const loadBalances = async (list) => {
+    if (!wartAddress || !list?.length || !selectedNode) return;
+    try {
+      const api = await createWarthogApi(selectedNode);
+      const next = {};
+      for (const it of list.slice(0, 8)) {
+        if (!it.assetHash) continue;
+        try {
+          const res = await api.getAccountAssetBalance(wartAddress, it.assetHash);
+          if (res.success) {
+            const total = res.data?.balance?.total;
+            next[it.assetHash] = total?.str ?? total?.u64 ?? '—';
+          }
+        } catch {
+          /* skip */
+        }
+      }
+      setBalances(next);
+    } catch {
+      /* node offline */
+    }
+  };
+
+  /** Re-read local watch + promote pending→active from rollup ethWartAssets. */
+  const refreshStatus = async () => {
+    if (!wartAddress) return;
+    setRefreshing(true);
+    const toastId = toast.loading('Refreshing Bridge WETH status…');
+    try {
+      let inspectAssets = [];
+      const owner = ownerL1 || null;
+      if (owner) {
+        try {
+          const hex = String(owner).replace(/^0x/i, '').toLowerCase();
+          const base = getInspectUrl().replace(/\/$/, '');
+          const res = await fetch(`${base}/vault/${hex}`, { cache: 'no-store' });
+          const data = await res.json();
+          if (data.reports?.length > 0) {
+            const json = decodeInspectPayloadLocal(data.reports[0].payload);
+            if (json && !json.error && Array.isArray(json.ethWartAssets)) {
+              inspectAssets = json.ethWartAssets;
+            }
+          }
+        } catch {
+          /* keep local */
+        }
+      }
+
+      // Promote local links (owner registry) then mirror into this wart watch list
+      const merged = owner
+        ? mergeEthWartAssetLinks(owner, inspectAssets)
+        : listWethWatch(wartAddress);
+      const wartKey = String(wartAddress).replace(/^0x/i, '').toLowerCase();
+      for (const e of merged) {
+        const eWart = e.wartAddress
+          ? String(e.wartAddress).replace(/^0x/i, '').toLowerCase()
+          : wartKey;
+        if (eWart === wartKey || !e.wartAddress) {
+          addWethWatch(wartAddress, e);
+        }
+      }
+      // Also promote watch-only entries by hash match against inspect
+      const byHash = new Map(
+        (inspectAssets || [])
+          .map((r) => {
+            const h = String(r.assetHash || r.hash || '')
+              .replace(/^0x/i, '')
+              .toLowerCase();
+            return h ? [h, r] : null;
+          })
+          .filter(Boolean),
+      );
+      for (const it of listWethWatch(wartAddress)) {
+        if (byHash.has(it.assetHash)) {
+          addWethWatch(wartAddress, {
+            ...it,
+            ...byHash.get(it.assetHash),
+            claimLinked: true,
+            status: it.status === 'released' ? 'released' : 'active',
+            source: 'rollup',
+          });
+        }
+      }
+
+      const list = loadItems();
+      await loadBalances(list);
+      if (typeof onRefreshL1Vault === 'function') {
+        try {
+          await onRefreshL1Vault();
+        } catch {
+          /* optional */
+        }
+      }
+      const active = list.filter((l) => l.status === 'active').length;
+      const pending = list.filter((l) => l.status === 'pending').length;
+      toast.success(
+        pending
+          ? `Bridge WETH · ${active} active, ${pending} still pending`
+          : `Bridge WETH · ${active || list.length} active`,
+        { id: toastId },
+      );
+    } catch (e) {
+      toast.error(e?.message || 'Refresh failed', { id: toastId });
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  useEffect(() => {
+    loadItems();
+  }, [wartAddress]);
+
+  useEffect(() => {
+    if (!wartAddress || !items.length || !selectedNode) return undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const api = await createWarthogApi(selectedNode);
+        const next = {};
+        for (const it of items.slice(0, 8)) {
+          if (!it.assetHash) continue;
+          try {
+            const res = await api.getAccountAssetBalance(wartAddress, it.assetHash);
+            if (res.success) {
+              const total = res.data?.balance?.total;
+              next[it.assetHash] = total?.str ?? total?.u64 ?? '—';
+            }
+          } catch {
+            /* skip */
+          }
+        }
+        if (!cancelled) setBalances(next);
+      } catch {
+        /* node offline */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [wartAddress, items, selectedNode]);
+
+  if (!items.length) return null;
+
+  return (
+    <div style={{ marginTop: '0.85rem' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '0.5rem',
+          marginBottom: '0.35rem',
+          flexWrap: 'wrap',
+        }}
+      >
+        <p className="wh-hint" style={{ margin: 0 }}>
+          <strong>Bridge WETH</strong> (linked to ETH capacity claims)
+        </p>
+        <button
+          type="button"
+          className="btn secondary small"
+          disabled={refreshing}
+          onClick={() => refreshStatus()}
+          title="Re-check rollup claim link + balances"
+        >
+          {refreshing ? 'Refreshing…' : 'Refresh'}
+        </button>
+      </div>
+      <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {items.slice(0, 6).map((it) => (
+          <li
+            key={it.assetHash}
+            style={{
+              fontSize: '0.78rem',
+              border: '1px solid rgba(148,163,184,0.2)',
+              borderRadius: 6,
+              padding: '0.35rem 0.45rem',
+            }}
+          >
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <strong>{it.assetName || 'WETH'}</strong>
+              <span>{it.amount}</span>
+              {balances[it.assetHash] != null ? (
+                <span style={{ opacity: 0.85 }}>bal {balances[it.assetHash]}</span>
+              ) : null}
+              <span style={{ opacity: 0.75, textTransform: 'uppercase', fontSize: '0.7rem' }}>
+                {it.status || 'active'}
+              </span>
+              <button
+                type="button"
+                className="btn secondary small"
+                style={{ marginLeft: 'auto' }}
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard?.writeText(it.assetHash);
+                    toast.success('WETH hash copied');
+                  } catch {
+                    toast.error('Copy failed');
+                  }
+                }}
+              >
+                Copy
+              </button>
+            </div>
+            <code className="mono" style={{ wordBreak: 'break-all', opacity: 0.85 }}>
+              {it.assetHash.slice(0, 20)}…
+            </code>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+import {
   generateWallet as createWarthogWallet,
   deriveWallet as restoreWarthogWallet,
   importFromPrivateKey as importWarthogWallet,
@@ -53,6 +303,12 @@ import {
   setLastWalletName,
 } from '../utils/namedWallets.js';
 import { computeWliqMintAvailable } from '../utils/wliqCapacity.js';
+import {
+  downloadTextFile,
+  sanitizeDownloadFilename,
+  isRestrictedDownloadEnv,
+  DEFAULT_WALLET_DOWNLOAD_NAME,
+} from '../utils/downloadFile.js';
 
 /** DeFi first (vaults / sub-wallets), then mainnet — same product surface on both. */
 const NODE_OPTIONS = [
@@ -184,6 +440,8 @@ const WarthogWallet = ({
   onOptimisticShareMint,
   /** Notify parent when unlock/lock changes (ETH bridge subs need mnemonic) */
   onSessionChange,
+  /** Parent bridge helpers (Path A pool): { sendTransaction, getWartTxProof, address, selectedNode } */
+  onBridgeApi,
   /** Hide Warthog section (parent toggles showWarthog) */
   onToggleShowWallet,
   showWalletVisible = true,
@@ -251,6 +509,8 @@ const WarthogWallet = ({
   });
   const [savedEntries, setSavedEntries] = useState(() => listWalletEntries());
   const [confirmPassword, setConfirmPassword] = useState('');
+  /** Optional download filename for encrypted wallet file (default warthog_wallet.txt). */
+  const [walletDownloadName, setWalletDownloadName] = useState(DEFAULT_WALLET_DOWNLOAD_NAME);
   const [showManageSaved, setShowManageSaved] = useState(false);
   const [selectedNode, setSelectedNode] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -642,6 +902,11 @@ const WarthogWallet = ({
       onSessionChange?.({
         mnemonic: data?.mnemonic || null,
         address: data?.address || null,
+        /** Signing worker unlocked — parent can createAssets without privateKey */
+        signingReady: true,
+        selectedNode: typeof localStorage !== 'undefined'
+          ? (localStorage.getItem('selectedNode') || null)
+          : null,
       });
     } catch {
       /* parent optional */
@@ -719,23 +984,38 @@ const WarthogWallet = ({
     }
   };
 
-  const downloadWallet = (data) => {
+  const downloadWallet = async (data, filename) => {
     if (!password) {
       setError('Please provide a password to encrypt the wallet file');
       return false;
     }
     try {
       const encrypted = encryptWallet(data, password);
-      const blob = new Blob([encrypted], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'warthog_wallet.txt';
-      a.click();
-      URL.revokeObjectURL(url);
+      if (!encrypted) {
+        setError('Failed to encrypt wallet for download');
+        return false;
+      }
+      const name = sanitizeDownloadFilename(
+        filename || walletDownloadName || DEFAULT_WALLET_DOWNLOAD_NAME,
+        DEFAULT_WALLET_DOWNLOAD_NAME,
+      );
+      // Wallet in-app browsers (Rabby, etc.) often block <a download> with no error.
+      const result = await downloadTextFile(encrypted, name, 'text/plain;charset=utf-8');
+      if (result?.likelySaved) {
+        toast.success(`Saved ${result.name}`);
+      } else if (result?.method === 'fallback' || isRestrictedDownloadEnv()) {
+        toast(
+          `Wallet browsers (e.g. Rabby) block auto-download — use Copy / Open in the dialog to save ${result?.name || name}`,
+          { duration: 9000 },
+        );
+      } else {
+        toast.success(`Download started: ${result?.name || name}`);
+      }
       setIsWalletProcessed(true);
       setPassword('');
+      setConfirmPassword('');
       setSaveWalletConsent(false);
+      setWalletDownloadName(DEFAULT_WALLET_DOWNLOAD_NAME);
       return true;
     } catch (err) {
       setError(err.message || 'Failed to download wallet file');
@@ -921,6 +1201,7 @@ const WarthogWallet = ({
       setWalletData(data);
       // Only show backup modal when we have new material worth backing up
       if (data.mnemonic || action === 'import' || action === 'create') {
+        setWalletDownloadName(DEFAULT_WALLET_DOWNLOAD_NAME);
         setShowModal(true);
         setConsentToClose(false);
       }
@@ -1087,6 +1368,22 @@ const WarthogWallet = ({
       propSetLoading(false);
     }
   };
+
+  // Expose send + proof helpers for Path A fungible pool (no cosigner)
+  useEffect(() => {
+    if (!onBridgeApi) return;
+    if (wallet?.address) {
+      onBridgeApi({
+        sendTransaction: handleSendTransaction,
+        getWartTxProof,
+        address: wallet.address,
+        selectedNode,
+      });
+    } else {
+      onBridgeApi(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- stable bridge surface
+  }, [wallet?.address, selectedNode, onBridgeApi]);
 
   const handleInstallClick = async () => {
     if (deferredPrompt) {
@@ -1693,7 +1990,15 @@ const WarthogWallet = ({
             >
               Refresh
             </button>
-            <button type="button" className="btn secondary small" onClick={() => setShowDownloadPrompt(true)}>
+            <button
+              type="button"
+              className="btn secondary small"
+              onClick={() => {
+                setWalletDownloadName(DEFAULT_WALLET_DOWNLOAD_NAME);
+                setError(null);
+                setShowDownloadPrompt(true);
+              }}
+            >
               Backup
             </button>
             <button type="button" className="btn danger small" onClick={clearWallet}>
@@ -1789,6 +2094,12 @@ const WarthogWallet = ({
                 <p className="wh-hint" style={{ marginTop: '0.75rem', marginBottom: 0 }}>
                   Keys stay in the signing worker this session. Use <strong>Backup</strong> to encrypt.
                 </p>
+                <BridgeWethWatchCard
+                  wartAddress={wallet.address}
+                  selectedNode={selectedNode}
+                  ownerL1={l1Address || propAddress}
+                  onRefreshL1Vault={onRefreshL1Vault}
+                />
               </div>
             )}
 
@@ -2643,6 +2954,26 @@ const WarthogWallet = ({
                 className="input"
               />
             </div>
+            <div className="form-group">
+              <label>Download file name (optional)</label>
+              <input
+                type="text"
+                value={walletDownloadName}
+                onChange={(e) => setWalletDownloadName(e.target.value)}
+                placeholder={DEFAULT_WALLET_DOWNLOAD_NAME}
+                className="input"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <p className="wh-hint" style={{ marginTop: '0.35rem' }}>
+                Default: <code>{DEFAULT_WALLET_DOWNLOAD_NAME}</code> — change if you want a custom name.
+              </p>
+            </div>
+            {error && (
+              <div className="error" role="alert" style={{ marginBottom: '0.75rem' }}>
+                <strong>Error:</strong> {error}
+              </div>
+            )}
             <div className="button-group">
               <button
                 type="button"
@@ -2665,8 +2996,13 @@ const WarthogWallet = ({
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  if (downloadWallet(wallet)) {
+                onClick={async () => {
+                  if (password !== confirmPassword) {
+                    setError('Passwords do not match');
+                    return;
+                  }
+                  setError(null);
+                  if (await downloadWallet(wallet, walletDownloadName)) {
                     setShowDownloadPrompt(false);
                     setPassword('');
                     setConfirmPassword('');
@@ -2682,6 +3018,7 @@ const WarthogWallet = ({
                   setShowDownloadPrompt(false);
                   setPassword('');
                   setConfirmPassword('');
+                  setWalletDownloadName(DEFAULT_WALLET_DOWNLOAD_NAME);
                   setError(null);
                 }}
                 className="btn secondary small"
@@ -2794,6 +3131,21 @@ const WarthogWallet = ({
                 className="input"
               />
             </div>
+            <div className="form-group">
+              <label>Download file name (optional)</label>
+              <input
+                type="text"
+                value={walletDownloadName}
+                onChange={(e) => setWalletDownloadName(e.target.value)}
+                placeholder={DEFAULT_WALLET_DOWNLOAD_NAME}
+                className="input"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <p className="wh-hint" style={{ marginTop: '0.35rem' }}>
+                Default: <code>{DEFAULT_WALLET_DOWNLOAD_NAME}</code>
+              </p>
+            </div>
             <label className="wh-check">
               <input
                 type="checkbox"
@@ -2802,6 +3154,11 @@ const WarthogWallet = ({
               />
               Save named encrypted copy in this browser
             </label>
+            {error && (
+              <div className="error" role="alert" style={{ marginBottom: '0.75rem' }}>
+                <strong>Error:</strong> {error}
+              </div>
+            )}
             <div className="button-group">
               <button
                 type="button"
@@ -2832,13 +3189,17 @@ const WarthogWallet = ({
               <button
                 type="button"
                 className="btn secondary small"
-                onClick={() => {
+                onClick={async () => {
                   if (!password) {
                     setError('Password required to download encrypted file.');
                     return;
                   }
+                  if (password !== confirmPassword) {
+                    setError('Passwords do not match');
+                    return;
+                  }
                   setError(null);
-                  if (downloadWallet(walletData)) {
+                  if (await downloadWallet(walletData, walletDownloadName)) {
                     setShowModal(false);
                     setWalletData(null);
                     setConsentToClose(false);

@@ -28,3 +28,4 @@ pnpm-debug.log*
 
 # Threshold co-signer share store (dapp pin half)
 .data/
+dist-sepolia/

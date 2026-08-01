@@ -19,6 +19,11 @@ import {
   SigningKey,
 } from 'ethers-v6';
 import CryptoJS from 'crypto-js';
+import {
+  downloadTextFile,
+  promptDownloadFilename,
+  sanitizeDownloadFilename,
+} from './downloadFile.js';
 
 export const MULTISIG_SCHEME = 'wart-2p-ecdsa-lindell-v1';
 /** Same 2P-ECDSA keygen; address is Ethereum (keccak) not Warthog. */
@@ -537,11 +542,21 @@ export function decryptVaultShareWithPassword(cipherText, password) {
 
 /**
  * Download opaque password-encrypted .txt (client-side only).
+ * In Rabby / wallet in-app browsers, automatic download is often blocked —
+ * a copy/open fallback modal is shown.
+ *
  * @param {string|object} cipherOrPayload - AES ciphertext string, or plain payload (+ password required)
  * @param {string} [password] - required if cipherOrPayload is plain object
- * @param {string} [filename]
+ * @param {string} [filename] - optional; defaults to user-vault-share.txt
+ * @param {{ promptName?: boolean }} [opts] - if promptName, ask for filename (default pre-filled)
+ * @returns {Promise<string|null>} filename used, or null if user cancelled the name prompt
  */
-export function downloadVaultShareBackupFile(cipherOrPayload, password, filename) {
+export async function downloadVaultShareBackupFile(
+  cipherOrPayload,
+  password,
+  filename,
+  opts = {},
+) {
   if (typeof document === 'undefined') {
     throw new Error('downloadVaultShareBackupFile requires a browser');
   }
@@ -551,18 +566,29 @@ export function downloadVaultShareBackupFile(cipherOrPayload, password, filename
   } else {
     cipher = encryptVaultShareWithPassword(cipherOrPayload, password);
   }
-  const name = filename || VAULT_SHARE_DOWNLOAD_NAME;
-  const blob = new Blob([cipher], { type: 'text/plain' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  a.rel = 'noopener';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 2000);
-  return name;
+  if (!cipher) {
+    throw new Error('Nothing to download — empty vault-share ciphertext');
+  }
+
+  let name = filename;
+  if (opts?.promptName) {
+    name = promptDownloadFilename(
+      sanitizeDownloadFilename(
+        filename || VAULT_SHARE_DOWNLOAD_NAME,
+        VAULT_SHARE_DOWNLOAD_NAME,
+      ),
+      'Vault share file name (edit or keep default)',
+    );
+    if (name == null) return null;
+  } else {
+    name = sanitizeDownloadFilename(
+      filename || VAULT_SHARE_DOWNLOAD_NAME,
+      VAULT_SHARE_DOWNLOAD_NAME,
+    );
+  }
+
+  const result = await downloadTextFile(cipher, name, 'text/plain;charset=utf-8');
+  return result?.name || name;
 }
 
 /** @deprecated alias — prefer buildVaultSharePlainPayload + encryptVaultShareWithPassword */

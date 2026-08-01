@@ -267,7 +267,9 @@ export default function PersonalVaultMvp({
             scheme: MULTISIG_SCHEME,
             ownerL1: l1Address,
           });
-          downloadVaultShareBackupFile(plain, password);
+          await downloadVaultShareBackupFile(plain, password, undefined, {
+            promptName: true,
+          });
         }
       } catch (e) {
         console.warn('[personal-vault] share backup download', e);

@@ -13,9 +13,12 @@ const processShim = path.resolve(projectRoot, 'src/shims/process.js');
 
 // VPS/local Node host: ASTRO_ADAPTER=node  (default remains Netlify for deploys)
 const useNodeAdapter = process.env.ASTRO_ADAPTER === 'node';
+// Mode B staging builds use ASTRO_OUT_DIR=dist-sepolia so live Mode A `dist/` is untouched.
+const outDir = process.env.ASTRO_OUT_DIR || 'dist';
 
 export default defineConfig({
   output: 'server',
+  outDir,
   integrations: [react()],
   adapter: useNodeAdapter
     ? node({ mode: 'standalone' })
@@ -26,7 +29,7 @@ export default defineConfig({
   // When serving on the VPS (Node adapter), bind all interfaces so nginx can
   // reach 127.0.0.1:4321. Netlify builds ignore this for deploys.
   server: useNodeAdapter
-    ? { host: true, port: 4321 }
+    ? { host: true, port: Number(process.env.PORT || 4321) }
     : { host: false, port: 4321 },
   vite: {
     worker: {

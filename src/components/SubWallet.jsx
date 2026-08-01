@@ -34,6 +34,7 @@ import { multiSigTransferWart } from '../utils/multiSigTransfer.js';
 import { getSmartNonce, bumpNonceAfterSuccess } from '../utils/cancelLimitOrder.js';
 import { computeWliqMintAvailable } from '../utils/wliqCapacity.js';
 import { SHARE_TOKEN } from '../utils/tokenNames.js';
+import SignalQuorumBadge from './SignalQuorumBadge.jsx';
 const API_URL = '/api/proxy';
 
 /** Module-level so SubWallet re-renders do not remount / reset dots interval. */
@@ -442,10 +443,13 @@ function SubWallet({
           { duration: 8000 },
         );
       }
-      const name = downloadVaultShareBackupFile(plain, password);
+      const name = await downloadVaultShareBackupFile(plain, password, undefined, {
+        promptName: true,
+      });
+      if (!name) return toast('Download cancelled');
       toast.success(
-        `Downloaded ${name} — user half only (password blob). Cosigner half stays on the cosigner; not in this file.`,
-        { duration: 9000 },
+        `Vault share ready (${name}) — user half only. If no file appeared (Rabby/wallet browser), use Copy/Open in the dialog.`,
+        { duration: 10000 },
       );
     } catch (e) {
       toast.error(String(e?.message || e));
@@ -2738,11 +2742,20 @@ function SubWallet({
               scheme: vault.scheme,
               ownerL1: l1Address,
             });
-            const fname = downloadVaultShareBackupFile(plain, password);
-            toast.success(
-              `Save offline: ${fname} — user half only. Cosigner half is only on the cosigner (ops backup).`,
-              { duration: 10000 },
-            );
+            const fname = await downloadVaultShareBackupFile(plain, password, undefined, {
+              promptName: true,
+            });
+            if (!fname) {
+              toast(
+                'Vault created — use Download vault share for user-vault-share.txt when ready.',
+                { duration: 9000 },
+              );
+            } else {
+              toast.success(
+                `Save offline: ${fname} — user half only. If no file appeared (Rabby/wallet browser), use Copy/Open in the dialog.`,
+                { duration: 10000 },
+              );
+            }
           } else {
             toast(
               'Vault created — use Download vault share for user-vault-share.txt (password) when ready.',
@@ -3333,7 +3346,7 @@ function SubWallet({
           className="btn secondary small"
           onClick={() => downloadVaultShareBackup(sub)}
           disabled={loading}
-          title="Download password-encrypted user half for this sub’s current local vault"
+          title={`Download password-encrypted user half (default name ${VAULT_SHARE_DOWNLOAD_NAME}; you can rename)`}
         >
           Download vault share
         </button>
@@ -3751,6 +3764,10 @@ function SubWallet({
                 ? ' If this fails with Pin held after a restart, use Recover under Release.'
                 : ''}
             </p>
+            <SignalQuorumBadge
+              vaultAddress={sub.vaultAddress || sub.vault || ''}
+              compact
+            />
             <div className="action-group vault-withdraw-group">
               <input
                 type="text"

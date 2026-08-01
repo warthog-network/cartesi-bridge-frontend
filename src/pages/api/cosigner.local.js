@@ -58,6 +58,91 @@ const INSPECT_URL =
 
 const REQUIRE_TICKETS = process.env.COSIGNER_REQUIRE_TICKETS === '1';
 const ALLOW_FORCE = process.env.COSIGNER_ALLOW_FORCE === '1';
+/** V2: hard-require EIP-191 ownerSig on register (default soft). */
+const REQUIRE_OWNER_SIG = process.env.COSIGNER_REQUIRE_OWNER_SIG === '1';
+const OWNER_SIG_TTL_SEC = 15 * 60;
+
+function buildRegisterMessageLocal({ vaultAddress, owner, scheme, allowedTo, issuedAt }) {
+  const vault = String(vaultAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  const own = String(owner || '').toLowerCase().startsWith('0x')
+    ? String(owner).toLowerCase()
+    : `0x${String(owner || '').toLowerCase()}`;
+  const allowed = (allowedTo || [])
+    .map((a) => String(a || '').replace(/^0x/i, '').toLowerCase())
+    .filter(Boolean)
+    .sort()
+    .join(',');
+  return [
+    'cartesi-cosigner-register-v0',
+    `vault:${vault}`,
+    `owner:${own}`,
+    `scheme:${scheme || 'wart-2p-ecdsa-lindell-v1'}`,
+    `allowedTo:${allowed}`,
+    `issuedAt:${Math.floor(Number(issuedAt))}`,
+  ].join('\n');
+}
+
+async function checkOwnerRegisterAuthLocal({
+  vaultAddress,
+  owner,
+  scheme,
+  allowedTo,
+  issuedAt,
+  ownerSig,
+}) {
+  const hasSig = Boolean(ownerSig && String(ownerSig).length > 10);
+  if (!hasSig) {
+    if (REQUIRE_OWNER_SIG) {
+      return {
+        ok: false,
+        error:
+          'COSIGNER_REQUIRE_OWNER_SIG: register requires ownerSig (EIP-191) + issuedAt from L1 owner',
+      };
+    }
+    return { ok: true, mode: 'none' };
+  }
+  const ts = Number(issuedAt);
+  if (!Number.isFinite(ts) || ts <= 0) {
+    return { ok: false, error: 'ownerSig present but issuedAt missing/invalid' };
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - ts) > OWNER_SIG_TTL_SEC) {
+    return {
+      ok: false,
+      error: `ownerSig issuedAt outside ±${OWNER_SIG_TTL_SEC}s window (skew or replay)`,
+    };
+  }
+  try {
+    const ethersMod = await import('ethers');
+    const verifyMessage =
+      ethersMod.verifyMessage ||
+      ethersMod.utils?.verifyMessage ||
+      ethersMod.default?.verifyMessage ||
+      ethersMod.default?.utils?.verifyMessage;
+    if (typeof verifyMessage !== 'function') {
+      return { ok: false, error: 'ownerSig verify: ethers.verifyMessage unavailable' };
+    }
+    const msg = buildRegisterMessageLocal({
+      vaultAddress,
+      owner,
+      scheme,
+      allowedTo,
+      issuedAt: ts,
+    });
+    const recovered = verifyMessage(msg, ownerSig).toLowerCase();
+    const want = String(owner || '').toLowerCase().startsWith('0x')
+      ? String(owner).toLowerCase()
+      : `0x${String(owner || '').toLowerCase()}`;
+    if (recovered !== want) {
+      return { ok: false, error: `ownerSig recovered ${recovered} != owner ${want}` };
+    }
+    return { ok: true, mode: 'verified', recovered };
+  } catch (e) {
+    return { ok: false, error: `ownerSig verify failed: ${e.message || e}` };
+  }
+}
 
 // Encrypted vault store only (same as Rust cosigner / cosigner-node). Never write plaintext.
 import { createSecureStore } from '../../../../cosigner-node/secureStore.mjs';
@@ -394,7 +479,8 @@ export async function POST({ request }) {
       .replace(/^0x/i, '')
       .toLowerCase()
       .padStart(64, '0');
-    const owner = String(body.owner || '').toLowerCase();
+    let owner = String(body.owner || '').toLowerCase();
+    if (owner && !owner.startsWith('0x')) owner = `0x${owner}`;
     if (!vaultAddress || !owner || !body.ckey || !body.paillierN || !body.paillierG) {
       return json(400, {
         error: 'register requires vaultAddress, owner, dappShareHex, ckey, paillierN, paillierG',
@@ -406,7 +492,7 @@ export async function POST({ request }) {
       return json(400, { error: 'invalid dappShareHex' });
     }
     const store = readStore();
-        let allowedTo = parseAllowedTo(body);
+    let allowedTo = parseAllowedTo(body);
     const prevRec = store.vaults[vaultAddress];
     if (!allowedTo.length && prevRec?.allowedTo?.length) allowedTo = prevRec.allowedTo;
     if (!allowedTo.length) {
@@ -414,6 +500,16 @@ export async function POST({ request }) {
         error: 'register requires allowedTo or mainAddress (Warthog main) — vault may only withdraw to allowlisted destinations',
       });
     }
+    const scheme = body.scheme || 'wart-2p-ecdsa-lindell-v1';
+    const auth = await checkOwnerRegisterAuthLocal({
+      vaultAddress,
+      owner,
+      scheme,
+      allowedTo,
+      issuedAt: body.issuedAt,
+      ownerSig: body.ownerSig,
+    });
+    if (!auth.ok) return json(403, { error: auth.error });
     store.vaults[vaultAddress] = {
       dappShareHex,
       paillierN: String(body.paillierN),
@@ -423,17 +519,20 @@ export async function POST({ request }) {
       owner,
       subAddress: normAddr(body.subAddress),
       index: body.index != null ? Number(body.index) : null,
-      scheme: body.scheme || 'wart-2p-ecdsa-lindell-v1',
+      scheme,
       createdAt: Date.now(),
       signCount: prevRec?.signCount || 0,
       signedWithdrawE8: prevRec?.signedWithdrawE8 || '0',
       allowedTo,
     };
     writeStore(store);
-    console.log(`[2p-ecdsa] REGISTER vault=${vaultAddress.slice(0, 12)}… (no full key)`);
+    console.log(
+      `[2p-ecdsa] REGISTER vault=${vaultAddress.slice(0, 12)}… auth=${auth.mode} (no full key)`,
+    );
     return json(200, {
       ok: true,
       vaultAddress,
+      ownerAuth: auth.mode,
       message: '2P-ECDSA material stored — d_dapp + Enc(d_user) only',
     });
   }

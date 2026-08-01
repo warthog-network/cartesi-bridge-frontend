@@ -19,13 +19,29 @@ async function cosignerFetch({ method = 'GET', body, query = '' } = {}) {
   return data;
 }
 
-/** Register dapp share + Enc(d_user) + Paillier pub after keygen. */
-export async function registerMultiSigVault(reg) {
+/**
+ * Register dapp share + Enc(d_user) + Paillier pub after keygen.
+ * V2: attaches EIP-191 ownerSig when MetaMask/signer available (soft — cosigner
+ * still accepts without sig unless COSIGNER_REQUIRE_OWNER_SIG=1).
+ * @param {object} reg
+ * @param {{ signer?: object, skipOwnerSig?: boolean }} [opts]
+ */
+export async function registerMultiSigVault(reg, opts = {}) {
+  let auth = {};
+  if (!opts.skipOwnerSig) {
+    try {
+      const { attachOwnerRegisterAuth } = await import('./ownerRegisterAuth.js');
+      auth = await attachOwnerRegisterAuth(reg, { signer: opts.signer });
+    } catch (e) {
+      console.warn('[cosigner] ownerSig attach skipped', e);
+    }
+  }
   return cosignerFetch({
     method: 'POST',
     body: {
       action: 'register',
       ...reg,
+      ...auth,
     },
   });
 }
@@ -54,6 +70,8 @@ export async function multiSigSignPartial({
   nonceId = null,
   /** 'eth' = skip Warthog preimage; sign EIP-1559 unsignedHash */
   chain = null,
+  /** S4: 0x-hex32 policyDigest when COSIGNER_REQUIRE_SIGNALS=1 */
+  policyDigest = null,
 }) {
   return cosignerFetch({
     method: 'POST',
@@ -72,6 +90,7 @@ export async function multiSigSignPartial({
       ...(pinHeight != null ? { pinHeight: Number(pinHeight) } : {}),
       ...(nonceId != null ? { nonceId: Number(nonceId) } : {}),
       ...(chain != null ? { chain: String(chain) } : {}),
+      ...(policyDigest != null ? { policyDigest: String(policyDigest) } : {}),
       force,
     },
   });

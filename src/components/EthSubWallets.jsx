@@ -6,7 +6,7 @@
  *   2. Create cosigner ETH vault (2P-ECDSA → Ethereum address)
  *   3. Main → sub → fund vault
  *   4. Lock vault ETH → ETH capacity (not WART capacity)
- *   5. Mint / burn wETH claims (rollup claims until Warthog DeFi WETH)
+ *   5. Mint / burn wETH claims + linked Warthog WETH assets
  *   6. Release locked ETH (when freeable); cosign vault→main later
  */
 import { useCallback, useEffect, useMemo, useState, useRef } from 'react';
@@ -26,6 +26,7 @@ import {
   MULTISIG_SCHEME_ETH,
 } from '../utils/twoPartyEcdsa.js';
 import { registerMultiSigVault } from '../utils/cosignerClient.js';
+import SignalQuorumBadge from './SignalQuorumBadge.jsx';
 import {
   multiSigTransferEth,
   loadEthVaultClientSecret,
@@ -722,14 +723,75 @@ export default function EthSubWallets({
     if (!send) return toast.error('Connect MetaMask');
     const amtStr = String(mintWethByIndex[sub.index] || '').trim();
     if (!amtStr) return toast.error('Enter claim amount');
+
+    // Gate: need locked ETH capacity available
+    try {
+      const { ethCapacityFromVault } = await import('../utils/mintEthWarthogAsset.js');
+      const cap = ethCapacityFromVault(vault);
+      if (!cap.hasLocked || !cap.hasAvailable) {
+        return toast.error('No available ETH capacity — lock vault ETH first');
+      }
+    } catch {
+      /* rollup enforces */
+    }
+
     try {
       setBusyKey(`mintw:${sub.index}`);
       setLoading?.(true);
+
+      let assetLink = null;
+      const {
+        createWarthogEthAsset,
+        ethCapacityFromVault,
+        claimLinkPayload,
+        markLinkClaimed,
+      } = await import('../utils/mintEthWarthogAsset.js');
+      // Prefer native Warthog WETH when seed unlocked (same path as Get wWETH)
+      if (mainMnemonic && wartAddress) {
+        const toastId = toast.loading(`Creating WETH on Warthog for ${amtStr}…`);
+        try {
+          const cap = ethCapacityFromVault(vault);
+          const nodeUrl =
+            typeof localStorage !== 'undefined'
+              ? localStorage.getItem('selectedNode')
+              : null;
+          assetLink = await createWarthogEthAsset({
+            amount: amtStr,
+            wartAddress,
+            nodeUrl: nodeUrl || undefined,
+            ownerL1: owner,
+            remainingWei: cap.remainingWei,
+          });
+          toast.success(
+            `WETH ${assetLink.assetHash.slice(0, 12)}… · linking claim…`,
+            { id: toastId },
+          );
+        } catch (e) {
+          toast.error(e?.message || 'Warthog WETH failed — claim only', {
+            id: toastId,
+            duration: 7000,
+          });
+          // fall through to rollup claim without asset
+        }
+      }
+
       await send({
         type: 'mint_weth_claim',
         amount: amtStr,
+        ...claimLinkPayload(assetLink, wartAddress),
       });
-      toast.success(`Minted ${amtStr} wETH claim (rollup)`);
+      if (assetLink?.assetHash && owner) {
+        markLinkClaimed(owner, assetLink.assetHash, {
+          amount: assetLink.amount,
+          wartAddress,
+          assetName: assetLink.assetName,
+        });
+      }
+      toast.success(
+        assetLink
+          ? `Linked WETH ${assetLink.assetHash.slice(0, 12)}… · ${amtStr} claim`
+          : `Minted ${amtStr} wETH claim (rollup)`,
+      );
       setMintWethByIndex((p) => ({ ...p, [sub.index]: '' }));
       setTimeout(() => onRefreshVault?.(), 4000);
     } catch (e) {
@@ -1124,8 +1186,8 @@ export default function EthSubWallets({
             </div>
           </div>
           <p className="wh-hint sw-l1-track-hint">
-            <strong>Locked vault ETH</strong> is capacity (not WART). Optional wETH claims are
-            rollup-only until DeFi WETH. Cosign vault→main needs a release ticket.
+            <strong>Locked vault ETH</strong> is capacity (not WART). Mint links Warthog WETH
+            + rollup claim. Cosign vault→main needs a release ticket.
           </p>
           {isVaultFocus && (
             <div className="sw-card-toolbar">
@@ -1739,6 +1801,12 @@ export default function EthSubWallets({
                               : 'Vault → main'}
                           </button>
                         </div>
+                        <SignalQuorumBadge
+                          vaultAddress={
+                            sub.ethVaultAddress || sub.vaultAddress || ''
+                          }
+                          compact
+                        />
                       </div>
                     </details>
                   </div>

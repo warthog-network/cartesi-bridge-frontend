@@ -12,6 +12,7 @@ import WarthogWallet from './WarthogWallet'; // Added import for WarthogWallet c
 import EthSubWallets from './EthSubWallets.jsx';
 import VoucherExecutor from './VoucherExecutor.jsx';
 import AnvilTestKeys from './AnvilTestKeys.jsx';
+import FungiblePool from './FungiblePool.jsx';
 import { useMmTxConfirm } from './MmTxConfirm.jsx';
 import '../styles/global.css'; // Assuming global styles (including new Warthog CSS) in Astro
 import '../styles/warthog.css';
@@ -47,6 +48,24 @@ import {
   describePortalDeposit,
   describeErc20Approve,
 } from '../utils/mmTxDescribe.js';
+import {
+  startProviderDiscovery,
+  resolveProviderForConnect,
+  getInjectedProvider,
+  setPreferredProvider,
+  describeProvider,
+  listInjectedWallets,
+  resolveWalletOptions,
+  isMobileClient,
+  walletInjectDiagnostics,
+} from '../utils/injectedProvider.js';
+import {
+  connectWalletConnect,
+  disconnectWalletConnect,
+  isWalletConnectProvider,
+  getActiveWalletConnectProvider,
+  getWalletConnectProvider,
+} from '../utils/walletConnect.js';
 
 // Active network address book (Anvil default; Sepolia when PUBLIC_NETWORK=sepolia)
 const ACTIVE_NETWORK = getNetwork();
@@ -90,7 +109,18 @@ export default function WalletIsland() {
   // STATES FROM ORIGINAL WalletIsland
   const [address, setAddress] = useState('');
   const [connected, setConnected] = useState(false);
+  /** ethers BrowserProvider */
   const [provider, setProvider] = useState(null);
+  /** raw EIP-1193 (window.ethereum / Rabby / MetaMask / Brave) */
+  const eip1193Ref = useRef(null);
+  const [walletLabel, setWalletLabel] = useState('wallet');
+  const [injectedReady, setInjectedReady] = useState(false);
+  /** @type {import('../utils/injectedProvider.js').InjectedWallet[] | any[]} */
+  const [walletOptions, setWalletOptions] = useState([]);
+  const [showWalletPicker, setShowWalletPicker] = useState(false);
+  const [connectBusy, setConnectBusy] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+  const [injectDiag, setInjectDiag] = useState(null);
   const [signer, setSigner] = useState(null);
   const [vault, setVault] = useState({ liquid: "0", wWART: "0", CTSI: "0", eth: "0", usdc: "0" });
   const [spoofedWwart, setSpoofedWwart] = useState({ history: [], burnHistory: [], total: '0', totalBurned: '0' });
@@ -124,8 +154,18 @@ export default function WalletIsland() {
   /** Local Get wWETH burn amount */
   const [burnWethAmt, setBurnWethAmt] = useState('');
   const [mintWethAmt, setMintWethAmt] = useState('');
+  /**
+   * When true (default): mint creates Warthog WETH (createAssets) + rollup claim,
+   * linked 1:1 to the amount. Needs unlocked Warthog wallet + locked ETH capacity.
+   */
+  const [mintWartEthAsset, setMintWartEthAsset] = useState(true);
+  /** Last mint link + full merged list (inspect + localStorage) */
+  const [lastEthWartAsset, setLastEthWartAsset] = useState(null);
+  const [wethLinks, setWethLinks] = useState([]);
   /** Warthog session (mnemonic) for ETH bridge sub-wallet derivation */
   const [wartSession, setWartSession] = useState(null);
+  /** Path A pool bridge helpers from WarthogWallet */
+  const [wartBridgeApi, setWartBridgeApi] = useState(null);
   /** true if UI is showing cached claims because inspect was empty */
   const [vaultFromCache, setVaultFromCache] = useState(false);
   /** Live MetaMask ERC-20 wWART balance (human units string) */
@@ -135,6 +175,44 @@ export default function WalletIsland() {
    * null = unknown / loading, true = registered, false = not yet.
    */
   const [l1Registered, setL1Registered] = useState(null);
+  /** Public Anvil /rpc probe (must stay before any early return — Rules of Hooks). */
+  const [l1RpcOk, setL1RpcOk] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const probe = async () => {
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 6000);
+        const res = await fetch(RPC_URL, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'eth_chainId',
+            params: [],
+            id: 1,
+          }),
+          signal: ctrl.signal,
+          cache: 'no-store',
+        });
+        clearTimeout(t);
+        const j = await res.json();
+        const cid = parseInt(String(j?.result || '0'), 16);
+        if (!cancelled) {
+          setL1RpcOk(res.ok && cid === Number(ACTIVE_NETWORK?.chainId || 31337));
+        }
+      } catch {
+        if (!cancelled) setL1RpcOk(false);
+      }
+    };
+    probe();
+    const id = setInterval(probe, 30000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
 
   const l1RegStorageKey = (addr) =>
     `cartesiL1Registered:${String(addr || '')
@@ -294,12 +372,90 @@ export default function WalletIsland() {
     return false;
   };
 
+  /** Active EIP-1193 provider (preferred / discovered). */
+  const getEip1193 = () => eip1193Ref.current || getInjectedProvider();
+
+  const bindEip1193 = (raw, meta = {}) => {
+    if (!raw) return null;
+    eip1193Ref.current = raw;
+    setPreferredProvider(raw, meta);
+    setWalletLabel(meta.name || describeProvider(raw));
+    setInjectedReady(true);
+    return raw;
+  };
+
+  const refreshWalletOptions = async () => {
+    const opts = await resolveWalletOptions();
+    setWalletOptions(opts);
+    setInjectedReady(opts.length > 0);
+    setIsMobile(isMobileClient());
+    setInjectDiag(walletInjectDiagnostics());
+    if (opts.length === 1) {
+      setWalletLabel(opts[0].name);
+    } else if (opts.length > 1) {
+      setWalletLabel('wallet');
+    }
+    return opts;
+  };
+
   // useEffects FROM ORIGINAL WalletIsland
   useEffect(() => {
-    const tryAutoConnect = async () => {
-      if (!window.ethereum) return;
+    startProviderDiscovery();
+    setIsMobile(isMobileClient());
+    // Detect installs before user clicks (late inject: Rabby/MM/Brave race)
+    let cancelled = false;
+    (async () => {
+      const opts = await resolveWalletOptions();
+      if (cancelled) return;
+      setWalletOptions(opts);
+      setInjectedReady(opts.length > 0);
+      setInjectDiag(walletInjectDiagnostics());
+      // Only bind a provider for listeners / auto-connect preference — do not
+      // force Brave when MetaMask/Rabby are also present.
+      const preferred = getInjectedProvider();
+      if (preferred) {
+        const meta = opts.find((w) => w.provider === preferred);
+        bindEip1193(preferred, { rdns: meta?.rdns, name: meta?.name });
+      } else if (opts.length === 1) {
+        bindEip1193(opts[0].provider, {
+          rdns: opts[0].rdns,
+          name: opts[0].name,
+        });
+      }
+
+      // Resume WalletConnect session (mobile) if pairing still valid
       try {
-        const prov = new ethers.BrowserProvider(window.ethereum);
+        const wc = await getWalletConnectProvider();
+        if (!cancelled && wc?.session && wc.accounts?.length) {
+          bindEip1193(wc, { name: 'WalletConnect' });
+          const prov = new ethers.BrowserProvider(wc);
+          const sign = await prov.getSigner();
+          const addr = await sign.getAddress();
+          setProvider(prov);
+          setSigner(sign);
+          setAddress(addr);
+          setConnected(true);
+          await hydrateVaultPreferApi(addr);
+          toast.success(`WalletConnect session: ${addr.slice(0, 6)}…${addr.slice(-4)}`);
+          refreshVault(addr);
+        }
+      } catch (e) {
+        console.log('[walletconnect] no session to resume', e?.message || e);
+      }
+    })();
+
+    const tryAutoConnect = async () => {
+      // Auto-connect only when a prior permission exists on a preferred/single wallet
+      const eth =
+        getEip1193() ||
+        getInjectedProvider() ||
+        (listInjectedWallets().length === 1
+          ? listInjectedWallets()[0].provider
+          : null);
+      if (!eth) return;
+      bindEip1193(eth);
+      try {
+        const prov = new ethers.BrowserProvider(eth);
         const accounts = await prov.listAccounts();
         if (accounts.length > 0) {
           const sign = await prov.getSigner();
@@ -309,25 +465,26 @@ export default function WalletIsland() {
           setAddress(addr);
           setConnected(true);
           await hydrateVaultPreferApi(addr);
-          toast.success(`Auto-connected: ${addr.slice(0,6)}...${addr.slice(-4)}`);
+          toast.success(
+            `Auto-connected (${describeProvider(eth)}): ${addr.slice(0, 6)}...${addr.slice(-4)}`,
+          );
           refreshVault(addr);
         }
       } catch (err) {
-        console.log("No auto-connect");
+        console.log('No auto-connect');
       }
     };
     tryAutoConnect();
 
-    const eth = window.ethereum;
-    if (!eth?.on) return undefined;
-
     const onAccountsChanged = async (accounts) => {
       if (!accounts || accounts.length === 0) {
         clearLocalSession({ wipeCache: false });
-        toast('MetaMask disconnected');
+        toast('Wallet disconnected');
         return;
       }
       try {
+        const eth = getEip1193();
+        if (!eth) return;
         const prov = new ethers.BrowserProvider(eth);
         const sign = await prov.getSigner();
         const addr = await sign.getAddress();
@@ -345,25 +502,49 @@ export default function WalletIsland() {
     };
 
     const onChainChanged = () => {
-      // MetaMask recommends full reload; soft re-bind is enough for Anvil demo
+      // Wallets recommend full reload; soft re-bind is enough for Anvil demo
       tryAutoConnect();
     };
 
-    eth.on('accountsChanged', onAccountsChanged);
-    eth.on('chainChanged', onChainChanged);
+    // Attach listeners to every known inject (multi-wallet)
+    const attached = [];
+    const attach = (eth) => {
+      if (!eth?.on || attached.includes(eth)) return;
+      eth.on('accountsChanged', onAccountsChanged);
+      eth.on('chainChanged', onChainChanged);
+      attached.push(eth);
+    };
+    for (const w of listInjectedWallets()) attach(w.provider);
+    // Also listen when EIP-6963 announces later
+    const onAnnounce = () => {
+      for (const w of listInjectedWallets()) attach(w.provider);
+      if (!eip1193Ref.current) {
+        const p = getInjectedProvider();
+        if (p) bindEip1193(p);
+      }
+    };
+    window.addEventListener('eip6963:announceProvider', onAnnounce);
+    window.addEventListener('ethereum#initialized', onAnnounce);
+
     return () => {
-      eth.removeListener?.('accountsChanged', onAccountsChanged);
-      eth.removeListener?.('chainChanged', onChainChanged);
+      cancelled = true;
+      window.removeEventListener('eip6963:announceProvider', onAnnounce);
+      window.removeEventListener('ethereum#initialized', onAnnounce);
+      for (const eth of attached) {
+        eth.removeListener?.('accountsChanged', onAccountsChanged);
+        eth.removeListener?.('chainChanged', onChainChanged);
+      }
     };
   }, []);
 
   const refreshMmWwart = async (addr) => {
     try {
-      if (!WWART_ADDRESS || !window.ethereum || !addr) {
+      const eth = getEip1193();
+      if (!WWART_ADDRESS || !eth || !addr) {
         setMmWwartBal(null);
         return;
       }
-      const browser = new ethers.BrowserProvider(window.ethereum);
+      const browser = new ethers.BrowserProvider(eth);
       const token = new ethers.Contract(
         WWART_ADDRESS,
         ['function balanceOf(address) view returns (uint256)'],
@@ -372,17 +553,18 @@ export default function WalletIsland() {
       const bal = await token.balanceOf(addr);
       setMmWwartBal(ethers.formatUnits(bal, 18));
     } catch {
-      /* MetaMask not ready / wrong chain */
+      /* wallet not ready / wrong chain */
     }
   };
 
   const refreshMainEth = async (addr) => {
     try {
-      if (!window.ethereum || !addr) {
+      const eth = getEip1193();
+      if (!eth || !addr) {
         setMainEthBal(null);
         return;
       }
-      const browser = new ethers.BrowserProvider(window.ethereum);
+      const browser = new ethers.BrowserProvider(eth);
       const bal = await browser.getBalance(addr);
       setMainEthBal(ethers.formatEther(bal));
     } catch {
@@ -497,20 +679,43 @@ export default function WalletIsland() {
   /**
    * EIP-3085: add/switch the active Cartesi L1 network in MetaMask
    * (same idea as wallet_watchAsset for the token).
-   * @param {{ silent?: boolean }} opts — silent: no toast on soft failures (connect path)
+   * @param {{ silent?: boolean, forceAdd?: boolean }} opts
+   *   silent: no toast on soft failures (connect path)
+   *   forceAdd: always wallet_addEthereumChain so RPC URL is the public DuckDNS one
+   *             (fixes MetaMask stuck on http://localhost:8545 for chain 31337)
    */
   const ensureCartesiNetwork = async (opts = {}) => {
     const silent = !!opts.silent;
-    if (!window.ethereum) {
-      if (!silent) toast.error('Please install MetaMask!');
-      throw new Error('MetaMask not found');
+    const forceAdd = !!opts.forceAdd;
+    const eth =
+      getEip1193() ||
+      (await resolveProviderForConnect());
+    if (!eth) {
+      if (!silent) {
+        toast.error(
+          'No browser wallet found. Install/enable Rabby or MetaMask for this site, then refresh.',
+          { duration: 7000 },
+        );
+      }
+      throw new Error('No injected wallet');
     }
+    bindEip1193(eth);
+    const walletName = describeProvider(eth);
     const net = getNetwork() || ACTIVE_NETWORK;
     const chainIdHex =
       net.chainIdHex ||
       (net.chainId != null ? `0x${Number(net.chainId).toString(16)}` : '0x7a69');
     const chainName = net.label || 'Cartesi Local';
-    const rpcUrls = [net.rpcUrl || RPC_URL].filter(Boolean);
+    // Prefer public DuckDNS RPC — never leave MetaMask on localhost:8545
+    // (that only works if Anvil is on the *user's* machine).
+    const publicRpc =
+      net.rpcUrl ||
+      RPC_URL ||
+      'https://cartesi-bridge.duckdns.org/rpc';
+    const rpcUrls = [publicRpc].filter(
+      (u) => u && !/localhost|127\.0\.0\.1/i.test(String(u)),
+    );
+    if (!rpcUrls.length) rpcUrls.push('https://cartesi-bridge.duckdns.org/rpc');
     const nativeCurrency = net.nativeCurrency || {
       name: 'ETH',
       symbol: 'ETH',
@@ -522,12 +727,42 @@ export default function WalletIsland() {
       rpcUrls,
       nativeCurrency,
     };
+
+    const tryAdd = async () => {
+      await eth.request({
+        method: 'wallet_addEthereumChain',
+        params: [params],
+      });
+    };
+
     try {
+      if (forceAdd) {
+        // Re-add updates RPC on many wallets; falls back to switch if already present.
+        try {
+          await tryAdd();
+          if (!silent) toast.success(`${chainName} RPC set → ${rpcUrls[0]}`);
+          return true;
+        } catch (addFirst) {
+          const c = addFirst?.code ?? addFirst?.data?.originalError?.code;
+          if (c === 4001) {
+            if (!silent) toast('Network update cancelled');
+            return false;
+          }
+          // "already added" → switch
+        }
+      }
       // Prefer switch if already added
-      await window.ethereum.request({
+      await eth.request({
         method: 'wallet_switchEthereumChain',
         params: [{ chainId: chainIdHex }],
       });
+      // After switch, try re-add once so a stale localhost RPC gets the public URL.
+      // MetaMask often no-ops; Rabby/others may update. Errors ignored.
+      try {
+        await tryAdd();
+      } catch {
+        /* chain already configured */
+      }
       if (!silent) toast.success(`Switched to ${chainName}`);
       return true;
     } catch (switchErr) {
@@ -535,11 +770,8 @@ export default function WalletIsland() {
       const code = switchErr?.code ?? switchErr?.data?.originalError?.code;
       if (code === 4902 || /unrecognized chain|unknown chain/i.test(String(switchErr?.message || ''))) {
         try {
-          await window.ethereum.request({
-            method: 'wallet_addEthereumChain',
-            params: [params],
-          });
-          if (!silent) toast.success(`${chainName} added to MetaMask`);
+          await tryAdd();
+          if (!silent) toast.success(`${chainName} added to ${walletName}`);
           return true;
         } catch (addErr) {
           if (!silent) {
@@ -558,11 +790,8 @@ export default function WalletIsland() {
       }
       // Fallback: try add anyway (some wallets only implement add)
       try {
-        await window.ethereum.request({
-          method: 'wallet_addEthereumChain',
-          params: [params],
-        });
-        if (!silent) toast.success(`${chainName} added to MetaMask`);
+        await tryAdd();
+        if (!silent) toast.success(`${chainName} added to ${walletName}`);
         return true;
       } catch (addErr) {
         if (!silent) {
@@ -573,6 +802,95 @@ export default function WalletIsland() {
         throw addErr;
       }
     }
+  };
+
+  /**
+   * Prove L1 is usable for InputBox: VPS Anvil up + MetaMask on chainId with a live RPC.
+   * Rebinds provider/signer after network switch.
+   */
+  const ensureL1ReadyForSend = async () => {
+    const net = getNetwork() || ACTIVE_NETWORK;
+    const wantChain = Number(net.chainId ?? 31337);
+    const publicRpc =
+      net.rpcUrl || RPC_URL || 'https://cartesi-bridge.duckdns.org/rpc';
+
+    // 1) Server Anvil (public RPC) — if this fails, the VPS really is down
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      const res = await fetch(publicRpc, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'eth_chainId',
+          params: [],
+          id: 1,
+        }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(t);
+      const j = await res.json();
+      const cid = parseInt(String(j?.result || '0'), 16);
+      if (!res.ok || !Number.isFinite(cid)) {
+        throw new Error('bad rpc response');
+      }
+    } catch {
+      throw new Error(
+        `L1 RPC unreachable (${publicRpc}). Server Anvil may be down — try again in a minute.`,
+      );
+    }
+
+    // 2) Point MetaMask at public RPC (fixes stale localhost:8545 for chain 31337)
+    try {
+      await ensureCartesiNetwork({ silent: true, forceAdd: true });
+    } catch {
+      try {
+        await ensureCartesiNetwork({ silent: true });
+      } catch {
+        /* user may already be on chain */
+      }
+    }
+
+    // 3) Rebind signer after network change
+    const eth = getEip1193();
+    if (!eth) throw new Error('No browser wallet');
+    const prov = new ethers.BrowserProvider(eth);
+    const sign = await prov.getSigner();
+    setProvider(prov);
+    setSigner(sign);
+
+    let chainId;
+    try {
+      const n = await prov.getNetwork();
+      chainId = Number(n.chainId);
+    } catch (e) {
+      throw new Error(
+        `Wallet cannot read chain id — set network ${wantChain} with RPC ${publicRpc}. (${e?.message || e})`,
+      );
+    }
+    if (chainId !== wantChain) {
+      throw new Error(
+        `Wrong network (wallet=${chainId}, need ${wantChain}). Click “Switch network” or add Cartesi Bridge Anvil with RPC ${publicRpc}`,
+      );
+    }
+
+    // 4) Wallet’s own RPC must answer (catches localhost:8545 still configured)
+    try {
+      await Promise.race([
+        prov.getBlockNumber(),
+        new Promise((_, rej) =>
+          setTimeout(() => rej(new Error('wallet rpc timeout')), 10000),
+        ),
+      ]);
+    } catch {
+      throw new Error(
+        `MetaMask RPC for chain ${wantChain} is dead (often still http://localhost:8545). ` +
+          `Anvil on the server IS up. Fix: MetaMask → Settings → Networks → chain ${wantChain} → ` +
+          `RPC URL = ${publicRpc} (or remove the network and reconnect).`,
+      );
+    }
+    return sign;
   };
 
   /** Reset React connection state (always local; MetaMask has no full logout API). */
@@ -636,9 +954,12 @@ export default function WalletIsland() {
    */
   const disconnectWallet = async () => {
     try {
-      if (window.ethereum?.request) {
+      const eth = getEip1193();
+      if (isWalletConnectProvider(eth) || getActiveWalletConnectProvider()) {
+        await disconnectWalletConnect();
+      } else if (eth?.request) {
         try {
-          await window.ethereum.request({
+          await eth.request({
             method: 'wallet_revokePermissions',
             params: [{ eth_accounts: {} }],
           });
@@ -648,8 +969,9 @@ export default function WalletIsland() {
         }
       }
     } finally {
+      eip1193Ref.current = null;
       clearLocalSession({ wipeCache: false });
-      toast.success('Disconnected MetaMask from this site');
+      toast.success(`Disconnected ${walletLabel} from this site`);
     }
   };
 
@@ -659,9 +981,12 @@ export default function WalletIsland() {
    */
   const logoutWallet = async () => {
     try {
-      if (window.ethereum?.request) {
+      const eth = getEip1193();
+      if (isWalletConnectProvider(eth) || getActiveWalletConnectProvider()) {
+        await disconnectWalletConnect();
+      } else if (eth?.request) {
         try {
-          await window.ethereum.request({
+          await eth.request({
             method: 'wallet_revokePermissions',
             params: [{ eth_accounts: {} }],
           });
@@ -670,18 +995,24 @@ export default function WalletIsland() {
         }
       }
     } finally {
+      eip1193Ref.current = null;
       clearLocalSession({ wipeCache: true });
       toast.success('Logged out — site session and vault cache cleared');
     }
   };
 
-  // FUNCTIONS FROM ORIGINAL WalletIsland
-  const connect = async () => {
-    if (!window.ethereum) {
-      toast.error("Please install MetaMask!");
-      return;
-    }
-
+  /**
+   * Connect a specific EIP-1193 provider (injected or WalletConnect).
+   * @param {object} eth
+   * @param {{ name?: string, rdns?: string, skipRequestAccounts?: boolean }} [meta]
+   */
+  const connectWithProvider = async (eth, meta = {}) => {
+    if (!eth) return false;
+    bindEip1193(eth, meta);
+    const label =
+      meta.name ||
+      (isWalletConnectProvider(eth) ? 'WalletConnect' : describeProvider(eth));
+    setConnectBusy(true);
     try {
       try {
         await ensureCartesiNetwork({ silent: true });
@@ -689,8 +1020,11 @@ export default function WalletIsland() {
         /* still allow connect if user is already on a usable chain */
       }
 
-      await window.ethereum.request({ method: 'eth_requestAccounts' });
-      const prov = new ethers.BrowserProvider(window.ethereum);
+      // WC session already has accounts after connect(); injected needs eth_requestAccounts
+      if (!meta.skipRequestAccounts) {
+        await eth.request({ method: 'eth_requestAccounts' });
+      }
+      const prov = new ethers.BrowserProvider(eth);
       const sign = await prov.getSigner();
       const addr = await sign.getAddress();
 
@@ -699,12 +1033,85 @@ export default function WalletIsland() {
       setAddress(addr);
       setConnected(true);
       setL1Registered(null);
+      setShowWalletPicker(false);
       hydrateVaultFromCache(addr);
-      toast.success(`Connected: ${addr.slice(0,6)}...${addr.slice(-4)}`);
+      toast.success(`Connected (${label}): ${addr.slice(0, 6)}...${addr.slice(-4)}`);
       refreshVault(addr);
+
+      // Keep session in sync for WC disconnects
+      if (isWalletConnectProvider(eth) && eth.on) {
+        eth.on('accountsChanged', (accounts) => {
+          if (!accounts?.length) {
+            clearLocalSession({ wipeCache: false });
+            toast('WalletConnect disconnected');
+          }
+        });
+        eth.on('disconnect', () => {
+          clearLocalSession({ wipeCache: false });
+          toast('WalletConnect disconnected');
+        });
+        eth.on('session_delete', () => {
+          clearLocalSession({ wipeCache: false });
+        });
+      }
+      return true;
     } catch (err) {
-      toast.error("Connection rejected");
-      console.error(err);
+      const msg = String(err?.message || err || '');
+      if (
+        err?.code === 4001 ||
+        /reject|denied|user closed|reset|Connection request reset/i.test(msg)
+      ) {
+        toast.error(`Connection cancelled (${label})`);
+      } else {
+        toast.error(`Could not connect to ${label}: ${msg.slice(0, 140)}`, {
+          duration: 7000,
+        });
+      }
+      console.error('[connect]', err);
+      return false;
+    } finally {
+      setConnectBusy(false);
+    }
+  };
+
+  /** Open WalletConnect modal (QR + MetaMask / Rabby / … like QuickSwap). */
+  const connectViaWalletConnect = async () => {
+    setConnectBusy(true);
+    try {
+      toast.loading('Opening wallet list…', { id: 'wc-connect' });
+      const eth = await connectWalletConnect();
+      toast.dismiss('wc-connect');
+      await connectWithProvider(eth, {
+        name: 'WalletConnect',
+        skipRequestAccounts: true,
+      });
+    } catch (err) {
+      toast.dismiss('wc-connect');
+      const msg = String(err?.message || err || '');
+      if (/reset|reject|denied|closed|User closed/i.test(msg)) {
+        toast('WalletConnect cancelled');
+      } else {
+        toast.error(`WalletConnect failed: ${msg.slice(0, 140)}`, { duration: 8000 });
+      }
+      console.error('[walletconnect]', err);
+    } finally {
+      setConnectBusy(false);
+    }
+  };
+
+  // FUNCTIONS FROM ORIGINAL WalletIsland
+  const connect = async () => {
+    setConnectBusy(true);
+    try {
+      const opts = await refreshWalletOptions();
+      // Always show chooser: injected (if any) + WalletConnect (mobile / all)
+      setShowWalletPicker(true);
+      if (!opts.length) {
+        // Still fine — user can pick WalletConnect
+        setInjectedReady(false);
+      }
+    } finally {
+      setConnectBusy(false);
     }
   };
 
@@ -926,7 +1333,35 @@ export default function WalletIsland() {
         usdc: String(json?.usdc ?? cacheCap?.usdc ?? '0'),
         eth: String(json?.eth ?? cacheCap?.eth ?? '0'),
         wWART: String(json?.wWART ?? cacheCap?.wWART ?? '0'),
+        ethCapacity18:
+          json?.ethCapacity18 != null ? String(json.ethCapacity18) : cacheCap?.ethCapacity18,
+        ethClaimed18:
+          json?.ethClaimed18 != null ? String(json.ethClaimed18) : cacheCap?.ethClaimed18,
+        ethRemaining18:
+          json?.ethRemaining18 != null
+            ? String(json.ethRemaining18)
+            : cacheCap?.ethRemaining18,
+        l1WethClaim:
+          json?.l1WethClaim != null ? String(json.l1WethClaim) : cacheCap?.l1WethClaim,
+        wethPortable:
+          json?.wethPortable != null ? String(json.wethPortable) : cacheCap?.wethPortable,
+        ethWartAssets: Array.isArray(json?.ethWartAssets)
+          ? json.ethWartAssets
+          : cacheCap?.ethWartAssets,
       };
+
+      // Merge rollup-linked WETH assets with browser registry (works pre-backend-rebuild)
+      try {
+        const { mergeEthWartAssetLinks } = await import(
+          '../utils/mintEthWarthogAsset.js'
+        );
+        const merged = mergeEthWartAssetLinks(addr, nextVault.ethWartAssets);
+        nextVault.ethWartAssets = merged;
+        setWethLinks(merged);
+        if (merged[0]) setLastEthWartAsset(merged[0]);
+      } catch {
+        /* optional */
+      }
 
       // Always recompute remaining from capacity + merged claims (authoritative UI)
       try {
@@ -985,12 +1420,36 @@ export default function WalletIsland() {
         }
       }
       setLoading(true);
+
+      // Server Anvil is usually up; MetaMask often still points 31337 at localhost:8545.
+      const liveSigner = await ensureL1ReadyForSend();
+
       // UTF-8 JSON bytes — MetaMask may offer a UTF-8 view of the `input` param
       const message = JSON.stringify(payload);
       const payloadBytes = new TextEncoder().encode(message);
-      const inputBox = new ethers.Contract(INPUT_BOX_ADDRESS, INPUT_BOX_ABI, signer);
-      const tx = await inputBox.addInput(DAPP_ADDRESS, payloadBytes, { gasLimit: 200000 });
-      const receipt = await tx.wait();
+      // Gas scales with calldata; 200k was tight for larger InputBox payloads (e.g. proofs).
+      const gasLimit = BigInt(Math.min(1_500_000, 80_000 + payloadBytes.length * 16 + 50_000));
+      const inputBox = new ethers.Contract(INPUT_BOX_ADDRESS, INPUT_BOX_ABI, liveSigner);
+      const tx = await inputBox.addInput(DAPP_ADDRESS, payloadBytes, { gasLimit });
+      // Never hang forever if wallet RPC stops returning receipts.
+      const publicRpc =
+        (getNetwork() || ACTIVE_NETWORK)?.rpcUrl ||
+        RPC_URL ||
+        'https://cartesi-bridge.duckdns.org/rpc';
+      const receipt = await Promise.race([
+        tx.wait(),
+        new Promise((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `L1 receipt timeout (90s). Server Anvil is fine — MetaMask network 31337 must use RPC ${publicRpc} (not localhost:8545).`,
+                ),
+              ),
+            90_000,
+          ),
+        ),
+      ]);
       // ethers-v6: receipt.hash (v5 used transactionHash)
       const txHash = receipt?.hash || receipt?.transactionHash || tx?.hash || '';
       if (successMessage) {
@@ -1139,8 +1598,14 @@ export default function WalletIsland() {
   };
 
   const depositErc20 = async (tokenAddress, amountStr, decimals, opts = {}) => {
-    if (!amountStr || !signer) return;
+    if (!amountStr) return;
+    if (!signer && !getEip1193()) {
+      toast.error('Connect wallet first');
+      return;
+    }
     try {
+      // Rebind signer to public Anvil RPC (wallet often still has localhost:8545)
+      const liveSigner = await ensureL1ReadyForSend();
       const amount = ethers.parseUnits(amountStr, decimals);
       const tokenSym =
         opts.tokenSymbol ||
@@ -1152,9 +1617,10 @@ export default function WalletIsland() {
               ? 'USDC'
               : 'ERC-20');
 
-      const token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
+      const from = await liveSigner.getAddress();
+      const token = new ethers.Contract(tokenAddress, ERC20_ABI, liveSigner);
       // ethers-v6 returns bigint — never use BigNumber .lt()
-      const allowance = await token.allowance(address, ERC20_PORTAL_ADDRESS);
+      const allowance = await token.allowance(from, ERC20_PORTAL_ADDRESS);
       if (allowance < amount) {
         const okApprove = await confirmMmTx(
           describeErc20Approve({
@@ -1170,9 +1636,26 @@ export default function WalletIsland() {
           return;
         }
         setLoading(true);
-        const txApprove = await token.approve(ERC20_PORTAL_ADDRESS, amount, { gasLimit: 100000 });
-        await txApprove.wait();
-        toast.success('Approved!');
+        // 100k often fails on cold ERC-20 approve paths — use headroom
+        const txApprove = await token.approve(ERC20_PORTAL_ADDRESS, amount, {
+          gasLimit: 200_000n,
+        });
+        toast.loading('Waiting for approve receipt…', { id: 'erc20-dep' });
+        await Promise.race([
+          txApprove.wait(),
+          new Promise((_, rej) =>
+            setTimeout(
+              () =>
+                rej(
+                  new Error(
+                    `Approve receipt timeout. Fix wallet RPC for 31337 → ${RPC_URL} (not localhost:8545).`,
+                  ),
+                ),
+              90_000,
+            ),
+          ),
+        ]);
+        toast.success('Approved!', { id: 'erc20-dep' });
         setLoading(false);
       }
 
@@ -1193,13 +1676,35 @@ export default function WalletIsland() {
       }
 
       setLoading(true);
-      const portal = new ethers.Contract(ERC20_PORTAL_ADDRESS, ERC20_PORTAL_ABI, signer);
-      const tx = await portal.depositERC20Tokens(tokenAddress, DAPP_ADDRESS, amount, "0x", { gasLimit: 200000 });
-      await tx.wait();
-      if (!opts.silentSuccess) toast.success('Deposited!');
-      setTimeout(() => refreshVault(address), 8000);
+      const portal = new ethers.Contract(ERC20_PORTAL_ADDRESS, ERC20_PORTAL_ABI, liveSigner);
+      // Portal deposit needs more gas than 200k on Anvil under load
+      const tx = await portal.depositERC20Tokens(
+        tokenAddress,
+        DAPP_ADDRESS,
+        amount,
+        '0x',
+        { gasLimit: 500_000n },
+      );
+      toast.loading('Waiting for deposit receipt…', { id: 'erc20-dep' });
+      await Promise.race([
+        tx.wait(),
+        new Promise((_, rej) =>
+          setTimeout(
+            () =>
+              rej(
+                new Error(
+                  `Deposit receipt timeout. Wallet RPC for 31337 must be ${RPC_URL} (not localhost).`,
+                ),
+              ),
+            90_000,
+          ),
+        ),
+      ]);
+      if (!opts.silentSuccess) toast.success('Deposited!', { id: 'erc20-dep' });
+      else toast.dismiss('erc20-dep');
+      setTimeout(() => refreshVault(from), 8000);
     } catch (err) {
-      toast.error(`Failed: ${err.message || err}`);
+      toast.error(`Failed: ${err.message || err}`, { id: 'erc20-dep', duration: 12000 });
       console.error(err);
       throw err;
     } finally {
@@ -1350,13 +1855,161 @@ export default function WalletIsland() {
     };
   })();
 
+  const refreshWethLinks = async (owner = address) => {
+    if (!owner) return;
+    const toastId = toast.loading('Refreshing WETH link status…');
+    try {
+      const { mergeEthWartAssetLinks, listLocalEthWartAssets } = await import(
+        '../utils/mintEthWarthogAsset.js'
+      );
+      // Fresh inspect — do not trust stale React vault state for pending→active
+      let inspectAssets = [];
+      try {
+        const hex = String(owner).replace(/^0x/i, '').toLowerCase();
+        const base = getInspectUrl().replace(/\/$/, '');
+        const res = await fetch(`${base}/vault/${hex}`, { cache: 'no-store' });
+        const data = await res.json();
+        if (data.reports?.length > 0) {
+          const json = decodeInspectPayload(data.reports[0].payload);
+          if (json && !json.error && Array.isArray(json.ethWartAssets)) {
+            inspectAssets = json.ethWartAssets;
+          }
+        }
+      } catch {
+        /* merge local-only below */
+      }
+
+      const finalList = mergeEthWartAssetLinks(owner, inspectAssets);
+      const list = finalList.length ? finalList : listLocalEthWartAssets(owner);
+      setWethLinks(list);
+      setVault((prev) => ({
+        ...prev,
+        ethWartAssets: list,
+        ...(inspectAssets.length
+          ? {}
+          : {}),
+      }));
+      if (list[0]) setLastEthWartAsset(list[0]);
+
+      // Also refresh capacity numbers so Available/Used match rollup
+      await refreshVault(owner);
+
+      const active = list.filter((l) => l.status === 'active').length;
+      const pending = list.filter((l) => l.status === 'pending').length;
+      toast.success(
+        pending
+          ? `Links refreshed · ${active} active, ${pending} pending (rollup has no link for those yet)`
+          : `Links refreshed · ${active || list.length} active`,
+        { id: toastId },
+      );
+    } catch (e) {
+      toast.error(e?.message || 'Refresh failed', { id: toastId });
+    }
+  };
+
   const mintWethClaim = async () => {
     const amt = String(mintWethAmt || '').trim();
     if (!amt) return toast.error('Enter mint amount');
+
+    // Capacity gate: locked ETH must leave Available > 0
+    let remainingWei = 0n;
+    let capacityWei = 0n;
+    try {
+      const { ethCapacityFromVault } = await import(
+        '../utils/mintEthWarthogAsset.js'
+      );
+      const cap = ethCapacityFromVault(vault);
+      remainingWei = cap.remainingWei;
+      capacityWei = cap.capacityWei;
+      if (!cap.hasLocked || capacityWei <= 0n) {
+        return toast.error(
+          'No locked ETH capacity — lock vault ETH under Vaults first',
+        );
+      }
+      if (!cap.hasAvailable || remainingWei <= 0n) {
+        return toast.error(
+          'ETH capacity fully used — burn claims or lock more ETH',
+        );
+      }
+    } catch {
+      /* proceed; rollup still enforces */
+    }
+
     try {
       setLoading(true);
-      await send({ type: 'mint_weth_claim', amount: amt });
-      toast.success(`Minted ${amt} wETH claim (rollup)`);
+      let assetLink = null;
+      const {
+        createWarthogEthAsset,
+        claimLinkPayload,
+        markLinkClaimed,
+        mergeEthWartAssetLinks,
+      } = await import('../utils/mintEthWarthogAsset.js');
+
+      // Native Warthog WETH (linked to claim amount) when capacity available
+      if (mintWartEthAsset) {
+        if (!wartSession?.address) {
+          return toast.error(
+            'Unlock Warthog wallet first to mint on-chain WETH',
+          );
+        }
+        const toastId = toast.loading(
+          `Creating WETH on Warthog for ${amt}…`,
+        );
+        try {
+          const nodeUrl =
+            wartSession?.selectedNode ||
+            (typeof localStorage !== 'undefined'
+              ? localStorage.getItem('selectedNode')
+              : null);
+          assetLink = await createWarthogEthAsset({
+            amount: amt,
+            wartAddress: wartSession.address,
+            nodeUrl: nodeUrl || undefined,
+            ownerL1: address,
+            remainingWei,
+          });
+          setLastEthWartAsset(assetLink);
+          toast.loading(
+            `WETH ${assetLink.assetHash.slice(0, 12)}… — opening rollup claim…`,
+            { id: toastId },
+          );
+        } catch (e) {
+          toast.error(e?.message || 'Warthog WETH mint failed', {
+            id: toastId,
+            duration: 8000,
+          });
+          return;
+        }
+        toast.dismiss(toastId);
+      }
+
+      await send({
+        type: 'mint_weth_claim',
+        amount: amt,
+        ...claimLinkPayload(assetLink, wartSession?.address),
+      });
+
+      if (assetLink?.assetHash) {
+        markLinkClaimed(address, assetLink.assetHash, {
+          amount: assetLink.amount,
+          wartAddress: wartSession?.address,
+          assetName: assetLink.assetName,
+        });
+        const merged = mergeEthWartAssetLinks(address, [
+          { ...assetLink, claimLinked: true, status: 'active', source: 'local' },
+          ...(vault?.ethWartAssets || []),
+        ]);
+        setWethLinks(merged);
+        setVault((prev) => ({ ...prev, ethWartAssets: merged }));
+        setLastEthWartAsset(merged[0] || assetLink);
+      }
+
+      toast.success(
+        assetLink
+          ? `Linked WETH ${assetLink.assetHash.slice(0, 12)}… · ${amt} claim open`
+          : `Minted ${amt} wETH claim (rollup only)`,
+        { duration: 8000 },
+      );
       setMintWethAmt('');
       setTimeout(() => refreshVault(address), 4000);
     } catch (e) {
@@ -1372,7 +2025,24 @@ export default function WalletIsland() {
     try {
       setLoading(true);
       await send({ type: 'burn_weth_claim', amount: amt });
-      toast.success(`Burned ${amt} wETH claim — Available ↑`);
+      try {
+        const { markLinksReleasedFifo, mergeEthWartAssetLinks } = await import(
+          '../utils/mintEthWarthogAsset.js'
+        );
+        const { released } = markLinksReleasedFifo(address, amt);
+        const merged = mergeEthWartAssetLinks(address, vault?.ethWartAssets);
+        setWethLinks(merged);
+        setVault((prev) => ({ ...prev, ethWartAssets: merged }));
+        const n = released.length;
+        toast.success(
+          n
+            ? `Burned ${amt} claim — Available ↑ · marked ${n} WETH link(s) released (tokens stay on Warthog)`
+            : `Burned ${amt} wETH claim — Available ↑`,
+          { duration: 7000 },
+        );
+      } catch {
+        toast.success(`Burned ${amt} wETH claim — Available ↑`);
+      }
       setBurnWethAmt('');
       setTimeout(() => refreshVault(address), 4000);
     } catch (e) {
@@ -1435,22 +2105,121 @@ export default function WalletIsland() {
     </div>
   );
 
+  const renderWalletOptionButton = (w) => (
+    <button
+      key={w.id}
+      type="button"
+      className="wi-wallet-option"
+      disabled={connectBusy}
+      onClick={() =>
+        connectWithProvider(w.provider, { name: w.name, rdns: w.rdns })
+      }
+    >
+      {w.icon ? (
+        <img src={w.icon} alt="" className="wi-wallet-option__icon" width={28} height={28} />
+      ) : (
+        <span className="wi-wallet-option__icon wi-wallet-option__icon--fallback" aria-hidden>
+          <Wallet size={16} />
+        </span>
+      )}
+      <span className="wi-wallet-option__meta">
+        <span className="wi-wallet-option__name">{w.name}</span>
+        {w.rdns ? <span className="wi-wallet-option__rdns">{w.rdns}</span> : null}
+      </span>
+    </button>
+  );
+
   if (!connected) {
     return (
       <div className="wi-shell preview-section">
         <Toaster position="top-right" />
         <div className="wi-connect-card">
           <p className="wi-connect-lead">
-            L1 MetaMask — required for vault multi-sig, lock/burn, and vouchers
+            L1 wallet — required for vault multi-sig, lock/burn, and vouchers
           </p>
-          <p className="wi-muted" style={{ marginTop: 0, marginBottom: '0.75rem' }}>
-            This is your Cartesi rollup owner address. Connect MetaMask first, then use{' '}
-            <strong>Register L1 address</strong> once so the dApp knows this wallet.
+          <p className="wi-muted" style={{ marginTop: 0, marginBottom: '0.85rem', lineHeight: 1.45 }}>
+            Connect with <strong>WalletConnect</strong> (works on phone — Rabby, MetaMask, …)
+            {walletOptions.length > 0
+              ? ' or a browser extension below.'
+              : '. On desktop you can also use a browser extension.'}
           </p>
-          <button type="button" onClick={connect} className="btn primary">
+
+          {/* Primary: WalletConnect — QuickSwap-style mobile path */}
+          <button
+            type="button"
+            className="btn primary"
+            disabled={connectBusy}
+            onClick={connectViaWalletConnect}
+            style={{ width: '100%', marginBottom: '0.55rem' }}
+          >
             <Wallet className="inline" size={18} style={{ marginRight: 8, verticalAlign: -3 }} />
-            Connect MetaMask (L1)
+            {connectBusy ? 'Connecting…' : 'Connect wallet'}
           </button>
+          <p className="wi-muted" style={{ fontSize: '0.78rem', margin: '0 0 0.75rem' }}>
+            Opens a wallet list + QR — pick Rabby / MetaMask / others (same idea as QuickSwap).
+          </p>
+
+          {walletOptions.length > 0 && (
+            <div className="wi-wallet-list" role="list" aria-label="Browser wallets">
+              <p className="wi-wallet-list__label">Or use a browser wallet on this device</p>
+              {walletOptions.map(renderWalletOptionButton)}
+            </div>
+          )}
+
+          <button
+            type="button"
+            className="btn secondary small"
+            style={{ marginTop: '0.65rem' }}
+            disabled={connectBusy}
+            onClick={() => refreshWalletOptions()}
+          >
+            Refresh browser wallets
+          </button>
+
+          {showWalletPicker && (
+            <div
+              className="wi-wallet-picker-overlay"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Choose wallet"
+              onClick={(e) => {
+                if (e.target === e.currentTarget && !connectBusy) setShowWalletPicker(false);
+              }}
+            >
+              <div className="wi-wallet-picker">
+                <h3 className="wi-wallet-picker__title">Connect wallet</h3>
+                <p className="wi-muted" style={{ marginTop: 0, marginBottom: '0.75rem' }}>
+                  Phone: use <strong>WalletConnect</strong> to open Rabby or MetaMask.
+                  Desktop: pick an extension or WalletConnect.
+                </p>
+                <button
+                  type="button"
+                  className="btn primary"
+                  disabled={connectBusy}
+                  onClick={connectViaWalletConnect}
+                  style={{ width: '100%', marginBottom: '0.65rem' }}
+                >
+                  {connectBusy ? 'Connecting…' : 'WalletConnect (Rabby / MetaMask / …)'}
+                </button>
+                {walletOptions.length > 0 && (
+                  <div className="wi-wallet-list">
+                    <p className="wi-wallet-list__label">Browser wallets</p>
+                    {walletOptions.map(renderWalletOptionButton)}
+                  </div>
+                )}
+                <button
+                  type="button"
+                  className="btn secondary small"
+                  style={{ marginTop: '0.75rem' }}
+                  onClick={() => setShowWalletPicker(false)}
+                  disabled={connectBusy}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
           {(getNetworkId() === 'anvil' || ACTIVE_NETWORK?.isDemo) && (
             <AnvilTestKeys rpcUrl={RPC_URL} compact />
           )}
@@ -1472,7 +2241,7 @@ export default function WalletIsland() {
               <span className="wi-stat-v">0.12</span>
             </div>
           </div>
-          <p className="wi-muted">Preview only — connect MetaMask to load your L1 vault</p>
+          <p className="wi-muted">Preview only — connect a wallet to load your L1 vault</p>
         </div>
       </div>
     );
@@ -1483,7 +2252,72 @@ export default function WalletIsland() {
       <Toaster position="top-right" />
       {mmTxModal}
 
-      {/* ── 1) Warthog first (primary bridge path) ── */}
+      <div
+        className="wi-panel"
+        style={{
+          marginBottom: '0.75rem',
+          padding: '0.55rem 0.75rem',
+          border:
+            l1RpcOk === false
+              ? '1px solid rgba(255,80,80,0.5)'
+              : '1px solid rgba(0,255,204,0.25)',
+          fontSize: '0.8rem',
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: '0.5rem',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+          }}
+        >
+          <span>
+            <strong>Anvil L1:</strong>{' '}
+            {l1RpcOk === null
+              ? 'checking…'
+              : l1RpcOk
+                ? `reachable · chain ${ACTIVE_NETWORK?.chainId || 31337}`
+                : 'UNREACHABLE from this browser'}
+            <span className="wi-muted" style={{ display: 'block', fontSize: '0.72rem' }}>
+              Wallet network RPC must be{' '}
+              <code style={{ wordBreak: 'break-all' }}>{RPC_URL}</code>
+              {' '}— never <code>localhost:8545</code> on a phone.
+            </span>
+          </span>
+          <button
+            type="button"
+            className="btn secondary small"
+            disabled={loading}
+            onClick={async () => {
+              try {
+                await ensureCartesiNetwork({ forceAdd: true });
+                await ensureL1ReadyForSend();
+                toast.success('Wallet network OK for Anvil');
+                setL1RpcOk(true);
+              } catch (e) {
+                toast.error(e?.message || String(e), { duration: 10000 });
+                setL1RpcOk(false);
+              }
+            }}
+          >
+            Fix wallet → Anvil RPC
+          </button>
+        </div>
+      </div>
+
+      {/* Path A — fungible shared pool (does not touch cosigner / sub-wallets) */}
+      <FungiblePool
+        ownerAddress={address}
+        send={send}
+        wartBridgeApi={wartBridgeApi}
+        onRefreshL1Vault={() => refreshVault(address)}
+        mmWwartBal={mmWwartBal}
+        onRefreshMmWwart={() => refreshMmWwart(address)}
+      />
+
+      {/* ── 1) Warthog first (Path B personal vaults / subs live here) ── */}
       {showWarthog && (
         <WarthogWallet
           send={send}
@@ -1496,6 +2330,7 @@ export default function WalletIsland() {
           l1Vault={vault}
           onRefreshL1Vault={() => refreshVault(address)}
           onSessionChange={setWartSession}
+          onBridgeApi={setWartBridgeApi}
           onToggleShowWallet={() => setShowWarthog(false)}
           showWalletVisible
           capacityOverviewPanel={
@@ -1882,17 +2717,16 @@ export default function WalletIsland() {
             <button
               type="button"
               className="wi-token-copy"
-              title={`Add or switch to ${ACTIVE_NETWORK?.label || 'Cartesi Local'} in MetaMask`}
+              title={`Add/switch ${ACTIVE_NETWORK?.label || 'Cartesi Local'} with public RPC (not localhost)`}
               onClick={async () => {
                 try {
-                  await ensureCartesiNetwork();
+                  await ensureCartesiNetwork({ forceAdd: true });
                 } catch {
                   /* toasts handled inside */
                 }
               }}
             >
-              Add network · {ACTIVE_NETWORK?.label || 'Cartesi Local'} (chain{' '}
-              {ACTIVE_NETWORK?.chainId ?? 31337})
+              Fix L1 network · chain {ACTIVE_NETWORK?.chainId ?? 31337} · public RPC
             </button>
             {WWART_ADDRESS ? (
               <button
@@ -1904,15 +2738,16 @@ export default function WalletIsland() {
                   const symbol = LOCAL_WWART?.symbol || 'wWART';
                   const decimals = LOCAL_WWART?.decimals ?? 18;
                   try {
-                    if (!window.ethereum) throw new Error('MetaMask not found');
-                    const added = await window.ethereum.request({
+                    const eth = getEip1193() || (await resolveProviderForConnect());
+                    if (!eth) throw new Error('No browser wallet found');
+                    const added = await eth.request({
                       method: 'wallet_watchAsset',
                       params: {
                         type: 'ERC20',
                         options: { address: addr, symbol, decimals },
                       },
                     });
-                    if (added) toast.success(`${symbol} added to MetaMask`);
+                    if (added) toast.success(`${symbol} added to ${describeProvider(eth)}`);
                     else {
                       await navigator.clipboard?.writeText(addr);
                       toast('Import cancelled — address copied', { duration: 4000 });
@@ -2172,10 +3007,22 @@ export default function WalletIsland() {
                 </div>
               </div>
               <p className="wh-hint sw-l1-track-hint">
-                <strong>Locked vault ETH</strong> is capacity (not WART).{' '}
-                <strong>wETH claims</strong> are rollup-only until DeFi WETH. Portal ETH is
-                inventory only.
+                <strong>Locked vault ETH</strong> is capacity (not WART). Mint opens a rollup
+                claim and (default) a linked <strong>WETH</strong> asset on Warthog. Portal ETH
+                is inventory only.
               </p>
+              {wethLinks.length > 0 ? (
+                <div className="sw-meta-row" style={{ marginTop: '0.35rem' }}>
+                  <span className="sw-meta-k" title="Warthog WETH linked to claims">
+                    Warthog WETH links
+                  </span>
+                  <span className="sw-meta-v">
+                    {wethLinks.filter((l) => l.status !== 'released').length} active
+                    {' / '}
+                    {wethLinks.length} total
+                  </span>
+                </div>
+              ) : null}
             </>
           )}
         </div>
@@ -2238,7 +3085,7 @@ export default function WalletIsland() {
                 <strong>Vaults</strong> — sub → vault · lock capacity · release · cosign
               </li>
               <li>
-                <strong>Get wWETH</strong> — mint / burn rollup wETH claims (until DeFi WETH)
+                <strong>Get wWETH</strong> — mint Warthog WETH + rollup claim (linked)
               </li>
             </ol>
             {(getNetworkId() === 'anvil' || ACTIVE_NETWORK?.isDemo) && (
@@ -2312,8 +3159,7 @@ export default function WalletIsland() {
         {l1Tab === 'getwweth' && (
           <div className="wi-panel eth-getwweth-panel">
             <p className="wi-muted wi-claim-lead">
-              wETH claim:{' '}
-              <strong>{ethCapSummary.claim}</strong>
+              Claim: <strong>{ethCapSummary.claim}</strong>
               {' · '}
               Portable: <strong>{ethCapSummary.portable}</strong>
               {' · '}
@@ -2322,11 +3168,32 @@ export default function WalletIsland() {
               Capacity: <strong>{ethCapSummary.capacity}</strong>
             </p>
             <p className="wi-muted" style={{ marginTop: '-0.25rem', marginBottom: '0.75rem' }}>
-              Rollup-only claims until Warthog DeFi WETH. Mint uses ETH capacity (locked vault
-              ETH). Burn frees Available. Not the same as MetaMask WETH.
+              Against <strong>locked vault ETH</strong>: mint opens a rollup claim and (default)
+              creates <strong>WETH</strong> on Warthog for the same amount — hash linked here.
+              Burn frees capacity; Warthog WETH tokens stay in your wallet (no on-chain asset burn
+              yet). Not MetaMask / L1 WETH.
             </p>
             <div className="wi-portal-card wi-portal-card--focus" style={{ marginBottom: '0.75rem' }}>
-              <div className="wi-portal-title">Mint wETH claim</div>
+              <div className="wi-portal-title">Mint WETH (Warthog + claim)</div>
+              <label
+                className="wi-muted"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.4rem',
+                  marginBottom: '0.55rem',
+                  fontSize: '0.85rem',
+                  cursor: 'pointer',
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={mintWartEthAsset}
+                  onChange={(e) => setMintWartEthAsset(e.target.checked)}
+                  disabled={loading}
+                />
+                Create WETH on Warthog &amp; link to claim (recommended)
+              </label>
               <div className="wi-portal-row">
                 <input
                   className="input"
@@ -2350,15 +3217,31 @@ export default function WalletIsland() {
                 <button
                   type="button"
                   className="btn primary small"
-                  disabled={loading || !mintWethAmt}
+                  disabled={
+                    loading ||
+                    !mintWethAmt ||
+                    !ethCapSummary.availableRaw ||
+                    Number(ethCapSummary.availableRaw) <= 0
+                  }
                   onClick={() => mintWethClaim()}
+                  title={
+                    Number(ethCapSummary.availableRaw) > 0
+                      ? 'Mint when ETH capacity is available (locked)'
+                      : 'Lock vault ETH first'
+                  }
                 >
-                  Mint claim
+                  {mintWartEthAsset ? 'Mint WETH + claim' : 'Mint claim only'}
                 </button>
               </div>
+              {!wartSession?.address && mintWartEthAsset ? (
+                <p className="wi-muted" style={{ margin: '0.45rem 0 0', fontSize: '0.8rem' }}>
+                  Unlock the Warthog wallet above to mint on-chain WETH.
+                </p>
+              ) : null}
             </div>
+
             <div className="wi-portal-card wi-portal-card--focus" style={{ marginBottom: '0.75rem' }}>
-              <div className="wi-portal-title">Burn wETH claim</div>
+              <div className="wi-portal-title">Burn claim (free capacity)</div>
               <div className="wi-portal-row">
                 <input
                   className="input"
@@ -2388,9 +3271,119 @@ export default function WalletIsland() {
                   Burn claim
                 </button>
               </div>
+              <p className="wi-muted" style={{ margin: '0.45rem 0 0', fontSize: '0.78rem' }}>
+                Releases ETH capacity. Linked WETH is marked released (FIFO) but remains
+                transferable on Warthog until a burn/escrow path exists.
+              </p>
             </div>
+
+            <div className="wi-portal-card" style={{ marginBottom: '0.75rem' }}>
+              <div
+                className="wi-portal-title"
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                }}
+              >
+                <span>Linked Warthog WETH</span>
+                <button
+                  type="button"
+                  className="btn secondary small"
+                  disabled={loading}
+                  onClick={() => refreshWethLinks(address)}
+                >
+                  Refresh links
+                </button>
+              </div>
+              {wethLinks.length === 0 ? (
+                <p className="wi-muted" style={{ margin: 0, fontSize: '0.85rem' }}>
+                  No linked WETH yet. Mint with the checkbox on to create &amp; link.
+                </p>
+              ) : (
+                <ul
+                  style={{
+                    listStyle: 'none',
+                    margin: 0,
+                    padding: 0,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.45rem',
+                  }}
+                >
+                  {wethLinks.slice(0, 12).map((link) => (
+                    <li
+                      key={link.assetHash}
+                      style={{
+                        border: '1px solid rgba(148,163,184,0.25)',
+                        borderRadius: 8,
+                        padding: '0.45rem 0.55rem',
+                        fontSize: '0.8rem',
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: 'flex',
+                          flexWrap: 'wrap',
+                          gap: '0.35rem 0.65rem',
+                          alignItems: 'center',
+                        }}
+                      >
+                        <strong>{link.assetName || 'WETH'}</strong>
+                        <span>{link.amount}</span>
+                        <span
+                          style={{
+                            opacity: 0.85,
+                            textTransform: 'uppercase',
+                            fontSize: '0.72rem',
+                            letterSpacing: '0.03em',
+                          }}
+                        >
+                          {link.status || 'active'}
+                          {link.source === 'rollup' ? ' · rollup' : ' · local'}
+                        </span>
+                        <button
+                          type="button"
+                          className="btn secondary small"
+                          style={{ marginLeft: 'auto' }}
+                          onClick={async () => {
+                            try {
+                              await navigator.clipboard?.writeText(link.assetHash);
+                              toast.success('Asset hash copied');
+                            } catch {
+                              toast.error('Copy failed');
+                            }
+                          }}
+                        >
+                          Copy hash
+                        </button>
+                      </div>
+                      <code
+                        className="mono"
+                        title={link.assetHash}
+                        style={{
+                          display: 'block',
+                          marginTop: 4,
+                          wordBreak: 'break-all',
+                          opacity: 0.9,
+                        }}
+                      >
+                        {link.assetHash}
+                      </code>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {lastEthWartAsset?.assetHash && wethLinks.length === 0 ? (
+                <p className="wi-muted" style={{ margin: '0.45rem 0 0', fontSize: '0.8rem' }}>
+                  Last: {lastEthWartAsset.assetHash.slice(0, 16)}… · {lastEthWartAsset.amount}
+                </p>
+              ) : null}
+            </div>
+
             <p className="wi-muted" style={{ marginBottom: 0 }}>
-              Lock ETH capacity under <strong>Vaults</strong> first. Sub wallets fund the path.
+              Lock ETH under <strong>Vaults</strong> first. Subs fund Main → sub → vault.
             </p>
           </div>
         )}

@@ -68,7 +68,10 @@ export const ANVIL = {
 };
 
 /**
- * Sepolia Mode B placeholders — filled after cartesi deploy + MinterWWART deploy.
+ * Sepolia Mode B — dapp/wwart filled after cartesi deploy + MinterWWART deploy.
+ * Portals/relay are Cartesi CLI 1.5 CREATE2 addresses (same as Anvil; verified
+ * on Sepolia public RPC 2026-07-28). Override via PUBLIC_SEPOLIA_* if redeployed.
+ *
  * Build flags:
  *   PUBLIC_NETWORK=sepolia
  *   PUBLIC_SEPOLIA_DAPP=0x…
@@ -83,6 +86,14 @@ function envAddr(key) {
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 
+/** Cartesi rollups 1.x base contracts (CREATE2) — confirmed code on Sepolia. */
+export const CARTESI_SEPOLIA_BASE = {
+  inputBox: '0x59b22D57D4f067708AB0c00552767405926dc768',
+  etherPortal: '0xFfdbe43d4c855BF7e0f105c400A50857f53AB044',
+  erc20Portal: '0x9C21AEb2093C32DDbC53eEF24B873BDCd1aDa1DB',
+  dappAddressRelay: '0xF5DE34d6BbC0446E2a45719E718efEbaaE179daE',
+};
+
 export const SEPOLIA = {
   id: 'sepolia',
   label: 'Sepolia (Mode B)',
@@ -94,11 +105,15 @@ export const SEPOLIA = {
     '',
   nativeCurrency: { name: 'Sepolia ETH', symbol: 'ETH', decimals: 18 },
   contracts: {
+    /** Per-app Application — zero until Mode B deploy + PUBLIC_SEPOLIA_DAPP. */
     dapp: envAddr('PUBLIC_SEPOLIA_DAPP') || ZERO,
-    inputBox: envAddr('PUBLIC_SEPOLIA_INPUTBOX') || ZERO,
-    etherPortal: envAddr('PUBLIC_SEPOLIA_ETHER_PORTAL') || ZERO,
-    erc20Portal: envAddr('PUBLIC_SEPOLIA_ERC20_PORTAL') || ZERO,
-    dappAddressRelay: envAddr('PUBLIC_SEPOLIA_DAPP_RELAY') || ZERO,
+    inputBox: envAddr('PUBLIC_SEPOLIA_INPUTBOX') || CARTESI_SEPOLIA_BASE.inputBox,
+    etherPortal:
+      envAddr('PUBLIC_SEPOLIA_ETHER_PORTAL') || CARTESI_SEPOLIA_BASE.etherPortal,
+    erc20Portal:
+      envAddr('PUBLIC_SEPOLIA_ERC20_PORTAL') || CARTESI_SEPOLIA_BASE.erc20Portal,
+    dappAddressRelay:
+      envAddr('PUBLIC_SEPOLIA_DAPP_RELAY') || CARTESI_SEPOLIA_BASE.dappAddressRelay,
     wwart: envAddr('PUBLIC_SEPOLIA_WWART') || ZERO,
     minterWwart: envAddr('PUBLIC_SEPOLIA_WWART') || ZERO,
   },
