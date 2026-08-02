@@ -370,8 +370,60 @@ export default function FungiblePool({
   const spv = snap?.spv || null;
 
   const refreshPending = useCallback(() => {
-    setPendingList(listPendingForOwner(owner).filter((p) => isOpenPendingStatus(p.status)));
+    setPendingList(
+      listPendingForOwner(owner).filter((p) => isOpenPendingStatus(p.status)),
+    );
   }, [owner]);
+
+  /**
+   * Clear browser "stranded" rows once the server queue or rollup already
+   * credited them (avoids false Resume prompts after a successful relayer fix).
+   */
+  const reconcilePendingWithServer = useCallback(async () => {
+    if (!owner || mode !== 'live') return;
+    const open = listPendingForOwner(owner).filter((p) =>
+      isOpenPendingStatus(p.status),
+    );
+    if (!open.length) {
+      setPendingList([]);
+      return;
+    }
+    try {
+      const credits = await poolApi(
+        `/api/pool?credits=1&owner=${encodeURIComponent(owner)}&limit=50`,
+      );
+      const byHash = new Map(
+        (credits.items || []).map((i) => [
+          String(i.txHash || '')
+            .replace(/^0x/i, '')
+            .toLowerCase(),
+          i,
+        ]),
+      );
+      let cleared = 0;
+      for (const p of open) {
+        const h = String(p.txHash || '')
+          .replace(/^0x/i, '')
+          .toLowerCase();
+        const row = byHash.get(h);
+        if (row?.status === 'credited') {
+          removePendingDeposit(p.txHash);
+          cleared += 1;
+        }
+      }
+      if (cleared) {
+        toast.success(
+          cleared === 1
+            ? 'Cleared 1 deposit already credited on the rollup'
+            : `Cleared ${cleared} deposits already credited on the rollup`,
+          { id: 'pool-pending-clear', duration: 4000 },
+        );
+      }
+    } catch {
+      /* offline / API — leave local list */
+    }
+    refreshPending();
+  }, [owner, mode, refreshPending]);
 
   const refreshFlows = useCallback(
     (inspectSnap = null) => {
@@ -387,9 +439,12 @@ export default function FungiblePool({
   useEffect(() => {
     refreshPending();
     refreshFlows();
+    // Drop local stranded markers once server has credited
+    void reconcilePendingWithServer();
   }, [
     refreshPending,
     refreshFlows,
+    reconcilePendingWithServer,
     snap?.user?.depositedE8,
     snap?.user?.claim18,
     snap?.user?.portable18,
@@ -1935,6 +1990,8 @@ export default function FungiblePool({
               <p className="wi-muted" style={{ fontSize: '0.72rem', margin: '0 0 0.4rem' }}>
                 If Deposit sent WART but the pool balance never moved, paste the Warthog tx
                 hash. Relayer credits the rollup; optional wallet only if relayer is down.
+                Rows below are browser reminders — if capacity already moved, dismiss them
+                (no need to Resume).
               </p>
               <div
                 style={{
@@ -1961,6 +2018,19 @@ export default function FungiblePool({
                 >
                   Resume credit
                 </button>
+                {pendingList.length > 0 && (
+                  <button
+                    type="button"
+                    className="btn secondary small"
+                    disabled={busy}
+                    title="Clear local stranded list if credits already landed"
+                    onClick={() => {
+                      void reconcilePendingWithServer();
+                    }}
+                  >
+                    Refresh / clear credited
+                  </button>
+                )}
               </div>
               {pendingList.length > 0 && (
                 <ul
@@ -1995,6 +2065,23 @@ export default function FungiblePool({
                         onClick={() => resumePendingRow(p.txHash)}
                       >
                         Resume
+                      </button>
+                      <button
+                        type="button"
+                        className="btn secondary small"
+                        disabled={busy}
+                        style={{ fontSize: '0.68rem', padding: '0.1rem 0.35rem' }}
+                        title="Remove this browser reminder (does not move WART)"
+                        onClick={() => {
+                          removePendingDeposit(p.txHash);
+                          refreshPending();
+                          toast.success('Dismissed local reminder', {
+                            id: 'pool-dismiss',
+                            duration: 2500,
+                          });
+                        }}
+                      >
+                        Dismiss
                       </button>
                     </li>
                   ))}
