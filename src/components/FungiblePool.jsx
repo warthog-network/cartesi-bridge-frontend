@@ -589,6 +589,7 @@ export default function FungiblePool({
   /**
    * Wait for rollup credit via inspect (relayer or self-submit).
    * Returns true if deposited/locked increased or server marks credited.
+   * Extends wait while queue shows conf/LC catch-up / submitted (relayer working).
    */
   const waitForRollupCredit = async ({
     txHash,
@@ -596,12 +597,14 @@ export default function FungiblePool({
     prevLocked,
     timeoutMs = 120000,
   }) => {
-    const deadline = Date.now() + timeoutMs;
+    const hardDeadline = Date.now() + Math.max(timeoutMs, 180000);
+    let softDeadline = Date.now() + timeoutMs;
     updatePendingStatus(txHash, 'awaiting_rollup');
     advanceFlowForOwner(owner, 'credit_pending', { depositTxHash: txHash });
     refreshPending();
     refreshFlows();
-    while (Date.now() < deadline) {
+    let lastStatusNote = '';
+    while (Date.now() < softDeadline && Date.now() < hardDeadline) {
       try {
         const insp = await fetchPoolInspect(owner);
         if (insp && !insp.error) {
@@ -626,10 +629,33 @@ export default function FungiblePool({
         if (row?.status === 'credited') {
           return { ok: true, source: 'queue', row };
         }
-        if (row?.status === 'rejected') {
+        if (row?.status === 'rejected' || row?.status === 'failed') {
           const err = new Error(row.error || 'Credit rejected by relayer');
           err.row = row;
           throw err;
+        }
+        // Surface relayer progress so UI does not look hung
+        const note =
+          row?.error ||
+          row?.note ||
+          (row?.status === 'submitted'
+            ? 'L1 input in; waiting rollup notice…'
+            : row?.status === 'pending'
+              ? 'queued for relayer…'
+              : row?.status === 'processing'
+                ? 'relayer processing (SPV / LC catch-up)…'
+                : '');
+        if (note && note !== lastStatusNote) {
+          lastStatusNote = note;
+          toast.loading(`Pool credit: ${note}`, { id: 'pool' });
+        }
+        // Relayer still working — give more time (up to hardDeadline)
+        if (
+          row &&
+          ['pending', 'processing', 'submitted'].includes(row.status) &&
+          softDeadline < hardDeadline
+        ) {
+          softDeadline = Math.min(Date.now() + 45000, hardDeadline);
         }
       } catch (e) {
         if (e?.row) throw e;
@@ -637,6 +663,47 @@ export default function FungiblePool({
       await sleep(2500);
     }
     return { ok: false };
+  };
+
+  /** Ensure MetaMask is on Anvil (31337) before optional wallet credit. */
+  const ensureAnvilForOptionalCredit = async () => {
+    if (typeof window === 'undefined' || !window.ethereum) {
+      throw new Error(
+        'No browser wallet for optional credit. Wait for the relayer, or connect MetaMask on Anvil (chainId 31337).',
+      );
+    }
+    let chainId;
+    try {
+      chainId = await window.ethereum.request({ method: 'eth_chainId' });
+    } catch (e) {
+      throw new Error(
+        `Wallet RPC failed (cannot reach chain): ${e?.message || e}. Check MetaMask → Anvil ${typeof window !== 'undefined' ? window.location?.host || '' : ''} RPC.`,
+      );
+    }
+    const n = Number.parseInt(String(chainId), 16);
+    if (n !== 31337) {
+      try {
+        await window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: '0x7a69' }],
+        });
+      } catch (e) {
+        throw new Error(
+          `Switch MetaMask to Cartesi Bridge Anvil (chainId 31337 / 0x7a69). Currently ${chainId}. ${e?.message || ''}`,
+        );
+      }
+    }
+    // Probe Anvil via wallet
+    try {
+      const id = await window.ethereum.request({ method: 'eth_chainId' });
+      if (Number.parseInt(String(id), 16) !== 31337) {
+        throw new Error(`still on chainId ${id}`);
+      }
+    } catch (e) {
+      throw new Error(
+        `Anvil not reachable via wallet: ${e?.message || e}. RPC should be https://cartesi-bridge.duckdns.org/rpc`,
+      );
+    }
   };
 
   /**
@@ -733,11 +800,13 @@ export default function FungiblePool({
 
     // Optional self-submit if relayer lagging and send() available
     if (!result.ok && allowSelfSubmit && send && slim) {
-      toast.loading('Relayer slow — confirm pool_deposit in wallet…', {
+      toast.loading('Relayer slow — checking Anvil + optional wallet credit…', {
         id: 'pool',
       });
-      const seen = await snapshotNoticePayloads();
       try {
+        await ensureAnvilForOptionalCredit();
+        toast.loading('Confirm pool_deposit in MetaMask (Anvil)…', { id: 'pool' });
+        const seen = await snapshotNoticePayloads();
         await send({
           type: 'pool_deposit',
           owner,
@@ -754,14 +823,18 @@ export default function FungiblePool({
           txHash,
           prevDeposited,
           prevLocked,
-          timeoutMs: 30000,
+          timeoutMs: 45000,
         });
       } catch (e) {
         updatePendingStatus(txHash, 'stranded', {
           error: e?.message || String(e),
         });
         refreshPending();
-        throw e;
+        // Prefer clear Anvil/wallet error over generic timeout
+        throw new Error(
+          `Optional wallet credit failed: ${e?.message || e}. ` +
+            'WART is still on the pool — use Resume (relayer will retry). Do not Deposit again.',
+        );
       }
     }
 
@@ -904,9 +977,14 @@ export default function FungiblePool({
 
     if (!result.ok) {
       // One optional self-submit attempt, then stranded with resume
+      let optionalErr = null;
       if (send) {
         try {
-          toast.loading('Relayer slow — optional wallet confirm for credit…', {
+          toast.loading('Relayer slow — checking Anvil + optional wallet…', {
+            id: 'pool',
+          });
+          await ensureAnvilForOptionalCredit();
+          toast.loading('Confirm pool_deposit in MetaMask (Anvil)…', {
             id: 'pool',
           });
           const seen = await snapshotNoticePayloads();
@@ -926,7 +1004,7 @@ export default function FungiblePool({
             txHash,
             prevDeposited,
             prevLocked,
-            timeoutMs: 30000,
+            timeoutMs: 45000,
           });
           if (again.ok) {
             updatePendingStatus(txHash, 'credited');
@@ -943,18 +1021,19 @@ export default function FungiblePool({
             });
             return;
           }
-        } catch {
-          /* fall through to stranded */
+        } catch (e) {
+          optionalErr = e?.message || String(e);
         }
       }
       updatePendingStatus(txHash, 'stranded', {
         amountE8: String(amtE8),
-        error: 'awaiting rollup credit',
+        error: optionalErr || 'awaiting rollup credit',
       });
       refreshPending();
       throw new Error(
-        `Sent ${humanFromE8(amtE8)} WART (tx ${String(txHash).slice(0, 12)}…) but credit is still pending. ` +
-          'Use Resume credit below — do not press Deposit again.',
+        `Sent ${humanFromE8(amtE8)} WART (tx ${String(txHash).slice(0, 12)}…) but credit is still pending` +
+          (optionalErr ? ` (wallet: ${optionalErr})` : '') +
+          '. Use Resume credit below — do not press Deposit again. Relayer will retry after SPV LC catch-up.',
       );
     }
 
