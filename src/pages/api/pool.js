@@ -1,9 +1,9 @@
 /**
  * Path A — fungible pool API
- * - status / lab ledger helpers
- * - payout: hot-wallet real WART from pool (after rollup pool_release_ticket)
- * - request_credit / credits: atomic-feel deposit queue for relayer
- * Does not touch cosigner personal vault stores.
+ * - status / public info
+ * - payout: hot-wallet WART after verified rollup pool_release_ticket
+ * - request_credit / credits: deposit queue for SPV relayer
+ * - lab ledger: ops-token or POOL_LAB_MUTATIONS=1 only
  */
 import { applyPoolAction } from '../../utils/server/poolLedger.mjs';
 import {
@@ -20,6 +20,8 @@ import {
   lookupWartTx,
 } from '../../utils/server/wartLookup.mjs';
 import { FUNGIBLE_POOL } from '../../utils/fungiblePoolConfig.js';
+import { allowLabMutation } from '../../utils/server/poolOpsAuth.mjs';
+import { assertPayoutMatchesTicket } from '../../utils/server/poolTicketVerify.mjs';
 
 export const prerender = false;
 
@@ -29,7 +31,8 @@ function corsHeaders() {
     'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers':
+      'Content-Type, Authorization, X-Pool-Ops-Token',
   };
 }
 
@@ -58,7 +61,7 @@ export async function GET({ request }) {
       return json(200, {
         ...credits,
         mode: 'credit-queue',
-        note: 'Relayer posts wart_deposit_claim (SPV) by default; legacy pool_deposit if SPV fails.',
+        note: 'Relayer posts wart_deposit_claim (SPV) by default; legacy only if POOL_SPV_FALLBACK=1.',
       });
     }
     if (url.searchParams.get('lookup')) {
@@ -69,7 +72,12 @@ export async function GET({ request }) {
         (await getPoolHotPublic()).address;
       try {
         const flat = await verifyPoolDepositTx(txHash, pool);
-        return json(200, { ok: true, verified: true, tx: flat, poolAddress: pool });
+        return json(200, {
+          ok: true,
+          verified: true,
+          tx: flat,
+          poolAddress: pool,
+        });
       } catch (e) {
         const raw = await lookupWartTx(txHash).catch(() => null);
         return json(200, {
@@ -82,6 +90,7 @@ export async function GET({ request }) {
       }
     }
     const owner = url.searchParams.get('owner') || undefined;
+    // Prefer not advertising lab ledger as truth — status is secondary
     const lab = await applyPoolAction({ action: 'status', owner });
     const pub = await getPoolHotPublic();
     const credits = owner
@@ -92,8 +101,9 @@ export async function GET({ request }) {
       livePool: pub,
       pendingCredits: credits.items || [],
       mode: 'rollup+hot-payout+relayer',
+      labMutations: process.env.POOL_LAB_MUTATIONS === '1' ? 'open' : 'ops-token',
       note:
-        'Deposit is 1-button (WART send → credit queue → relayer). Resume via request_credit / credits. Phase 3 SPV is north star.',
+        'Deposit is 1-button (WART send → credit queue → SPV relayer). Prefer /inspect/pool for balances. Payout requires matching release ticket notice.',
     });
   } catch (e) {
     return json(400, { ok: false, error: e?.message || String(e) });
@@ -106,20 +116,32 @@ export async function POST({ request }) {
     const action = String(body?.action || '').toLowerCase();
 
     if (action === 'payout') {
-      const result = await payoutPoolTicket({
+      // Harden: ticket must exist on rollup with matching amount/to/owner
+      const verified = await assertPayoutMatchesTicket({
         ticketId: body.ticketId,
         toAddress: body.toAddress,
         amountE8: body.amountE8,
         owner: body.owner,
       });
-      return json(200, result);
+      const result = await payoutPoolTicket({
+        ticketId: verified.ticketId,
+        toAddress: verified.toAddress || body.toAddress,
+        amountE8: verified.amountE8,
+        owner: verified.owner || body.owner,
+        verifiedFromNotice: true,
+        noticeIndex: verified.notice?._index,
+      });
+      return json(200, {
+        ...result,
+        verifiedTicket: true,
+        phase: verified.phase,
+      });
     }
 
     if (action === 'request_credit' || action === 'credit') {
       const pub = await getPoolHotPublic();
       const poolAddress =
         body.poolAddress || pub.address || FUNGIBLE_POOL.address;
-      // Host re-verify when possible (Phase 1); still enqueue if node lags
       let verified = null;
       let verifyError = null;
       if (body.txHash) {
@@ -129,14 +151,18 @@ export async function POST({ request }) {
           verifyError = e?.message || String(e);
         }
       }
+      // Prefer chain-truth fromAddress for owner binding
+      const fromAddress = verified?.fromAddress || body.fromAddress;
       const result = await requestPoolCredit({
         txHash: body.txHash,
         owner: body.owner,
-        fromAddress: body.fromAddress || verified?.fromAddress,
+        fromAddress,
         amountE8: body.amountE8 ?? verified?.amountE8,
         poolAddress,
         confirmations: body.confirmations ?? verified?.confirmations,
         source: body.source || 'fe',
+        requireVerified: process.env.POOL_CREDIT_REQUIRE_VERIFY === '1',
+        verified: Boolean(verified),
       });
       return json(200, {
         ...result,
@@ -145,29 +171,44 @@ export async function POST({ request }) {
         tx: verified,
         mode: 'credit-queue',
         note: verified
-          ? 'Queued for relayer (host-verified against Warthog).'
+          ? 'Queued for SPV relayer (host-verified against Warthog).'
           : 'Queued; relayer will re-verify before InputBox submit.',
       });
     }
 
-    // Lab ledger still available for offline demos
+    // Lab ledger — blocked on public demo without ops token
     if (
       action === 'deposit' ||
       action === 'mint' ||
       action === 'burn' ||
       action === 'redeem' ||
-      action === 'status' ||
       action === 'reset_lab'
     ) {
+      const gate = allowLabMutation(request, body);
+      if (!gate.ok) {
+        return json(gate.status || 403, { ok: false, error: gate.error });
+      }
+      const result = await applyPoolAction(body || {});
+      return json(200, {
+        ...result,
+        mode: 'lab-ledger',
+        authMode: gate.mode,
+      });
+    }
+
+    if (action === 'status') {
       const result = await applyPoolAction(body || {});
       return json(200, { ...result, mode: 'lab-ledger' });
     }
 
     return json(400, {
       ok: false,
-      error: `unknown action "${action}" (payout|request_credit|status|lab deposit/mint/burn/redeem)`,
+      error: `unknown action "${action}" (payout|request_credit|status|lab*)`,
     });
   } catch (e) {
-    return json(400, { ok: false, error: e?.message || String(e) });
+    const msg = e?.message || String(e);
+    const status =
+      /Unauthorized|No pool_release|mismatch|disabled/i.test(msg) ? 403 : 400;
+    return json(status, { ok: false, error: msg });
   }
 }

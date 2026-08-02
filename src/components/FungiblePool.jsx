@@ -358,10 +358,16 @@ export default function FungiblePool({
   const [pendingList, setPendingList] = useState([]);
   const [openFlows, setOpenFlows] = useState([]);
   const [resumeTxHash, setResumeTxHash] = useState('');
+  /** Lab mode only when PUBLIC_POOL_LAB=1 or ?lab=1 — public demo hides it. */
+  const labUiEnabled =
+    String(import.meta.env.PUBLIC_POOL_LAB || '') === '1' ||
+    (typeof window !== 'undefined' &&
+      new URLSearchParams(window.location.search).get('lab') === '1');
 
   const owner = ownerAddress || '';
   const poolAddr = snap?.poolAddress || FUNGIBLE_POOL.address;
   const wwartToken = LOCAL_WWART?.address;
+  const spv = snap?.spv || null;
 
   const refreshPending = useCallback(() => {
     setPendingList(listPendingForOwner(owner).filter((p) => isOpenPendingStatus(p.status)));
@@ -466,6 +472,9 @@ export default function FungiblePool({
             availableHuman: humanFrom18(json.available18),
             redeemedHuman: humanFromE8(json.redeemedE8),
             freeableHuman: humanFromE8(json.freeableE8),
+            holderRedeem: json.holderRedeem !== false,
+            redeemPhase: json.redeemPhase || 'A-beta',
+            spv: json.spv || null,
             user: user
               ? {
                   depositedHuman: humanFromE8(user.depositedE8),
@@ -1335,12 +1344,23 @@ export default function FungiblePool({
   };
 
   const labAction = async (action) => {
+    if (!labUiEnabled) {
+      throw new Error('Lab mode disabled on public demo');
+    }
     if (!owner) throw new Error('Connect L1');
     const amt = String(amount || '').trim();
     const body = { action, owner, amount: amt };
     if (action === 'redeem' && toAddress.trim()) body.toAddress = toAddress.trim();
+    // Ops may paste token in sessionStorage for lab work
+    let opsToken = null;
+    try {
+      opsToken = sessionStorage.getItem('poolOpsToken');
+    } catch {
+      /* */
+    }
     const s = await poolApi('/api/pool', {
       method: 'POST',
+      headers: opsToken ? { 'X-Pool-Ops-Token': opsToken } : {},
       body: JSON.stringify(body),
     });
     if (s.lastTicket) setLastTicket(s.lastTicket);
@@ -1429,17 +1449,19 @@ export default function FungiblePool({
           </span>
         </div>
         <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }}>
-          <select
-            className="input"
-            style={{ fontSize: '0.75rem', padding: '0.2rem 0.35rem' }}
-            value={mode}
-            onChange={(e) => setMode(e.target.value)}
-            disabled={busy}
-            title="Live = rollup + real WART; Lab = local ledger only"
-          >
-            <option value="live">Live</option>
-            <option value="lab">Lab only</option>
-          </select>
+          {labUiEnabled ? (
+            <select
+              className="input"
+              style={{ fontSize: '0.75rem', padding: '0.2rem 0.35rem' }}
+              value={mode}
+              onChange={(e) => setMode(e.target.value)}
+              disabled={busy}
+              title="Live = rollup + real WART; Lab = local ledger only (ops)"
+            >
+              <option value="live">Live</option>
+              <option value="lab">Lab only</option>
+            </select>
+          ) : null}
           <button
             type="button"
             className="btn secondary small"
@@ -1466,14 +1488,31 @@ export default function FungiblePool({
         className="wi-muted"
         style={{ margin: '0.45rem 0 0.65rem', fontSize: '0.8rem', lineHeight: 1.45 }}
       >
-        <strong>Live:</strong> <strong>Deposit WART</strong> is one button (send → auto
-        credit via relayer; no MetaMask in the happy path). If credit never lands, use{' '}
-        <strong>Resume credit</strong> with the Warthog tx hash — never re-send. Then Mint
-        claim → Withdraw wWART (voucher) or <strong>Redeem WART</strong>. Reverse /{' '}
-        <strong>A-β holder redeem</strong>: any MetaMask with pool wWART can Deposit wWART
-        (portal) → <strong>Burn claim</strong> (pays your redeem-to Warthog address from the
-        shared pool — not only the original minter). <strong>No cosigner / personal vaults</strong>.
+        <strong>Live:</strong> <strong>Deposit WART</strong> is one button (send → SPV
+        credit via relayer). If credit never lands, <strong>Resume credit</strong> with the
+        Warthog tx hash — never re-send. Then Mint → Withdraw wWART or{' '}
+        <strong>Redeem WART</strong>.{' '}
+        <strong>A-β holder redeem:</strong> any holder with portal pool-wWART can burn;
+        payout comes from <em>shared pool collateral</em> (FIFO across depositors — not only
+        your own deposit). <strong>No cosigner / personal vaults</strong>.
       </p>
+      {snap?.redeemPhase === 'A-beta' || snap?.holderRedeem ? (
+        <p
+          style={{
+            margin: '0 0 0.65rem',
+            fontSize: '0.75rem',
+            lineHeight: 1.4,
+            color: '#f0c674',
+            padding: '0.4rem 0.55rem',
+            borderRadius: 6,
+            background: 'rgba(240,198,116,0.1)',
+            border: '1px solid rgba(240,198,116,0.35)',
+          }}
+        >
+          Holder redeem spends pool-wide locked WART. Buying wWART and redeeming can debit
+          another depositor’s share if your own deposit is insufficient.
+        </p>
+      ) : null}
 
       {open && (
         <>
@@ -1526,6 +1565,30 @@ export default function FungiblePool({
               <span className="sw-meta-k">Data</span>
               <span className="sw-meta-v">{snap?.source || '—'}</span>
             </div>
+            {spv && (
+              <>
+                <div className="sw-meta-row">
+                  <span className="sw-meta-k">SPV</span>
+                  <span className="sw-meta-v" style={{ color: spv.bootstrapped ? '#7dffa3' : '#f0c674' }}>
+                    {spv.bootstrapped ? 'bootstrapped' : 'not ready'}
+                    {spv.requireSpv ? ' · SPV-only' : ' · legacy allowed'}
+                    {spv.minConfirmations != null
+                      ? ` · conf≥${spv.minConfirmations}`
+                      : ''}
+                  </span>
+                </div>
+                <div className="sw-meta-row">
+                  <span className="sw-meta-k">LC tip</span>
+                  <span
+                    className="sw-meta-v"
+                    style={{ fontFamily: 'monospace', fontSize: '0.7rem' }}
+                    title={spv.bestHash || ''}
+                  >
+                    h={spv.bestHeight ?? '—'} · headers={spv.headersStored ?? '—'}
+                  </span>
+                </div>
+              </>
+            )}
             {u && (
               <>
                 <div className="sw-meta-row">

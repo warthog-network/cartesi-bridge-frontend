@@ -67,6 +67,7 @@ function normAddr(a) {
 
 /**
  * Enqueue or refresh a credit request after Warthog send.
+ * Owner binding: first L1 owner wins for a given Warthog fromAddress.
  */
 export async function requestPoolCredit({
   txHash,
@@ -76,6 +77,8 @@ export async function requestPoolCredit({
   poolAddress,
   confirmations,
   source = 'fe',
+  requireVerified = false,
+  verified = false,
 }) {
   const hash = normHash(txHash);
   if (!hash || hash.length < 16) throw new Error('txHash required');
@@ -83,10 +86,26 @@ export async function requestPoolCredit({
   if (!own.startsWith('0x') || own.length < 10) {
     throw new Error('L1 owner address required for credit');
   }
+  if (requireVerified && !verified) {
+    throw new Error(
+      'POOL_CREDIT_REQUIRE_VERIFY=1 — Warthog tx must verify as pool deposit first',
+    );
+  }
 
   const q = await readQueue();
-  if (fromAddress) {
-    q.ownerByWart[normAddr(fromAddress)] = own;
+  const from = fromAddress ? normAddr(fromAddress) : null;
+
+  // First-writer-wins: Warthog deposit address binds to one L1 owner
+  if (from) {
+    const bound = q.ownerByWart[from];
+    if (bound && bound !== own) {
+      throw new Error(
+        `Warthog ${from.slice(0, 12)}… already bound to L1 ${bound.slice(0, 10)}… — cannot credit ${own.slice(0, 10)}…`,
+      );
+    }
+    if (!bound) {
+      q.ownerByWart[from] = own;
+    }
   }
 
   const existing = q.items.find((i) => normHash(i.txHash) === hash);
@@ -95,9 +114,18 @@ export async function requestPoolCredit({
     if (existing.status === 'credited') {
       return { ok: true, item: existing, alreadyCredited: true };
     }
+    // Do not let a later caller steal owner on the same tx
+    if (
+      existing.owner &&
+      String(existing.owner).toLowerCase() !== own
+    ) {
+      throw new Error(
+        `tx already queued for owner ${String(existing.owner).slice(0, 10)}…`,
+      );
+    }
     Object.assign(existing, {
-      owner: own,
-      fromAddress: fromAddress ? normAddr(fromAddress) : existing.fromAddress,
+      owner: existing.owner || own,
+      fromAddress: from || existing.fromAddress,
       amountE8:
         amountE8 != null && amountE8 !== ''
           ? String(amountE8)
@@ -116,14 +144,19 @@ export async function requestPoolCredit({
       error: null,
     });
     await writeQueue(q);
-    return { ok: true, item: existing, updated: true };
+    return {
+      ok: true,
+      item: existing,
+      updated: true,
+      boundOwner: from ? q.ownerByWart[from] : null,
+    };
   }
 
   const item = {
     id: crypto.randomBytes(8).toString('hex'),
     txHash: hash,
     owner: own,
-    fromAddress: fromAddress ? normAddr(fromAddress) : null,
+    fromAddress: from,
     amountE8: amountE8 != null ? String(amountE8) : null,
     poolAddress: poolAddress || null,
     confirmations: confirmations != null ? Number(confirmations) : 0,
@@ -139,7 +172,12 @@ export async function requestPoolCredit({
   // retain last 200
   q.items = q.items.slice(0, 200);
   await writeQueue(q);
-  return { ok: true, item, created: true };
+  return {
+    ok: true,
+    item,
+    created: true,
+    boundOwner: from ? q.ownerByWart[from] : null,
+  };
 }
 
 export async function listPoolCredits({ owner, status, limit = 50 } = {}) {

@@ -50,7 +50,15 @@ function e8ToHuman(e8) {
 }
 
 /**
- * @param {{ ticketId: string, toAddress: string, amountE8: string|number|bigint, owner?: string }} args
+ * @param {{
+ *   ticketId: string,
+ *   toAddress: string,
+ *   amountE8: string|number|bigint,
+ *   owner?: string,
+ *   verifiedFromNotice?: boolean,
+ *   noticeIndex?: number,
+ * }} args
+ * Callers MUST verify the ticket against rollup notices (pool.js does).
  */
 export async function payoutPoolTicket(args) {
   const ticketId = String(args.ticketId || '').trim();
@@ -60,6 +68,11 @@ export async function payoutPoolTicket(args) {
   const amountE8 = BigInt(String(args.amountE8 || 0));
   if (!ticketId) throw new Error('ticketId required');
   if (amountE8 <= 0n) throw new Error('amountE8 must be > 0');
+  if (args.verifiedFromNotice !== true && process.env.POOL_PAYOUT_SKIP_VERIFY !== '1') {
+    throw new Error(
+      'payoutPoolTicket: verifiedFromNotice required (use /api/pool payout)',
+    );
+  }
 
   const paid = await loadPaid();
   // Idempotency: same ticketId + amount + destination already paid.
