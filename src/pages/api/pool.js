@@ -10,6 +10,8 @@ import {
   getPoolHotPublic,
   payoutPoolTicket,
   resyncPoolHotNonce,
+  listUnpaidPoolTickets,
+  sweepUnpaidPoolTickets,
 } from '../../utils/server/poolPayout.mjs';
 import {
   requestPoolCredit,
@@ -58,6 +60,10 @@ export async function GET({ request }) {
       // Ops: show local nonce cursor (no secrets)
       const pub = await getPoolHotPublic();
       return json(200, { ok: true, ...pub });
+    }
+    if (url.searchParams.get('unpaid') === '1') {
+      const list = await listUnpaidPoolTickets();
+      return json(200, list);
     }
     if (url.searchParams.get('credits') === '1') {
       const owner = url.searchParams.get('owner') || undefined;
@@ -161,6 +167,30 @@ export async function POST({ request }) {
       return json(200, result);
     }
 
+    if (action === 'list_unpaid' || action === 'unpaid') {
+      const list = await listUnpaidPoolTickets();
+      return json(200, list);
+    }
+
+    if (action === 'sweep_unpaid' || action === 'payout_unpaid') {
+      // Paying real WART — require ops token (or lab gate)
+      const gate = allowLabMutation(request, body);
+      if (!gate.ok) {
+        const { requirePoolOps } = await import(
+          '../../utils/server/poolOpsAuth.mjs'
+        );
+        const auth = requirePoolOps(request, body);
+        if (!auth.ok) {
+          return json(auth.status || 403, { ok: false, error: auth.error });
+        }
+      }
+      const result = await sweepUnpaidPoolTickets({
+        limit: body.limit,
+        dryRun: Boolean(body.dryRun),
+      });
+      return json(200, result);
+    }
+
     if (action === 'request_credit' || action === 'credit') {
       const pub = await getPoolHotPublic();
       const poolAddress =
@@ -226,7 +256,7 @@ export async function POST({ request }) {
 
     return json(400, {
       ok: false,
-      error: `unknown action "${action}" (payout|request_credit|status|lab*)`,
+      error: `unknown action "${action}" (payout|resync_nonce|list_unpaid|sweep_unpaid|request_credit|status|lab*)`,
     });
   } catch (e) {
     const msg = e?.message || String(e);
