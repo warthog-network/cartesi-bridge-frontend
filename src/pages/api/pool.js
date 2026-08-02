@@ -9,6 +9,7 @@ import { applyPoolAction } from '../../utils/server/poolLedger.mjs';
 import {
   getPoolHotPublic,
   payoutPoolTicket,
+  resyncPoolHotNonce,
 } from '../../utils/server/poolPayout.mjs';
 import {
   requestPoolCredit,
@@ -52,6 +53,11 @@ export async function GET({ request }) {
     const url = new URL(request.url);
     if (url.searchParams.get('public') === '1') {
       return json(200, { ok: true, ...(await getPoolHotPublic()) });
+    }
+    if (url.searchParams.get('nonce') === '1') {
+      // Ops: show local nonce cursor (no secrets)
+      const pub = await getPoolHotPublic();
+      return json(200, { ok: true, ...pub });
     }
     if (url.searchParams.get('credits') === '1') {
       const owner = url.searchParams.get('owner') || undefined;
@@ -136,6 +142,23 @@ export async function POST({ request }) {
         verifiedTicket: true,
         phase: verified.phase,
       });
+    }
+
+    if (action === 'resync_nonce' || action === 'nonce_resync') {
+      const gate = allowLabMutation(request, body);
+      // Allow ops token OR lab env — same gate as lab mutations
+      if (!gate.ok) {
+        // Also allow if only ops token required
+        const { requirePoolOps } = await import(
+          '../../utils/server/poolOpsAuth.mjs'
+        );
+        const auth = requirePoolOps(request, body);
+        if (!auth.ok) {
+          return json(auth.status || 403, { ok: false, error: auth.error });
+        }
+      }
+      const result = await resyncPoolHotNonce();
+      return json(200, result);
     }
 
     if (action === 'request_credit' || action === 'credit') {

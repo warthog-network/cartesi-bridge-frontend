@@ -33,3 +33,7 @@ dist-sepolia/
 .data/
 *.token
 pool-ops.token
+
+.data/
+fungible-pool-nonce.json
+fungible-pool-paid.json
