@@ -10,6 +10,7 @@ import {
   executeVoucherOnL1,
   wasVoucherExecuted,
   getDappAddress,
+  formatVoucherExecuteError,
 } from '../utils/vouchers.js';
 import { describeVoucherExecute, formatDescribeJson } from '../utils/mmTxDescribe.js';
 import { useMmTxConfirm } from './MmTxConfirm.jsx';
@@ -107,8 +108,8 @@ export default function VoucherExecutor({
       setStatusMap((m) => ({ ...m, [key]: 'done' }));
       setTimeout(load, 2000);
     } catch (e) {
-      const msg = e?.shortMessage || e?.reason || e?.message || String(e);
-      toast.error(msg, { duration: 7000 });
+      const msg = formatVoucherExecuteError(e);
+      toast.error(msg, { duration: 9000 });
       console.error('[executeVoucher]', e);
     } finally {
       setExecuting(null);

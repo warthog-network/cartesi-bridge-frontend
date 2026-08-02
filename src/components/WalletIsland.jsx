@@ -2311,6 +2311,7 @@ export default function WalletIsland() {
       <FungiblePool
         ownerAddress={address}
         send={send}
+        signer={signer}
         wartBridgeApi={wartBridgeApi}
         onRefreshL1Vault={() => refreshVault(address)}
         mmWwartBal={mmWwartBal}

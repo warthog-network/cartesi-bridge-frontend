@@ -115,6 +115,18 @@ export async function fetchVouchers(opts = {}) {
       const decoded = decodeVoucherPayload(n.payload);
       const dest = n.destination;
       const token = tokenLabel(dest);
+      const validity = n.proof?.validity || null;
+      // Epoch proofs need sibling arrays — bare `validity: {}` is not executable.
+      const hasProof = Boolean(
+        validity &&
+          validity.outputHashesRootHash &&
+          validity.vouchersEpochRootHash &&
+          validity.machineStateHash &&
+          Array.isArray(validity.outputHashInOutputHashesSiblings) &&
+          validity.outputHashInOutputHashesSiblings.length > 0 &&
+          Array.isArray(validity.outputHashesInEpochSiblings) &&
+          validity.outputHashesInEpochSiblings.length > 0,
+      );
       return {
         inputIndex: Number(n.input?.index),
         voucherIndex: Number(n.index),
@@ -123,7 +135,7 @@ export async function fetchVouchers(opts = {}) {
         msgSender: n.input?.msgSender || null,
         timestamp: n.input?.timestamp != null ? Number(n.input.timestamp) : null,
         proof: n.proof || null,
-        hasProof: Boolean(n.proof?.validity),
+        hasProof,
         decoded,
         token,
         summary: [
@@ -198,12 +210,57 @@ export async function wasVoucherExecuted(signerOrProvider, voucher) {
 }
 
 /**
+ * Human-readable L1 / MetaMask error for voucher execute.
+ */
+export function formatVoucherExecuteError(e) {
+  const raw =
+    e?.shortMessage ||
+    e?.reason ||
+    e?.info?.error?.message ||
+    e?.data?.message ||
+    e?.message ||
+    String(e || 'unknown');
+  const s = String(raw);
+  if (/user rejected|user denied|ACTION_REJECTED|4001/i.test(s)) {
+    return 'MetaMask rejected executeVoucher — open Vouchers → Execute and approve (do not re-deposit)';
+  }
+  if (/Already executed/i.test(s)) {
+    return 'That voucher was already executed — check MetaMask wWART balance';
+  }
+  if (/missing revert data|estimateGas|CALL_EXCEPTION/i.test(s)) {
+    return (
+      'executeVoucher gas estimate failed (often an already-used voucher or MetaMask estimateGas flake). ' +
+      'Refresh Vouchers, pick the newest ready row for your amount, or retry — do not re-deposit. ' +
+      'Wallet RPC must be https://cartesi-bridge.duckdns.org/rpc (Anvil 31337).'
+    );
+  }
+  if (/Proof not ready|no proof|sibling/i.test(s)) {
+    return 'Voucher proof not ready yet — wait a few epochs, then Vouchers → Execute';
+  }
+  if (/network|chainId|chain id/i.test(s)) {
+    return `Wrong network for executeVoucher — switch MetaMask to Anvil (31337). ${s}`;
+  }
+  if (/NotMinter|not minter|execution reverted/i.test(s)) {
+    return `executeVoucher reverted (often minter/dApp mismatch or bad proof): ${s}`;
+  }
+  return s.length > 220 ? `${s.slice(0, 220)}…` : s;
+}
+
+/**
  * Execute a voucher on L1 via connected MetaMask signer.
+ *
+ * MetaMask often fails `estimateGas` on large Cartesi proofs with
+ * "missing revert data" even when the call is valid. We staticCall first,
+ * then send with an explicit gasLimit to skip estimateGas.
+ *
  * @returns {Promise<{ hash: string, receipt: any }>}
  */
 export async function executeVoucherOnL1(signer, voucher) {
   if (!voucher?.hasProof) throw new Error('Proof not ready — wait a few blocks/epochs, then refresh');
   const dapp = getDappAddress();
+  if (!dapp || /^0x0{40}$/i.test(dapp)) {
+    throw new Error('dApp address not configured — cannot execute voucher');
+  }
   const { Contract } = await import('ethers-v6');
   const app = new Contract(dapp, APP_ABI, signer);
 
@@ -221,9 +278,60 @@ export async function executeVoucherOnL1(signer, voucher) {
   }
 
   const proof = proofToEthers(voucher.proof);
-  const tx = await app.executeVoucher(voucher.destination, voucher.payload, proof);
-  const receipt = await tx.wait();
-  return { hash: tx.hash, receipt };
+  const args = [voucher.destination, voucher.payload, proof];
+
+  // Simulate with eth_call (more reliable than estimateGas for huge proofs)
+  try {
+    if (typeof app.executeVoucher?.staticCall === 'function') {
+      await app.executeVoucher.staticCall(...args);
+    }
+  } catch (e) {
+    // Re-check executed — Cartesi often returns empty revert data for already-used vouchers
+    try {
+      const done = await app.wasVoucherExecuted(voucher.inputIndex, outIdx);
+      if (done) throw new Error('Already executed on L1');
+    } catch (e2) {
+      if (String(e2.message || e2).includes('Already executed')) throw e2;
+    }
+    const msg = formatVoucherExecuteError(e);
+    const err = new Error(msg);
+    err.cause = e;
+    throw err;
+  }
+
+  // Explicit gas: skip MetaMask estimateGas (source of "missing revert data" on this stack)
+  const gasOverrides = { gasLimit: 1_500_000n };
+  try {
+    // Optional: tighten gas if node estimate works; ignore failures
+    const est = await app.executeVoucher.estimateGas(...args);
+    if (est && est > 0n) {
+      // 30% buffer, cap 3M
+      const buffered = (est * 130n) / 100n;
+      gasOverrides.gasLimit = buffered > 3_000_000n ? 3_000_000n : buffered < 300_000n ? 500_000n : buffered;
+    }
+  } catch {
+    /* keep fixed 1.5M — intentional */
+  }
+
+  try {
+    const tx = await app.executeVoucher(...args, gasOverrides);
+    const receipt = await tx.wait();
+    if (receipt && receipt.status === 0) {
+      throw new Error('executeVoucher mined but reverted — try newest voucher only');
+    }
+    return { hash: tx.hash, receipt };
+  } catch (e) {
+    if (/Already executed/i.test(String(e?.message || ''))) throw e;
+    try {
+      const done = await app.wasVoucherExecuted(voucher.inputIndex, outIdx);
+      if (done) throw new Error('Already executed on L1');
+    } catch (e2) {
+      if (String(e2.message || e2).includes('Already executed')) throw e2;
+    }
+    const err = new Error(formatVoucherExecuteError(e));
+    err.cause = e;
+    throw err;
+  }
 }
 
 export { APP_ABI };

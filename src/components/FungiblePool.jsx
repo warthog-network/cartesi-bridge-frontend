@@ -5,14 +5,23 @@
  * Deposit is 1-button (atomic feel): Warthog send → credit queue → relayer
  * posts pool_deposit (no second MetaMask in happy path). Resume via pending
  * store / tx hash if credit never lands. Phase 3 SPV is the trust north star.
+ *
+ * Optional **Get wWART (1-click)** runs deposit → mint → withdraw → execute
+ * voucher (MetaMask). Manual step buttons stay available.
  */
 import { useCallback, useEffect, useState } from 'react';
-import { Droplets, RefreshCw, Layers } from 'lucide-react';
+import { Droplets, RefreshCw, Layers, Zap } from 'lucide-react';
 import { toast } from 'react-hot-toast';
 import { FUNGIBLE_POOL } from '../utils/fungiblePoolConfig.js';
 import { LOCAL_WWART } from '../utils/localTokens.js';
 import { getInspectUrl, getRollupGraphqlUrl } from '../utils/bridgeConfig.js';
 import { normalizeTxLookup } from '../utils/txProof.js';
+import {
+  fetchVouchers,
+  executeVoucherOnL1,
+  wasVoucherExecuted,
+  formatVoucherExecuteError,
+} from '../utils/vouchers.js';
 import {
   listPendingForOwner,
   upsertPendingDeposit,
@@ -339,9 +348,223 @@ async function fetchPoolInspect(owner) {
   return decodeInspectPayload(data.reports[0].payload);
 }
 
+/**
+ * Wait for a new executable wWART (or owner-bound) voucher, then execute on L1.
+ * Prefers vouchers with inputIndex > minInputIndex (from just before withdraw).
+ * @param {import('ethers-v6').Signer} signer
+ * @param {{ owner: string, minInputIndex?: number, amountHint?: string, timeoutMs?: number }} opts
+ */
+async function waitAndExecuteWwartVoucher(signer, opts = {}) {
+  const owner = String(opts.owner || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (!signer) throw new Error('Connect MetaMask to execute the mint voucher');
+  if (!owner) throw new Error('L1 owner required for voucher execute');
+
+  // Ensure MetaMask is on Anvil before execute (Mode A demo)
+  try {
+    const net = await signer.provider?.getNetwork?.();
+    const chainId = net?.chainId != null ? Number(net.chainId) : null;
+    if (chainId != null && chainId !== 31337) {
+      if (typeof window !== 'undefined' && window.ethereum) {
+        try {
+          await window.ethereum.request({
+            method: 'wallet_switchEthereumChain',
+            params: [{ chainId: '0x7a69' }],
+          });
+        } catch {
+          throw new Error(
+            `MetaMask is on chainId ${chainId}, need Anvil 31337 for executeVoucher. Switch network then open Vouchers → Execute.`,
+          );
+        }
+      } else {
+        throw new Error(
+          `Wrong L1 chain (${chainId}). Switch to Anvil 31337, then Vouchers → Execute.`,
+        );
+      }
+    }
+  } catch (e) {
+    if (String(e?.message || '').includes('Anvil') || String(e?.message || '').includes('chain')) {
+      throw e;
+    }
+    /* provider getNetwork flaky — continue */
+  }
+
+  const wwart = String(LOCAL_WWART?.address || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  const timeoutMs = opts.timeoutMs ?? 180000;
+  const deadline = Date.now() + timeoutMs;
+  const minInputIndex =
+    typeof opts.minInputIndex === 'number' && Number.isFinite(opts.minInputIndex)
+      ? opts.minInputIndex
+      : -1;
+  let hintAmt = null;
+  try {
+    if (opts.amountHint != null && String(opts.amountHint).trim() !== '') {
+      hintAmt = Number(opts.amountHint);
+      if (!Number.isFinite(hintAmt)) hintAmt = null;
+    }
+  } catch {
+    hintAmt = null;
+  }
+
+  const matchesOwner = (v) => {
+    const to = String(v?.decoded?.to || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    const sender = String(v?.msgSender || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    if (to && to === owner) return true;
+    if (sender && sender === owner) return true;
+    return false;
+  };
+
+  const isWwartish = (v) => {
+    const dest = String(v?.destination || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    if (wwart && dest === wwart) return true;
+    if (v?.token === 'wWART') return true;
+    if (v?.decoded?.kind === 'mint' || v?.decoded?.kind === 'transfer') return true;
+    return false;
+  };
+
+  const score = (v) => {
+    let s = 0;
+    if (matchesOwner(v)) s += 10;
+    if (isWwartish(v)) s += 5;
+    if (v.hasProof) s += 3;
+    if (minInputIndex >= 0 && Number(v.inputIndex) > minInputIndex) s += 20;
+    if (hintAmt != null && v?.decoded?.amountHuman != null) {
+      const a = Number(v.decoded.amountHuman);
+      if (Number.isFinite(a) && Math.abs(a - hintAmt) < 1e-6) s += 8;
+    }
+    // Prefer newer inputs
+    s += Math.min(Number(v.inputIndex) || 0, 1000) / 1000;
+    return s;
+  };
+
+  let lastNote = '';
+  let lastExecErr = null;
+  while (Date.now() < deadline) {
+    let list = [];
+    try {
+      list = await fetchVouchers({ last: 50 });
+    } catch {
+      await sleep(2500);
+      continue;
+    }
+
+    const ownerVouchers = list.filter((v) => matchesOwner(v));
+
+    // Prefer NEW (inputIndex > min) complete proofs for this owner / wWART.
+    // Never auto-pick old already-executed rows first (they cause estimateGas
+    // "missing revert data" noise on Anvil/MetaMask).
+    let candidates = ownerVouchers
+      .filter((v) => v.hasProof && isWwartish(v))
+      .filter((v) => minInputIndex < 0 || Number(v.inputIndex) > minInputIndex)
+      .sort((a, b) => score(b) - score(a) || b.inputIndex - a.inputIndex);
+
+    // Fallback: newest unexecuted owner wWART only (max 2)
+    if (!candidates.length) {
+      candidates = ownerVouchers
+        .filter((v) => v.hasProof && isWwartish(v))
+        .sort((a, b) => b.inputIndex - a.inputIndex)
+        .slice(0, 2);
+    }
+
+    for (const v of candidates) {
+      try {
+        const done = await wasVoucherExecuted(signer, v);
+        if (done) continue;
+      } catch {
+        /* try execute anyway */
+      }
+      toast.loading(
+        `Voucher #${v.inputIndex} ready — confirm executeVoucher in MetaMask…`,
+        { id: 'pool' },
+      );
+      try {
+        const { hash } = await executeVoucherOnL1(signer, v);
+        return { voucher: v, hash };
+      } catch (e) {
+        lastExecErr = e;
+        const msg = formatVoucherExecuteError(e);
+        // User reject — stop immediately
+        if (/rejected/i.test(msg)) {
+          throw new Error(msg);
+        }
+        // Already executed — try newer candidate only
+        if (/Already executed|wWART balance/i.test(msg)) {
+          console.warn('[1-click execute] skip executed', v.inputIndex);
+          continue;
+        }
+        // missing revert data on stale voucher — try next; don't spam same error forever
+        if (/missing revert data|estimateGas|gas estimate failed/i.test(msg)) {
+          console.warn('[1-click execute] skip bad gas estimate', v.inputIndex, msg);
+          continue;
+        }
+        console.warn('[1-click execute]', v.inputIndex, msg);
+      }
+    }
+
+    const pendingProof = ownerVouchers.some((v) => !v.hasProof);
+    const newest = ownerVouchers[0];
+    const note = pendingProof
+      ? 'Waiting for voucher epoch proof…'
+      : newest
+        ? `Waiting for new voucher (have input #${newest.inputIndex}${minInputIndex >= 0 ? `, need >${minInputIndex}` : ''})…`
+        : 'Waiting for withdraw voucher…';
+    if (note !== lastNote) {
+      lastNote = note;
+      toast.loading(note, { id: 'pool' });
+    }
+    await sleep(3000);
+  }
+
+  if (lastExecErr) {
+    throw new Error(
+      `${formatVoucherExecuteError(lastExecErr)} — open Vouchers → Execute (do not re-deposit)`,
+    );
+  }
+  throw new Error(
+    'Voucher not ready in time. Open Vouchers → Execute when proof shows ready (do not re-deposit).',
+  );
+}
+
+/** Highest GraphQL voucher input index for owner (or -1). */
+async function maxOwnerVoucherInputIndex(owner) {
+  const want = String(owner || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  try {
+    const list = await fetchVouchers({ last: 50 });
+    let max = -1;
+    for (const v of list) {
+      const to = String(v?.decoded?.to || '')
+        .replace(/^0x/i, '')
+        .toLowerCase();
+      const sender = String(v?.msgSender || '')
+        .replace(/^0x/i, '')
+        .toLowerCase();
+      if (to === want || sender === want) {
+        const idx = Number(v.inputIndex);
+        if (Number.isFinite(idx) && idx > max) max = idx;
+      }
+    }
+    return max;
+  } catch {
+    return -1;
+  }
+}
+
 export default function FungiblePool({
   ownerAddress,
   send,
+  /** MetaMask / L1 signer — required for 1-click auto voucher execute */
+  signer = null,
   wartBridgeApi,
   onRefreshL1Vault,
   /** Live MetaMask ERC-20 wWART balance (human string) — same source as Warthog Overview */
@@ -1151,7 +1374,12 @@ export default function FungiblePool({
     );
   };
 
-  const liveWithdraw = async () => {
+  /**
+   * @param {{ silentSuccess?: boolean, minInputIndex?: number }} [opts]
+   *   silentSuccess — for 1-click (caller executes voucher next)
+   * @returns {Promise<{ prevVoucherCount: number, minInputIndex: number }>}
+   */
+  const liveWithdraw = async (opts = {}) => {
     if (!send) throw new Error('Rollup send unavailable');
     const amt = String(amount || '').trim();
     if (!amt) throw new Error('Enter amount');
@@ -1159,6 +1387,10 @@ export default function FungiblePool({
     const before = (await fetchPoolInspect(owner).catch(() => null)) || {};
     const prevPortable = userBn(before, 'portable18');
     const prevVouchers = await countOwnerVouchers(owner);
+    const minInputIndex =
+      opts.minInputIndex != null
+        ? opts.minInputIndex
+        : await maxOwnerVoucherInputIndex(owner);
     const seen = await snapshotNoticePayloads();
 
     toast.loading('Confirm withdraw in wallet…', { id: 'pool' });
@@ -1179,21 +1411,25 @@ export default function FungiblePool({
         if (prevPortable > 0n && portable < prevPortable) {
           advanceFlowForOwner(owner, 'voucher_ready', { amountHuman: amt });
           refreshFlows();
-          toast.success(
-            `Voucher ready for ${amt} wWART — open Vouchers → Execute`,
-            { id: 'pool', duration: 9000 },
-          );
-          return;
+          if (!opts.silentSuccess) {
+            toast.success(
+              `Voucher ready for ${amt} wWART — open Vouchers → Execute`,
+              { id: 'pool', duration: 9000 },
+            );
+          }
+          return { prevVoucherCount: prevVouchers, minInputIndex };
         }
         const vc = await countOwnerVouchers(owner);
         if (vc >= 0 && prevVouchers >= 0 && vc > prevVouchers) {
           advanceFlowForOwner(owner, 'voucher_ready', { amountHuman: amt });
           refreshFlows();
-          toast.success(`Voucher ready — open Vouchers → Execute`, {
-            id: 'pool',
-            duration: 9000,
-          });
-          return;
+          if (!opts.silentSuccess) {
+            toast.success(`Voucher ready — open Vouchers → Execute`, {
+              id: 'pool',
+              duration: 9000,
+            });
+          }
+          return { prevVoucherCount: prevVouchers, minInputIndex };
         }
       } catch {
         /* */
@@ -1204,15 +1440,72 @@ export default function FungiblePool({
     if (vc > 0) {
       advanceFlowForOwner(owner, 'voucher_ready');
       refreshFlows();
-      toast.success('Open Vouchers and Execute (may already be listed)', {
-        id: 'pool',
-        duration: 10000,
-      });
-      return;
+      if (!opts.silentSuccess) {
+        toast.success('Open Vouchers and Execute (may already be listed)', {
+          id: 'pool',
+          duration: 10000,
+        });
+      }
+      return { prevVoucherCount: prevVouchers, minInputIndex };
     }
     throw new Error(
       'Withdraw not confirmed. Open Vouchers tab and refresh. RPC: https://cartesi-bridge.duckdns.org/rpc',
     );
+  };
+
+  /**
+   * One-click Path A: Deposit WART → mint claim → withdraw voucher → execute on L1.
+   * Manual step buttons remain for partial / recovery flows.
+   * MetaMask prompts: mint InputBox, withdraw InputBox, executeVoucher (+ Warthog send).
+   */
+  const liveOneClickToWwart = async () => {
+    if (!owner) throw new Error('Connect L1 wallet');
+    if (!signer) {
+      throw new Error(
+        'Connect MetaMask (L1 signer) for auto voucher execute — or use Deposit → Mint → Withdraw → Vouchers manually',
+      );
+    }
+    if (!send) throw new Error('Rollup send unavailable');
+    if (!wartBridgeApi?.sendTransaction || !wartBridgeApi?.getWartTxProof) {
+      throw new Error('Unlock Warthog wallet first (needed to send real WART)');
+    }
+    const amt = String(amount || '').trim();
+    if (!amt) throw new Error('Enter amount');
+
+    toast.loading(`1-click: depositing ${amt} WART…`, { id: 'pool' });
+    await liveDeposit();
+
+    toast.loading('1-click: mint claim…', { id: 'pool' });
+    await liveMint();
+
+    const minInputIndex = await maxOwnerVoucherInputIndex(owner);
+    toast.loading('1-click: withdraw voucher…', { id: 'pool' });
+    const w = await liveWithdraw({ silentSuccess: true, minInputIndex });
+
+    toast.loading('1-click: waiting for voucher proof…', { id: 'pool' });
+    try {
+      const { hash } = await waitAndExecuteWwartVoucher(signer, {
+        owner,
+        minInputIndex: w?.minInputIndex ?? minInputIndex,
+        amountHint: amt,
+        timeoutMs: 180000,
+      });
+
+      advanceFlowForOwner(owner, 'wwart_on_l1', { amountHuman: amt });
+      refreshFlows();
+      toast.success(
+        `wWART on MetaMask · execute tx ${String(hash).slice(0, 10)}…`,
+        { id: 'pool', duration: 10000 },
+      );
+      onRefreshMmWwart?.();
+    } catch (e) {
+      // Deposit/mint/withdraw already done — never ask user to re-deposit
+      advanceFlowForOwner(owner, 'voucher_ready', { amountHuman: amt });
+      refreshFlows();
+      throw new Error(
+        `${formatVoucherExecuteError(e)}. Rollup steps finished — use Vouchers → Execute (do not re-deposit).`,
+      );
+    }
   };
 
   /** Hot-wallet payout after pool_release_ticket (redeem or burn auto-unlock). */
@@ -1505,8 +1798,12 @@ export default function FungiblePool({
     setBusy(true);
     try {
       if (mode === 'lab') {
+        if (action === 'one_click_wwart') {
+          throw new Error('1-click is live-only (real WART → real wWART)');
+        }
         await labAction(action);
-      } else if (action === 'deposit') await liveDeposit();
+      } else if (action === 'one_click_wwart') await liveOneClickToWwart();
+      else if (action === 'deposit') await liveDeposit();
       else if (action === 'credit_resume') {
         const h = String(resumeTxHash || '').trim();
         if (!h) throw new Error('Paste Warthog tx hash to resume credit');
@@ -1622,10 +1919,11 @@ export default function FungiblePool({
         className="wi-muted"
         style={{ margin: '0.45rem 0 0.65rem', fontSize: '0.8rem', lineHeight: 1.45 }}
       >
-        <strong>Live:</strong> <strong>Deposit WART</strong> is one button (send → SPV
-        credit via relayer). If credit never lands, <strong>Resume credit</strong> with the
-        Warthog tx hash — never re-send. Then Mint → Withdraw wWART or{' '}
-        <strong>Redeem WART</strong>.{' '}
+        <strong>Live:</strong> use <strong>Get wWART (1-click)</strong> for deposit → mint →
+        withdraw → auto voucher execute, or step manually. <strong>Deposit WART</strong>{' '}
+        alone sends → SPV credit via relayer. If credit never lands,{' '}
+        <strong>Resume credit</strong> with the Warthog tx hash — never re-send. Then Mint →
+        Withdraw wWART or <strong>Redeem WART</strong>.{' '}
         <strong>A-β holder redeem:</strong> any holder with portal pool-wWART can burn;
         payout comes from <em>shared pool collateral</em> (FIFO across depositors — not only
         your own deposit). <strong>No cosigner / personal vaults</strong>.
@@ -1745,6 +2043,81 @@ export default function FungiblePool({
             )}
           </div>
 
+          {mode === 'live' && (
+            <div
+              style={{
+                marginBottom: '0.65rem',
+                padding: '0.55rem 0.65rem',
+                borderRadius: 8,
+                border: '1px solid rgba(0, 255, 204, 0.45)',
+                background:
+                  'linear-gradient(120deg, rgba(0,80,70,0.45) 0%, rgba(0,30,40,0.4) 100%)',
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: '0.4rem',
+                  alignItems: 'center',
+                }}
+              >
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  className="input wi-portal-input"
+                  style={{ maxWidth: '7rem' }}
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                  placeholder="Amount"
+                  disabled={busy || !owner}
+                  aria-label="Amount for 1-click or step actions"
+                />
+                <button
+                  type="button"
+                  className="btn primary small"
+                  disabled={
+                    busy ||
+                    !owner ||
+                    !signer ||
+                    !wartBridgeApi?.sendTransaction
+                  }
+                  onClick={() => run('one_click_wwart')}
+                  title="Deposit WART → mint claim → withdraw → execute voucher (MetaMask gets wWART)"
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.3rem',
+                    fontWeight: 700,
+                  }}
+                >
+                  <Zap size={14} aria-hidden />
+                  Get wWART (1-click)
+                </button>
+              </div>
+              <p
+                className="wi-muted"
+                style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', lineHeight: 1.4 }}
+              >
+                Runs deposit → mint → withdraw → <strong>auto execute voucher</strong>.
+                Expect MetaMask for rollup inputs + final <code>executeVoucher</code>.
+                Unlock Warthog + connect L1 first. Manual steps below still work for
+                recovery.
+              </p>
+              {!signer && owner ? (
+                <p
+                  style={{
+                    margin: '0.35rem 0 0',
+                    fontSize: '0.72rem',
+                    color: '#f0c674',
+                  }}
+                >
+                  Connect MetaMask to enable 1-click (voucher execute needs a signer).
+                </p>
+              ) : null}
+            </div>
+          )}
+
           <div
             style={{
               display: 'flex',
@@ -1754,16 +2127,31 @@ export default function FungiblePool({
               marginBottom: '0.5rem',
             }}
           >
-            <input
-              type="text"
-              inputMode="decimal"
-              className="input wi-portal-input"
-              style={{ maxWidth: '7rem' }}
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
-              placeholder="Amount"
-              disabled={busy || !owner}
-            />
+            {mode !== 'live' && (
+              <input
+                type="text"
+                inputMode="decimal"
+                className="input wi-portal-input"
+                style={{ maxWidth: '7rem' }}
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                placeholder="Amount"
+                disabled={busy || !owner}
+              />
+            )}
+            <span
+              className="wi-muted"
+              style={{
+                fontSize: '0.68rem',
+                fontWeight: 700,
+                letterSpacing: '0.04em',
+                textTransform: 'uppercase',
+                width: '100%',
+                marginBottom: '0.1rem',
+              }}
+            >
+              Manual steps
+            </span>
             <button
               type="button"
               className="btn primary small"
