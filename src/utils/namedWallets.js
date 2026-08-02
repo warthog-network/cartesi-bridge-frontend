@@ -2,7 +2,17 @@
  * Named encrypted wallets (wartbunker-compatible key prefix).
  * Keys: warthogWallet_${name}
  * Legacy single slot: warthogWallet
+ *
+ * Values may be:
+ *  - legacy CryptoJS AES ciphertext (password)
+ *  - warthog-wallet-v1 JSON envelope (password and/or passkey)
  */
+
+import {
+  inspectWalletBlob,
+  authBadgeForBlob,
+  cleanupPasskeyStorage,
+} from './passkeyWallet.js';
 
 export const NAMED_WALLET_PREFIX = 'warthogWallet_';
 export const LEGACY_WALLET_KEY = 'warthogWallet';
@@ -42,7 +52,7 @@ export function hasLegacyWallet() {
   }
 }
 
-/** Ciphertext for a named wallet, or null */
+/** Ciphertext / envelope for a named wallet, or null */
 export function getNamedWalletCipher(name) {
   try {
     return localStorage.getItem(namedWalletStorageKey(name));
@@ -61,7 +71,7 @@ export function getLegacyWalletCipher() {
 
 /**
  * @param {string} name
- * @param {string} encryptedCipher AES ciphertext string
+ * @param {string} encryptedCipher AES ciphertext string or envelope JSON
  */
 export function saveNamedWalletCipher(name, encryptedCipher) {
   const key = namedWalletStorageKey(name);
@@ -98,7 +108,14 @@ export function setLastWalletName(name) {
 export function deleteNamedWallet(name) {
   try {
     const key = namedWalletStorageKey(name);
-    if (localStorage.getItem(key) == null) return false;
+    const raw = localStorage.getItem(key);
+    if (raw == null) return false;
+    // fire-and-forget cleanup of device AES keys
+    try {
+      void cleanupPasskeyStorage(raw);
+    } catch {
+      /* ignore */
+    }
     localStorage.removeItem(key);
     if (getLastWalletName() === String(name).trim()) {
       setLastWalletName('');
@@ -112,6 +129,14 @@ export function deleteNamedWallet(name) {
 /** Remove legacy single-slot key only */
 export function deleteLegacyWallet() {
   try {
+    const raw = localStorage.getItem(LEGACY_WALLET_KEY);
+    if (raw) {
+      try {
+        void cleanupPasskeyStorage(raw);
+      } catch {
+        /* ignore */
+      }
+    }
     localStorage.removeItem(LEGACY_WALLET_KEY);
     return true;
   } catch {
@@ -121,20 +146,43 @@ export function deleteLegacyWallet() {
 
 /**
  * All selectable entries for the login UI.
- * @returns {{ id: string, label: string, kind: 'named' | 'legacy' }[]}
+ * @returns {{ id: string, label: string, kind: 'named' | 'legacy', hasPasskey: boolean, hasPassword: boolean, require2fa: boolean, authBadge: string, addressHint: string }[]}
  */
 export function listWalletEntries() {
-  const entries = listNamedWallets().map((name) => ({
-    id: name,
-    label: name,
-    kind: 'named',
-  }));
+  const entries = listNamedWallets().map((name) => {
+    const raw = getNamedWalletCipher(name);
+    const info = inspectWalletBlob(raw);
+    return {
+      id: name,
+      label: name,
+      kind: 'named',
+      hasPasskey: info.hasPasskey,
+      hasPassword: info.hasPassword,
+      require2fa: info.require2fa,
+      authBadge: authBadgeForBlob(raw),
+      addressHint: info.addressHint || '',
+    };
+  });
   if (hasLegacyWallet()) {
+    const raw = getLegacyWalletCipher();
+    const info = inspectWalletBlob(raw);
     entries.unshift({
       id: '__legacy__',
       label: 'Default (legacy)',
       kind: 'legacy',
+      hasPasskey: info.hasPasskey,
+      hasPassword: info.hasPassword,
+      require2fa: info.require2fa,
+      authBadge: authBadgeForBlob(raw),
+      addressHint: info.addressHint || '',
     });
   }
   return entries;
+}
+
+/** Raw stored blob for an entry id (named name or __legacy__). */
+export function getWalletBlobForEntry(entryId) {
+  if (!entryId) return null;
+  if (entryId === '__legacy__') return getLegacyWalletCipher();
+  return getNamedWalletCipher(entryId);
 }
