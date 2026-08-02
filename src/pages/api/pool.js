@@ -58,7 +58,7 @@ export async function GET({ request }) {
       return json(200, {
         ...credits,
         mode: 'credit-queue',
-        note: 'Relayer posts pool_deposit for pending items (Phase 3 → SPV claims).',
+        note: 'Relayer posts wart_deposit_claim (SPV) by default; legacy pool_deposit if SPV fails.',
       });
     }
     if (url.searchParams.get('lookup')) {
