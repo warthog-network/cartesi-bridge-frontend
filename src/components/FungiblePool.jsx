@@ -380,7 +380,7 @@ async function waitForNotice(
     } catch (e) {
       if (e?.notice || String(e?.message || '').startsWith('Rollup rejected')) throw e;
     }
-    await sleep(1500);
+    await sleep(700);
   }
   return null;
 }
@@ -394,7 +394,7 @@ async function snapshotNoticeFingerprints(opts) {
  * Primary confirmation path: poll pool inspect until `ok(before, after)` is true.
  * Notices are secondary and flaky on mobile; inspect is rollup truth.
  */
-async function waitForPoolState(owner, ok, { timeoutMs = 45000, intervalMs = 1500 } = {}) {
+async function waitForPoolState(owner, ok, { timeoutMs = 45000, intervalMs = 700 } = {}) {
   const deadline = Date.now() + timeoutMs;
   let last = null;
   while (Date.now() < deadline) {
@@ -407,6 +407,60 @@ async function waitForPoolState(owner, ok, { timeoutMs = 45000, intervalMs = 150
     await sleep(intervalMs);
   }
   return last;
+}
+
+function humanToE8(human) {
+  const s = String(human || '').trim().replace(/,/g, '');
+  if (!s) return null;
+  const [w, f = ''] = s.split('.');
+  const frac = `${f}00000000`.slice(0, 8);
+  try {
+    return (BigInt(w || '0') * 100000000n + BigInt(frac || '0')).toString();
+  } catch {
+    return null;
+  }
+}
+
+function pickReleaseTicket(src, { owner, amountE8, toAddress } = {}) {
+  if (!src) return null;
+  const tid = src.unlockTicketId || src.ticketId;
+  if (tid && (src.amountE8 || src.unlockAmountE8 || src.type === 'pool_release_ticket')) {
+    return {
+      ticketId: tid,
+      amountE8: src.unlockAmountE8 || src.amountE8 || amountE8 || null,
+      toAddress: src.toAddress || toAddress || null,
+      owner: src.owner || owner || null,
+    };
+  }
+  const list = Array.isArray(src.recentTickets) ? src.recentTickets : [];
+  const wantOwner = owner ? String(owner).toLowerCase() : '';
+  const wantAmt = amountE8 != null ? String(amountE8) : null;
+  const wantTo = toAddress
+    ? String(toAddress).replace(/^0x/i, '').toLowerCase()
+    : '';
+  const matches = list.filter((t) => {
+    if (!t?.ticketId) return false;
+    if (t.type && t.type !== 'pool_release_ticket') return false;
+    if (wantOwner && String(t.owner || '').toLowerCase() !== wantOwner) return false;
+    if (
+      wantTo &&
+      String(t.toAddress || '')
+        .replace(/^0x/i, '')
+        .toLowerCase() !== wantTo
+    ) {
+      return false;
+    }
+    if (wantAmt && String(t.amountE8 || '') !== wantAmt) return false;
+    return true;
+  });
+  const t = matches.length ? matches[matches.length - 1] : null;
+  if (!t) return null;
+  return {
+    ticketId: t.ticketId,
+    amountE8: t.amountE8 || amountE8 || null,
+    toAddress: t.toAddress || toAddress || null,
+    owner: t.owner || owner || null,
+  };
 }
 
 function userBn(insp, field) {
@@ -2030,8 +2084,10 @@ export default function FungiblePool({
     if (pay.mode === 'pool-3p' || pay.custody === '3p-d1-d2') {
       toast.loading(`3P pool: waiting for d1 + d2 on ${ticketId}…`, { id: 'pool' });
       const deadline = Date.now() + 180000;
+      let first = true;
       while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 1500));
+        if (!first) await new Promise((r) => setTimeout(r, 700));
+        first = false;
         let st = null;
         try {
           st = await poolApi('/api/pool', {
@@ -2189,7 +2245,7 @@ export default function FungiblePool({
         poolBn(s, 'lockedE8') < prevLocked ||
         poolBn(s, 'claimed18') < prevGlobalClaim ||
         userBn(s, 'redeemedE8') > userBn(before, 'redeemedE8'),
-      { timeoutMs: 45000 },
+      { timeoutMs: 20000, intervalMs: 700 },
     );
 
     const burned =
@@ -2207,47 +2263,26 @@ export default function FungiblePool({
       );
     }
 
-    let ticket = null;
-    try {
-      const n = await Promise.race([
-        noticeP,
-        sleep(3000).then(() => null),
-      ]);
-      if (n?.unlockTicketId || n?.ticketId) {
-        ticket = {
-          ticketId: n.unlockTicketId || n.ticketId,
-          amountE8: n.unlockAmountE8 || n.amountE8,
-          toAddress: n.toAddress || to || null,
-          owner,
-        };
-      } else if (n?.type === 'pool_release_ticket' && n.ticketId) {
-        ticket = {
-          ticketId: n.ticketId,
-          amountE8: n.amountE8,
-          toAddress: n.toAddress || to || null,
-          owner,
-        };
-      }
-    } catch (e) {
-      if (String(e?.message || '').startsWith('Rollup rejected')) throw e;
+    let ticket = pickReleaseTicket(await noticeP.catch(() => null), {
+      owner,
+      amountE8: humanToE8(amt),
+      toAddress: to,
+    });
+    if (!ticket?.ticketId) {
+      ticket = pickReleaseTicket(after, {
+        owner,
+        amountE8: humanToE8(amt),
+        toAddress: to,
+      });
     }
-
-    // Pull latest release ticket notice if not yet
     if (!ticket?.ticketId) {
       try {
         const t = await waitForNotice('pool_release_ticket', {
-          timeoutMs: 8000,
+          timeoutMs: 4000,
           matchOwner: owner,
           seenPayloads: seen,
         });
-        if (t?.ticketId) {
-          ticket = {
-            ticketId: t.ticketId,
-            amountE8: t.amountE8,
-            toAddress: t.toAddress || to || null,
-            owner,
-          };
-        }
+        ticket = pickReleaseTicket(t, { owner, amountE8: humanToE8(amt), toAddress: to });
       } catch {
         /* no ticket */
       }
@@ -2338,7 +2373,7 @@ export default function FungiblePool({
         userBn(s, 'depositedE8') < prevDeposited ||
         userBn(s, 'portable18') < prevPortable ||
         userBn(s, 'redeemedE8') > prevRedeemed,
-      { timeoutMs: 45000 },
+      { timeoutMs: 20000, intervalMs: 700 },
     );
     const ok =
       after &&
@@ -2352,11 +2387,28 @@ export default function FungiblePool({
       );
     }
 
-    let ticket = null;
-    try {
-      ticket = await Promise.race([ticketP, sleep(5000).then(() => null)]);
-    } catch (e) {
-      if (String(e?.message || '').startsWith('Rollup rejected')) throw e;
+    let ticket = pickReleaseTicket(await Promise.race([ticketP, sleep(50)]), {
+      owner,
+      amountE8: humanToE8(amt),
+      toAddress: to,
+    });
+    if (!ticket?.ticketId) {
+      ticket = pickReleaseTicket(after, {
+        owner,
+        amountE8: humanToE8(amt),
+        toAddress: to,
+      });
+    }
+    if (!ticket?.ticketId) {
+      try {
+        ticket = pickReleaseTicket(await ticketP, {
+          owner,
+          amountE8: humanToE8(amt),
+          toAddress: to,
+        });
+      } catch (e) {
+        if (String(e?.message || '').startsWith('Rollup rejected')) throw e;
+      }
     }
     if (ticket?.ticketId) {
       advanceFlowForOwner(owner, 'payout_pending', { ticketId: ticket.ticketId });
