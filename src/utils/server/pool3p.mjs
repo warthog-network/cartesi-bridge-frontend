@@ -653,7 +653,7 @@ const ORBIT_PATH =
 
 const LEASE_MS = Number(env('POOL_3P_LEASE_MS', '900000')) || 900000;
 const ORBIT_LIVE_MS = Number(env('POOL_3P_ORBIT_LIVE_MS', '20000')) || 20000;
-const SEAT_IDLE_MS = Number(env('POOL_3P_SEAT_IDLE_MS', '45000')) || 45000;
+const SEAT_IDLE_MS = Number(env('POOL_3P_SEAT_IDLE_MS', '300000')) || 300000;
 const ORBIT_MIN = Number(env('POOL_3P_ORBIT_MIN', '2')) || 2;
 
 function vpsFallbackOn() {
@@ -706,7 +706,6 @@ function liveOrbitMembers(o = loadOrbit(), now = nowMs()) {
 
 function holderStale(rec, now = nowMs()) {
   if (!rec?.signerId) return true;
-  if (!liveOrbitMembers().includes(rec.signerId)) return true;
   const seen = Date.parse(rec.lastSeen || rec.assignedAt || 0);
   if (!Number.isFinite(seen)) return true;
   return now - seen > SEAT_IDLE_MS;
@@ -891,9 +890,11 @@ function signInFlight() {
     const s = JSON.parse(readFileSync(SESS_PATH, 'utf8'));
     const now = Date.now();
     for (const t of Object.values(s.tickets || {})) {
-      if (!t || t.status === 'paid') continue;
-      const age = now - Number(t.updatedAt || 0);
-      if (Number.isFinite(age) && age < 10 * 60 * 1000) return true;
+      if (!t || t.status === 'paid' || t.payout?.txHash) continue;
+      const raw = t.updatedAt;
+      const ts = typeof raw === 'number' ? raw : Date.parse(raw || 0);
+      const age = now - ts;
+      if (Number.isFinite(age) && age >= 0 && age < 10 * 60 * 1000) return true;
     }
   } catch {
     /* */
@@ -1428,6 +1429,43 @@ function combineCkeyD1D2(dapp, d2Hex) {
   return pub.addition(c1, c2).toString();
 }
 
+export async function pool3pReuseOrPrepare(ticketId, { toAddress, amountE8, makePrep }) {
+  const id = String(ticketId || '').trim();
+  const s = await loadSessions();
+  const prev = s.tickets[id] || {};
+  const old = prev.prep;
+  const sameTo =
+    !toAddress ||
+    String(old?.toAddress || '').toLowerCase() === String(toAddress).replace(/^0x/i, '').toLowerCase();
+  const sameAmt =
+    amountE8 == null || String(old?.amountE8 || '') === String(amountE8);
+  if (old?.hashHex && !prev.payout?.txHash && prev.status !== 'paid' && sameTo && sameAmt) {
+    return old;
+  }
+  const prep = await makePrep();
+  await pool3pRememberPrepare(id, prep);
+  return prep;
+}
+
+export async function rebuildLindell(ticketId) {
+  const id = String(ticketId || '').trim();
+  const dapp = loadDapp();
+  if (!dapp) throw new Error('3P pool not configured');
+  return withSessions((s) => {
+    const t = s.tickets[id];
+    if (!t) throw new Error('no room');
+    if (t.status === 'paid') return roomView(t);
+    if (!t.R1Hex || !t.d2Hex || !t.hashHex) {
+      t.status = t.haveD2 ? 'wait_r1' : 'wait_d2';
+      return roomView(t);
+    }
+    runLindellInto(t, dapp);
+    t.updatedAt = Date.now();
+    t.lastError = null;
+    return roomView(t);
+  });
+}
+
 export async function pool3pRememberPrepare(ticketId, prep) {
   const id = String(ticketId);
   await withSessions((s) => {
@@ -1810,6 +1848,8 @@ export function roomView(sess) {
       d2: { signerId: h2, live: !!(h2 && live.includes(h2)), joined: !!sum.haveD2 },
     },
     readyToFinish: !!sum.hasPartial,
+    lastError: sess.lastError || null,
+    lindellReset: sess.lindellReset || null,
   };
 }
 
