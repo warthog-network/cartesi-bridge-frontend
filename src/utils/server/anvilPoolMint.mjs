@@ -34,7 +34,12 @@ export async function submitAnvilPoolMint({ owner, amount, tokenAddress } = {}) 
   if (!amt || Number(amt) <= 0) throw new Error('amount required');
 
   const { ethers } = await import('ethers-v6');
-  const rpc = env('CARTESI_RPC_URL', 'http://127.0.0.1:8545');
+  // Same Anvil as wallets: nginx /rpc → 127.0.0.1:8545. Prefer the public
+  // URL so host mint exercises the path Rabby/MetaMask must use.
+  const rpc =
+    env('PUBLIC_L1_RPC') ||
+    env('CARTESI_PUBLIC_RPC') ||
+    'https://cartesi-bridge.duckdns.org/rpc';
   const dapp = env('DAPP_ADDRESS', '0xab7528bb862fB57E8A2BCd567a2e929a0Be56a5e');
   const boxAddr = env('INPUT_BOX', '0x59b22D57D4f067708AB0c00552767405926dc768');
   const provider = new ethers.JsonRpcProvider(rpc);
