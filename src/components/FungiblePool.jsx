@@ -21,12 +21,14 @@ import {
   executeVoucherOnL1,
   wasVoucherExecuted,
   formatVoucherExecuteError,
+  isVoucherClaimedOnL1,
 } from '../utils/vouchers.js';
 import {
   listPendingForOwner,
   upsertPendingDeposit,
   updatePendingStatus,
   removePendingDeposit,
+  clearPendingForOwner,
   isOpenPendingStatus,
 } from '../utils/poolPendingStore.js';
 import {
@@ -36,10 +38,13 @@ import {
   advanceFlowForOwner,
   completeFlow,
   cancelFlow,
+  clearOpenFlowsForOwner,
+  wipeFlowsForOwner,
   reconcileFlowsFromInspect,
   stepMeta,
   flowProgress,
 } from '../utils/poolFlowTracker.js';
+import { buildPoolBindMessage } from '../utils/poolBindMessage.js';
 
 function humanFrom18(raw) {
   try {
@@ -65,6 +70,17 @@ function humanFromE8(raw) {
   }
 }
 
+function humanTo18(human) {
+  const s = String(human || '').trim();
+  if (!s) return 0n;
+  const neg = s.startsWith('-');
+  const raw = neg ? s.slice(1) : s;
+  const [w, f = ''] = raw.split('.');
+  const frac = `${f}000000000000000000`.slice(0, 18);
+  const n = BigInt(w || '0') * 10n ** 18n + BigInt(frac || '0');
+  return neg ? -n : n;
+}
+
 async function poolApi(path, init) {
   const res = await fetch(path, {
     cache: 'no-store',
@@ -80,6 +96,84 @@ async function poolApi(path, init) {
     throw new Error(data.error || `pool API ${res.status}`);
   }
   return data;
+}
+
+/** Host-queue bind lookup. Does not throw on conflict (409). */
+async function fetchWartOwnerBind({ fromAddress, owner }) {
+  const from = String(fromAddress || '').replace(/^0x/i, '').trim();
+  const own = String(owner || '').trim();
+  if (!from || !own) return null;
+  const url = `/api/pool?bind=1&from=${encodeURIComponent(from)}&owner=${encodeURIComponent(own)}`;
+  const res = await fetch(url, {
+    cache: 'no-store',
+    headers: { Accept: 'application/json' },
+  });
+  const data = await res.json().catch(() => ({}));
+  return data;
+}
+
+/**
+ * Bind must exist before send/credit. Mismatch → abort.
+ * Unbound → Warthog + MetaMask personal_sign, then persist (no first-writer).
+ */
+async function ensureWartOwnerBind({
+  fromAddress,
+  owner,
+  signer,
+  signWartMessage,
+}) {
+  const from = String(fromAddress || '').trim();
+  const own = String(owner || '').trim();
+  if (!from || !own) {
+    throw new Error('Unlock Warthog and connect MetaMask before depositing');
+  }
+  let check;
+  try {
+    check = await fetchWartOwnerBind({ fromAddress: from, owner: own });
+  } catch (e) {
+    throw new Error(
+      `Could not verify WART↔ETH bind (${e?.message || e}) — not sending WART`,
+    );
+  }
+  if (!check) {
+    throw new Error('Could not verify WART↔ETH bind — not sending WART');
+  }
+  if (check.conflict || check.status === 'mismatch') {
+    throw new Error(
+      check.error ||
+        `This Warthog wallet is already bound to ${check.boundOwner || 'another L1 address'} — switch MetaMask. WART was not sent.`,
+    );
+  }
+  if (check.status === 'match') return check;
+  if (!signWartMessage) {
+    throw new Error('Unlock Warthog to bind this wallet to MetaMask before sending');
+  }
+  if (!signer?.signMessage) {
+    throw new Error(
+      'Connect MetaMask (signer) to bind this Warthog wallet before sending. WART was not sent.',
+    );
+  }
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const message = buildPoolBindMessage({
+    fromAddress: from,
+    owner: own,
+    issuedAt,
+  });
+  toast.loading('Sign Warthog bind…', { id: 'pool' });
+  const wartSig = await signWartMessage(message);
+  toast.loading('Sign MetaMask bind…', { id: 'pool' });
+  const ownerSig = await signer.signMessage(message);
+  return poolApi('/api/pool', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'register_bind',
+      fromAddress: from,
+      owner: own,
+      issuedAt,
+      wartSig,
+      ownerSig,
+    }),
+  });
 }
 
 function decodeInspectPayload(payload) {
@@ -144,19 +238,41 @@ function decodeNoticePayload(raw) {
  * small avoids MetaMask / gas surprises if the node ever returns fat proofs.
  */
 function slimDepositProof(proof) {
-  const normalized = normalizeTxLookup(proof);
-  const tx = normalized?.transaction || {};
+  // getWartTxProof may already return normalizeTxLookup(); also accept raw lookup.
+  const normalized = normalizeTxLookup(proof) || proof || {};
+  const tx = normalized.transaction || {};
+  const nested = tx.data || {};
+  const common = tx.signedCommon || tx.signingData || {};
+  const amountObj = nested.amount || {};
+  // v0.10+ uses amount.E8; never drop deposits because of shape drift
+  const amountE8 = Number(
+    tx.amountE8 ??
+      amountObj.E8 ??
+      amountObj.u64 ??
+      nested.amountE8 ??
+      0,
+  );
+  const toAddress =
+    tx.toAddress || nested.toAddress || null;
+  const fromAddress =
+    tx.fromAddress ||
+    common.originAddress ||
+    nested.fromAddress ||
+    null;
+  const txHash = tx.txHash || tx.hash || null;
   return {
     transaction: {
-      txHash: tx.txHash || tx.hash || null,
-      fromAddress: tx.fromAddress || null,
-      toAddress: tx.toAddress || null,
-      amountE8: Number(tx.amountE8 ?? 0),
-      blockHeight: tx.blockHeight ?? null,
-      confirmations: tx.confirmations ?? normalized?.confirmations ?? 0,
+      txHash,
+      fromAddress,
+      toAddress,
+      amountE8,
+      blockHeight:
+        tx.blockHeight ?? normalized.mined?.block?.height ?? null,
+      confirmations:
+        tx.confirmations ?? normalized.confirmations ?? 0,
     },
-    confirmations: normalized?.confirmations ?? tx.confirmations ?? 0,
-    mined: normalized?.mined || undefined,
+    confirmations: tx.confirmations ?? normalized.confirmations ?? 0,
+    mined: normalized.mined || undefined,
   };
 }
 
@@ -338,14 +454,35 @@ async function countOwnerVouchers(owner) {
 
 /** Read pool inspect for owner (rollup truth after deposit). */
 async function fetchPoolInspect(owner) {
-  const base = getInspectUrl().replace(/\/$/, '');
-  const path = owner
+  const want = owner
     ? `pool/${String(owner).replace(/^0x/i, '').toLowerCase()}`
     : 'pool';
-  const res = await fetchWithTimeout(`${base}/${path}`, { cache: 'no-store' }, 12000);
+  try {
+    const base = getInspectUrl().replace(/\/$/, '');
+    const res = await fetchWithTimeout(
+      `${base}/${want}`,
+      { cache: 'no-store' },
+      8000,
+    );
+    if (res.ok) {
+      const data = await res.json();
+      if (data.reports?.length) {
+        const decoded = decodeInspectPayload(data.reports[0].payload);
+        if (decoded && !decoded.error) return decoded;
+      }
+    }
+  } catch {
+    /* nginx /rollup/inspect can 404 on the Node port or lock under load */
+  }
+  // Same-origin API talks to 127.0.0.1:8080 — does not depend on the
+  // browser hitting /rollup/inspect.
+  const q = owner ? `?inspect=1&owner=${encodeURIComponent(owner)}` : '?inspect=1';
+  const res = await fetchWithTimeout(`/api/pool${q}`, { cache: 'no-store' }, 12000);
   const data = await res.json();
-  if (!data.reports?.length) return null;
-  return decodeInspectPayload(data.reports[0].payload);
+  if (!res.ok || data.ok === false) {
+    throw new Error(data.error || `pool inspect ${res.status}`);
+  }
+  return data;
 }
 
 /**
@@ -477,6 +614,8 @@ async function waitAndExecuteWwartVoucher(signer, opts = {}) {
 
     for (const v of candidates) {
       try {
+        const onL1 = await isVoucherClaimedOnL1(signer, v).catch(() => false);
+        if (!onL1) continue;
         const done = await wasVoucherExecuted(signer, v);
         if (done) continue;
       } catch {
@@ -578,9 +717,39 @@ export default function FungiblePool({
   const [toAddress, setToAddress] = useState('');
   const [lastTicket, setLastTicket] = useState(null);
   const [mode, setMode] = useState('live'); // live | lab
+  /** Path A3 threshold pool status (3-of-4 browser signers) */
+  const [thresholdSt, setThresholdSt] = useState(null);
+  const [pool3pSt, setPool3pSt] = useState(null);
+  /**
+   * UI custody toggle — same fungible deposit/mint flow either way;
+   * only WART *release* uses 3-of-4 signers when on.
+   */
+  const THRESH_PREF_KEY = 'cartesi.pool.useThreshold3of4.v1';
+  const [useThreshold3of4, setUseThreshold3of4] = useState(() => {
+    try {
+      const v = localStorage.getItem(THRESH_PREF_KEY);
+      if (v === '0' || v === 'false') return false;
+      if (v === '1' || v === 'true') return true;
+    } catch {
+      /* */
+    }
+    return true; // default ON for testnet demo
+  });
+  const setThresholdToggle = (on) => {
+    setUseThreshold3of4(on);
+    try {
+      localStorage.setItem(THRESH_PREF_KEY, on ? '1' : '0');
+    } catch {
+      /* */
+    }
+  };
   const [pendingList, setPendingList] = useState([]);
   const [openFlows, setOpenFlows] = useState([]);
   const [resumeTxHash, setResumeTxHash] = useState('');
+  /** Sticky action line — toasts expire; this does not. */
+  const [actionStatus, setActionStatus] = useState(null);
+  /** Host-queue WART→L1 bind. Conflict means do not send WART. */
+  const [wartBind, setWartBind] = useState(null);
   /** Lab mode only when PUBLIC_POOL_LAB=1 or ?lab=1 — public demo hides it. */
   const labUiEnabled =
     String(import.meta.env.PUBLIC_POOL_LAB || '') === '1' ||
@@ -588,7 +757,10 @@ export default function FungiblePool({
       new URLSearchParams(window.location.search).get('lab') === '1');
 
   const owner = ownerAddress || '';
-  const poolAddr = snap?.poolAddress || FUNGIBLE_POOL.address;
+  const wartFrom = wartBridgeApi?.address || '';
+  const bindBlocked = Boolean(wartBind?.conflict);
+  const poolAddr = FUNGIBLE_POOL.address || snap?.poolAddress;
+  const rollupPoolAddr = snap?.poolAddress || null;
   const wwartToken = LOCAL_WWART?.address;
   const spv = snap?.spv || null;
 
@@ -729,6 +901,22 @@ export default function FungiblePool({
       : '—';
 
   const refresh = useCallback(async () => {
+    // Path A3 threshold status (public, no secrets)
+    try {
+      const tres = await poolApi('/api/pool?threshold=1');
+      if (tres?.ok !== false) setThresholdSt(tres);
+    } catch {
+      /* optional */
+    }
+    try {
+      const p3 = await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'pool3p_status' }),
+      });
+      if (p3) setPool3pSt(p3);
+    } catch {
+      /* optional */
+    }
     // Prefer rollup inspect
     try {
       const base = getInspectUrl().replace(/\/$/, '');
@@ -744,6 +932,11 @@ export default function FungiblePool({
           setSnap({
             poolId: json.poolId,
             poolAddress: json.poolAddress || FUNGIBLE_POOL.address,
+            lockedE8: json.lockedE8,
+            claimed18: json.claimed18,
+            available18: json.available18,
+            redeemedE8: json.redeemedE8,
+            freeableE8: json.freeableE8,
             lockedHuman: humanFromE8(json.lockedE8),
             capacityHuman: humanFrom18(json.capacity18),
             claimedHuman: humanFrom18(json.claimed18),
@@ -755,6 +948,7 @@ export default function FungiblePool({
             spv: json.spv || null,
             user: user
               ? {
+                  ...user,
                   depositedHuman: humanFromE8(user.depositedE8),
                   claimHuman: humanFrom18(user.claim18),
                   portableHuman: humanFrom18(user.portable18),
@@ -778,6 +972,10 @@ export default function FungiblePool({
       setSnap({
         poolId: s.poolId,
         poolAddress: s.livePool?.address || s.poolAddress || FUNGIBLE_POOL.address,
+        lockedE8: s.lockedE8,
+        claimed18: s.claimed18,
+        available18: s.available18,
+        redeemedE8: s.redeemedE8,
         lockedHuman: s.lockedHuman,
         capacityHuman: s.capacityHuman,
         claimedHuman: s.claimedHuman,
@@ -785,6 +983,7 @@ export default function FungiblePool({
         redeemedHuman: s.redeemedHuman,
         user: s.user
           ? {
+              ...s.user,
               depositedHuman: s.user.depositedHuman,
               claimHuman: s.user.claimHuman,
               portableHuman: s.user.portableHuman,
@@ -804,6 +1003,24 @@ export default function FungiblePool({
     const t = setInterval(refresh, 20000);
     return () => clearInterval(t);
   }, [refresh]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!owner || !wartFrom) {
+      setWartBind(null);
+      return undefined;
+    }
+    fetchWartOwnerBind({ fromAddress: wartFrom, owner })
+      .then((b) => {
+        if (!cancelled) setWartBind(b);
+      })
+      .catch(() => {
+        if (!cancelled) setWartBind(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [owner, wartFrom]);
 
   const pollConfirm = async (txHash, need = 1) => {
     if (!wartBridgeApi?.getWartTxProof) return null;
@@ -827,6 +1044,7 @@ export default function FungiblePool({
     amountE8,
     fromAddress,
     confirmations,
+    baselineDepositedE8,
   }) => {
     upsertPendingDeposit({
       txHash,
@@ -844,6 +1062,8 @@ export default function FungiblePool({
       amountE8: amountE8 != null ? String(amountE8) : null,
       amountHuman: amountE8 != null ? humanFromE8(amountE8) : null,
       step: 'credit_pending',
+      baselineDepositedE8:
+        baselineDepositedE8 != null ? String(baselineDepositedE8) : undefined,
       replaceOpen: true,
     });
     refreshPending();
@@ -905,7 +1125,9 @@ export default function FungiblePool({
             String(txHash).replace(/^0x/i, '').toLowerCase(),
         );
         if (row?.status === 'credited') {
-          return { ok: true, source: 'queue', row };
+          // Queue truth: credit already applied (or duplicate). Always succeed
+          // even if inspect deposited did not *increase* this wait cycle.
+          return { ok: true, source: 'queue-credited', row };
         }
         if (row?.status === 'rejected' || row?.status === 'failed') {
           const err = new Error(row.error || 'Credit rejected by relayer');
@@ -1060,20 +1282,91 @@ export default function FungiblePool({
       );
     }
 
+    toast.loading('Checking WART↔ETH bind…', { id: 'pool' });
+    const bound = await ensureWartOwnerBind({
+      fromAddress: fromAddr || wartBridgeApi?.address,
+      owner,
+      signer,
+      signWartMessage: wartBridgeApi?.signMessage,
+    });
+    setWartBind(bound);
+
     toast.loading('Queueing credit (relayer, no MetaMask)…', { id: 'pool' });
-    await enqueueCredit({
+    const enq = await enqueueCredit({
       txHash,
       amountE8: amtE8,
       fromAddress: fromAddr,
       confirmations: slim?.confirmations || slim?.transaction?.confirmations,
+      baselineDepositedE8: String(prevDeposited),
     });
 
-    toast.loading('Waiting for pool credit…', { id: 'pool' });
+    // Already credited on server/rollup — do not wait for a *new* deposit bump
+    // (that was the "Resume hangs forever" bug when credit already landed).
+    if (enq?.alreadyCredited || enq?.item?.status === 'credited') {
+      try {
+        const insp = await fetchPoolInspect(owner);
+        const dep = BigInt(String(insp?.user?.depositedE8 || 0));
+        const locked = BigInt(String(insp?.lockedE8 || 0));
+        if (dep > 0n || locked > 0n || prevDeposited > 0n || prevLocked > 0n) {
+          updatePendingStatus(txHash, 'credited');
+          removePendingDeposit(txHash);
+          advanceFlowForOwner(owner, 'credited', {
+            depositTxHash: txHash,
+            amountE8: String(amtE8),
+          });
+          refreshPending();
+          refreshFlows();
+          toast.success(
+            `Already credited on rollup · ${humanFromE8(amtE8)} WART (cleared local tracker)`,
+            { id: 'pool', duration: 8000 },
+          );
+          return;
+        }
+      } catch {
+        /* fall through to wait */
+      }
+    }
+
+    // If inspect already shows this owner's deposit (common after SPV success),
+    // treat as done even when waiting for increase would no-op.
+    try {
+      const insp0 = await fetchPoolInspect(owner);
+      if (insp0 && !insp0.error) {
+        const dep = BigInt(String(insp0.user?.depositedE8 || 0));
+        const locked = BigInt(String(insp0.lockedE8 || 0));
+        if (
+          (dep > 0n && dep >= prevDeposited && prevDeposited > 0n) ||
+          (dep >= BigInt(amtE8) && amtE8 > 0) ||
+          (locked > 0n && locked >= prevLocked && prevLocked > 0n)
+        ) {
+          // If we already had capacity before this resume and queue says credited, done
+          if (enq?.alreadyCredited || dep >= BigInt(amtE8)) {
+            updatePendingStatus(txHash, 'credited');
+            removePendingDeposit(txHash);
+            advanceFlowForOwner(owner, 'credited', {
+              depositTxHash: txHash,
+              amountE8: String(amtE8),
+            });
+            refreshPending();
+            refreshFlows();
+            toast.success(
+              `Pool credit OK · deposited ${humanFromE8(dep)} WART on rollup`,
+              { id: 'pool', duration: 8000 },
+            );
+            return;
+          }
+        }
+      }
+    } catch {
+      /* */
+    }
+
+    toast.loading('Waiting for pool credit (relayer + SPV LC)…', { id: 'pool' });
     let result = await waitForRollupCredit({
       txHash,
       prevDeposited,
       prevLocked,
-      timeoutMs: 90000,
+      timeoutMs: 120000,
     });
 
     // Optional self-submit if relayer lagging and send() available
@@ -1158,6 +1451,16 @@ export default function FungiblePool({
       throw new Error('Pool address missing — refresh and try again');
     }
 
+    // Bind must exist before send. Unbound → dual-sig register (not first-writer).
+    toast.loading('Checking WART↔ETH bind…', { id: 'pool' });
+    const bound = await ensureWartOwnerBind({
+      fromAddress: wartBridgeApi.address,
+      owner,
+      signer,
+      signWartMessage: wartBridgeApi.signMessage,
+    });
+    setWartBind(bound);
+
     let prevDeposited = 0n;
     let prevLocked = 0n;
     try {
@@ -1185,12 +1488,22 @@ export default function FungiblePool({
       txData?.data?.hash;
     if (!txHash) throw new Error('No Warthog tx hash from send');
 
+    // Convert human amount → E8 early so we can queue even if proof parsing lags
+    let earlyE8 = null;
+    try {
+      const n = Number(amt);
+      if (Number.isFinite(n) && n > 0) earlyE8 = Math.round(n * 1e8);
+    } catch {
+      /* */
+    }
+
     upsertPendingDeposit({
       txHash,
       owner,
       poolAddress: poolAddr,
       status: 'awaiting_confirm',
       amountHuman: amt,
+      amountE8: earlyE8 != null ? String(earlyE8) : null,
       fromAddress: wartBridgeApi?.address || null,
     });
     upsertFlow({
@@ -1198,12 +1511,30 @@ export default function FungiblePool({
       owner,
       depositTxHash: txHash,
       amountHuman: amt,
+      amountE8: earlyE8 != null ? String(earlyE8) : null,
       step: 'deposit_pending',
+      baselineDepositedE8: String(prevDeposited),
       note: 'Warthog mempool / confirming',
       replaceOpen: true,
     });
     refreshPending();
     refreshFlows();
+
+    // CRITICAL: enqueue as soon as we have a hash so a tab close / proof lag
+    // cannot leave WART on the pool with no relayer job (the "5 never credited" bug).
+    try {
+      toast.loading('Queueing credit (relayer)…', { id: 'pool' });
+      await enqueueCredit({
+        txHash,
+        amountE8: earlyE8,
+        fromAddress: wartBridgeApi?.address,
+        confirmations: 0,
+        baselineDepositedE8: String(prevDeposited),
+      });
+    } catch (e) {
+      console.warn('[pool] early enqueue failed', e);
+      // Continue — proof path will re-enqueue; still surface hash for Resume
+    }
 
     toast.loading('Waiting for Warthog confirmations…', { id: 'pool' });
     let proof = await pollConfirm(txHash, 1);
@@ -1213,20 +1544,20 @@ export default function FungiblePool({
       });
       refreshPending();
       throw new Error(
-        `Warthog tx ${String(txHash).slice(0, 12)}… sent but proof not ready. ` +
-          'Do not Deposit again — use Resume credit with this tx hash.',
+        `Warthog tx ${String(txHash).slice(0, 12)}… sent and queued. ` +
+          'Proof not ready yet — wait, then Resume if Available does not rise. Do not Deposit again.',
       );
     }
     const slim = slimDepositProof(proof);
     const toNorm = String(slim.transaction?.toAddress || '')
       .replace(/^0x/i, '')
       .toLowerCase();
-    const amtE8 = Number(slim.transaction?.amountE8 || 0);
+    const amtE8 = Number(slim.transaction?.amountE8 || earlyE8 || 0);
     if (!toNorm || amtE8 <= 0) {
       updatePendingStatus(txHash, 'stranded', { error: 'incomplete proof' });
       refreshPending();
       throw new Error(
-        'Deposit proof incomplete. WART may already be on the pool — use Resume (no re-send).',
+        `Deposit proof incomplete for ${String(txHash).slice(0, 12)}… — already queued; use Resume (no re-send).`,
       );
     }
     if (toNorm !== poolNorm) {
@@ -1237,12 +1568,13 @@ export default function FungiblePool({
       );
     }
 
-    toast.loading('Queueing automatic credit (no MetaMask)…', { id: 'pool' });
+    toast.loading('Refreshing credit queue with confirmed proof…', { id: 'pool' });
     await enqueueCredit({
       txHash,
       amountE8: amtE8,
       fromAddress: slim.transaction?.fromAddress || wartBridgeApi?.address,
       confirmations: slim.confirmations || slim.transaction?.confirmations,
+      baselineDepositedE8: String(prevDeposited),
     });
 
     toast.loading('Waiting for pool credit…', { id: 'pool' });
@@ -1333,44 +1665,104 @@ export default function FungiblePool({
     if (!amt) throw new Error('Enter amount');
     if (!wwartToken) throw new Error('wWART token not configured');
 
-    const before = (await fetchPoolInspect(owner).catch(() => null)) || {};
+    setActionStatus({ kind: 'info', text: 'Checking pool credit…' });
+    toast.loading('Checking pool credit…', { id: 'pool', duration: Infinity });
+
+    let before = (await fetchPoolInspect(owner).catch(() => null)) || {};
+    if (!before.available18 && !before.user && snap) before = snap;
     const prevClaim = userBn(before, 'claim18');
     const prevPortable = userBn(before, 'portable18');
+    const avail = poolBn(before, 'available18');
+    const deposited = userBn(before, 'depositedE8');
+    const want18 = humanTo18(amt);
+    if (avail <= 0n) {
+      throw new Error(
+        prevClaim > 0n || deposited > 0n
+          ? `No mint headroom left (your claim ${humanFrom18(prevClaim)}, pool available 0). Withdraw that claim or wait for more pool deposits.`
+          : 'No credited pool deposit yet. Wait until Your deposit / Pool available rises (Warthog confirmations + relayer) — do not send WART again. Then Mint claim.',
+      );
+    }
+    // Explicit Mint always adds `amount` (capped to remaining available).
+    // Do not skip just because an earlier claim already matches the box.
+    const mint18 = want18 > avail ? avail : want18;
+    const mintAmt = humanFrom18(mint18);
+    if (mint18 < want18) {
+      toast(
+        `Capping mint to ${mintAmt} (pool available). You already hold claim ${humanFrom18(prevClaim)}.`,
+        { id: 'pool-mint-cap', duration: 8000 },
+      );
+    }
+
     const seen = await snapshotNoticePayloads();
+    let rejectErr = null;
 
-    toast.loading('Confirm mint in wallet…', { id: 'pool' });
-    await send({
-      type: 'pool_mint_wwart',
-      amount: amt,
-      tokenAddress: wwartToken,
+    setActionStatus({
+      kind: 'info',
+      text: `Confirm mint of ${mintAmt} more (you already have ${humanFrom18(prevClaim)}; pool available ${humanFrom18(avail)}). MetaMask popup.`,
     });
-    toast.loading('Confirming mint on rollup…', { id: 'pool' });
+    toast.loading(
+      `Confirm mint of ${mintAmt} more in MetaMask — check the extension popup`,
+      { id: 'pool', duration: Infinity },
+    );
+    // Skip in-page preview: one extra dialog was eating the toast and
+    // looking like a hang. Payload is tiny (type/amount/token).
+    await send(
+      {
+        type: 'pool_mint_wwart',
+        amount: mintAmt,
+        tokenAddress: String(wwartToken).toLowerCase(),
+      },
+      { skipConfirm: true },
+    );
+    setActionStatus({
+      kind: 'info',
+      text: 'Mint submitted to Anvil — waiting for rollup inspect (up to ~45s)…',
+    });
+    toast.loading('Mint submitted — waiting for rollup…', {
+      id: 'pool',
+      duration: Infinity,
+    });
 
-    // Inspect is source of truth (notices are best-effort)
     void waitForNotice('pool_wwart_minted', {
-      timeoutMs: 25000,
+      timeoutMs: 45000,
+      rejectType: ['pool_mint_rejected', 'wwart_mint_rejected'],
       matchOwner: owner,
       seenPayloads: seen,
-    }).catch(() => null);
+    }).catch((e) => {
+      if (e?.notice || String(e?.message || '').startsWith('Rollup rejected')) {
+        rejectErr = e;
+      }
+      return null;
+    });
 
     const after = await waitForPoolState(
       owner,
       (s) =>
-        userBn(s, 'claim18') > prevClaim || userBn(s, 'portable18') > prevPortable,
+        rejectErr ||
+        userBn(s, 'claim18') > prevClaim ||
+        userBn(s, 'portable18') > prevPortable,
       { timeoutMs: 45000 },
     );
+    if (rejectErr) throw rejectErr;
     if (
       after &&
       (userBn(after, 'claim18') > prevClaim ||
         userBn(after, 'portable18') > prevPortable)
     ) {
-      advanceFlowForOwner(owner, 'minted', { amountHuman: amt });
+      advanceFlowForOwner(owner, 'minted', { amountHuman: mintAmt });
       refreshFlows();
-      toast.success(`Minted pool claim ${amt}`, { id: 'pool' });
+      setActionStatus({
+        kind: 'ok',
+        text: `Minted ${mintAmt} more (claim now ${humanFrom18(userBn(after, 'claim18'))}). Withdraw when you want wWART.`,
+      });
+      toast.success(`Minted ${mintAmt} more pool claim`, {
+        id: 'pool',
+        duration: 10000,
+      });
       return;
     }
     throw new Error(
-      'Mint not confirmed on inspect. Refresh — if Your claim increased it worked. RPC: https://cartesi-bridge.duckdns.org/rpc',
+      'Mint not confirmed on inspect. Refresh — if Your claim increased it worked. If Your deposit is still 0, wait for confirmations then mint (do not re-deposit). RPC: https://cartesi-bridge.duckdns.org/rpc',
     );
   };
 
@@ -1393,7 +1785,10 @@ export default function FungiblePool({
         : await maxOwnerVoucherInputIndex(owner);
     const seen = await snapshotNoticePayloads();
 
-    toast.loading('Confirm withdraw in wallet…', { id: 'pool' });
+    toast.loading(
+      'Withdraw: confirm the preview dialog, then MetaMask…',
+      { id: 'pool', duration: 20000 },
+    );
     await send({ type: 'pool_withdraw_wwart', amount: amt });
     toast.loading('Confirming voucher on rollup…', { id: 'pool' });
 
@@ -1466,17 +1861,43 @@ export default function FungiblePool({
       );
     }
     if (!send) throw new Error('Rollup send unavailable');
-    if (!wartBridgeApi?.sendTransaction || !wartBridgeApi?.getWartTxProof) {
-      throw new Error('Unlock Warthog wallet first (needed to send real WART)');
-    }
     const amt = String(amount || '').trim();
     if (!amt) throw new Error('Enter amount');
 
-    toast.loading(`1-click: depositing ${amt} WART…`, { id: 'pool' });
-    await liveDeposit();
+    // Resume from *this owner's* rollup truth — never skip deposit just because
+    // the shared pool still has someone else's available headroom.
+    const want18 = humanTo18(amt);
+    let insp = (await fetchPoolInspect(owner).catch(() => null)) || {};
+    let claim = userBn(insp, 'claim18');
+    let portable = userBn(insp, 'portable18');
+    let userDep18 = userBn(insp, 'depositedE8') * 10n ** 10n;
 
-    toast.loading('1-click: mint claim…', { id: 'pool' });
-    await liveMint();
+    if (claim >= want18 || portable >= want18 || userDep18 >= want18) {
+      toast.loading(
+        '1-click: already credited on rollup — skipping deposit…',
+        { id: 'pool' },
+      );
+    } else {
+      if (!wartBridgeApi?.sendTransaction || !wartBridgeApi?.getWartTxProof) {
+        throw new Error('Unlock Warthog wallet first (needed to send real WART)');
+      }
+      toast.loading(`1-click: depositing ${amt} WART…`, { id: 'pool' });
+      await liveDeposit();
+      insp = (await fetchPoolInspect(owner).catch(() => null)) || {};
+      claim = userBn(insp, 'claim18');
+      portable = userBn(insp, 'portable18');
+      userDep18 = userBn(insp, 'depositedE8') * 10n ** 10n;
+    }
+
+    if (claim >= want18 || portable >= want18) {
+      toast.loading('1-click: claim already minted — skipping mint…', { id: 'pool' });
+    } else {
+      toast.loading('1-click: mint claim…', { id: 'pool' });
+      await liveMint();
+      insp = (await fetchPoolInspect(owner).catch(() => null)) || {};
+      claim = userBn(insp, 'claim18');
+      portable = userBn(insp, 'portable18');
+    }
 
     const minInputIndex = await maxOwnerVoucherInputIndex(owner);
     toast.loading('1-click: withdraw voucher…', { id: 'pool' });
@@ -1508,7 +1929,11 @@ export default function FungiblePool({
     }
   };
 
-  /** Hot-wallet payout after pool_release_ticket (redeem or burn auto-unlock). */
+  /**
+   * Release-ticket payout: under Path A3 opens 3-of-4 threshold request, then
+   * waits for faux/browser signers to assemble a real Warthog transfer.
+   * Single-key hot path still works if POOL_THRESHOLD_MODE is off.
+   */
   const payoutTicket = async (ticket, fallbackTo, amtLabel) => {
     if (!ticket?.ticketId) throw new Error('Missing release ticket id');
     setLastTicket(ticket);
@@ -1522,22 +1947,140 @@ export default function FungiblePool({
         toAddress: to,
         amountE8: ticket.amountE8,
         owner,
+        useThreshold: true,
+        forceHot: false,
       }),
     });
-    toast.success(
-      pay.alreadyPaid
-        ? `Already paid ${pay.amountHuman || amtLabel || ''} WART`
-        : `Paid ${pay.amountHuman || amtLabel || ''} WART · tx ${String(pay.txHash || '').slice(0, 12)}…`,
-      { id: 'pool', duration: 10000 },
+
+    // Immediate single-key (toggle OFF) or already paid
+    if (pay.txHash || pay.alreadyPaid || pay.skipped || pay.mode === 'hot-wallet') {
+      toast.success(
+        pay.alreadyPaid
+          ? `Already paid ${pay.amountHuman || amtLabel || ''} WART`
+          : pay.skipped
+            ? `Payout skipped: ${pay.skipReason || 'policy'}`
+            : `Paid ${pay.amountHuman || amtLabel || ''} WART · hot wallet · tx ${String(pay.txHash || '').slice(0, 12)}…`,
+        { id: 'pool', duration: 10000 },
+      );
+      await refresh();
+      return pay;
+    }
+
+    // Path A4: 3P Lindell — poll pool3p_ticket until paid
+    const ticketId = pay.ticketId || ticket.ticketId;
+    if (pay.mode === 'pool-3p' || pay.custody === '3p-d1-d2') {
+      toast.loading(`3P pool: waiting for d1 + d2 on ${ticketId}…`, { id: 'pool' });
+      const deadline = Date.now() + 180000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 1500));
+        let st = null;
+        try {
+          st = await poolApi('/api/pool', {
+            method: 'POST',
+            body: JSON.stringify({ action: 'pool3p_ticket', ticketId }),
+          });
+        } catch {
+          continue;
+        }
+        const status = String(st.status || '');
+        const rawTx = st.txHash || st.payout?.txHash;
+        const sighash = st.hashHex || st.prep?.hashHex;
+        const realTx =
+          rawTx && String(rawTx).toLowerCase() !== String(sighash || '').toLowerCase()
+            ? rawTx
+            : null;
+        if (realTx || status === 'paid' || st.payout?.ok) {
+          toast.success(
+            `Released ${amtLabel || humanFromE8(ticket.amountE8) || ''} WART via 3P Lindell` +
+              (realTx ? ` · ${realTx}` : ''),
+            { id: 'pool', duration: 14000 },
+          );
+          await refresh();
+          return { ok: true, ticketId, mode: 'pool-3p', txHash: realTx, ...st };
+        }
+        const wait = (st.waitingOn || []).join('+') || (status || 'signing');
+        toast.loading(
+          `3P Lindell · ${wait} · d1 ${st.haveR1 ? 'in' : '…'} · d2 ${st.haveD2 ? 'in' : '…'}`,
+          { id: 'pool' },
+        );
+      }
+      throw new Error(
+        `3P payout timeout for ${ticketId} — keep both browser d1 and d2 tabs signed in`,
+      );
+    }
+
+    // Path A3: opened for 3-of-4 signers — poll until real transfer lands
+    const isThreshold =
+      pay.mode === 'threshold-3of4' || pay.opened || pay.alreadyOpen;
+    if (!isThreshold) {
+      toast.success(
+        pay.note || `Payout accepted for ${amtLabel || ticketId}`,
+        { id: 'pool', duration: 8000 },
+      );
+      return pay;
+    }
+
+    toast.loading(
+      `3-of-4 threshold: waiting for signers on ${ticketId}…`,
+      { id: 'pool' },
     );
-    return pay;
+    const deadline = Date.now() + 90000;
+    let lastCount = 0;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1500));
+      let st = null;
+      try {
+        st = await poolApi(
+          `/api/pool?threshold=1&ticket=${encodeURIComponent(ticketId)}`,
+        );
+      } catch {
+        continue;
+      }
+      setThresholdSt((prev) => ({ ...(prev || {}), ...st, open: prev?.open }));
+      const count = Number(st.count || 0);
+      const need = Number(st.need || 3);
+      if (count !== lastCount && st.status !== 'paid' && st.status !== 'lab_paid') {
+        lastCount = count;
+        toast.loading(
+          `3-of-4 signers: ${count}/${need} shares for ${ticketId}…`,
+          { id: 'pool' },
+        );
+      }
+      if (st.status === 'paid' || st.paid?.txHash) {
+        const tx = st.paid?.txHash || st.payout?.txHash;
+        toast.success(
+          `Released ${amtLabel || humanFromE8(ticket.amountE8) || ''} WART via 3-of-4` +
+            (tx ? ` · tx ${String(tx).slice(0, 12)}…` : ''),
+          { id: 'pool', duration: 12000 },
+        );
+        await refresh();
+        return { ok: true, ...st.paid, ticketId, mode: 'threshold-3of4', txHash: tx };
+      }
+      if (st.status === 'lab_paid') {
+        toast.success(`Lab 3-of-4 complete (no chain transfer)`, {
+          id: 'pool',
+          duration: 8000,
+        });
+        await refresh();
+        return { ok: true, labDemo: true, ticketId, ...st.paid };
+      }
+      if (st.status === 'failed') {
+        throw new Error(
+          st.error ||
+            '3-of-4 assemble failed — check faux-signers logs / pool balance',
+        );
+      }
+    }
+    throw new Error(
+      `3-of-4 payout timeout for ${ticketId} — signers may be down (systemctl status cartesi-bridge-pool-faux-signers)`,
+    );
   };
 
   /**
    * Burn pool claim (A-α minter) or A-β holder redeem.
    * Filled claims / bearer wWART need portal inventory first.
    * Success = personal claim drops OR global claimed/locked drops (holder).
-   * Then hot-wallet payout if release ticket found.
+   * Then 3-of-4 (or hot) payout if release ticket found.
    */
   const liveBurn = async () => {
     if (!send) throw new Error('Rollup send unavailable');
@@ -1557,9 +2100,9 @@ export default function FungiblePool({
 
     toast.loading(
       to
-        ? 'Confirm burn / holder redeem in wallet…'
-        : 'Confirm burn in wallet…',
-      { id: 'pool' },
+        ? 'Burn/redeem: confirm the preview dialog, then MetaMask…'
+        : 'Burn: confirm the preview dialog, then MetaMask…',
+      { id: 'pool', duration: 20000 },
     );
     await send({
       type: 'pool_burn_wwart',
@@ -1709,7 +2252,10 @@ export default function FungiblePool({
     const prevRedeemed = userBn(before, 'redeemedE8');
     const seen = await snapshotNoticePayloads();
 
-    toast.loading('Confirm redeem in wallet…', { id: 'pool' });
+    toast.loading(
+      'Redeem: confirm the preview dialog, then MetaMask…',
+      { id: 'pool', duration: 20000 },
+    );
     await send({
       type: 'pool_redeem',
       amount: amt,
@@ -1817,7 +2363,9 @@ export default function FungiblePool({
       onRefreshMmWwart?.();
       refreshPending();
     } catch (e) {
-      toast.error(e?.message || String(e), { id: 'pool', duration: 12000 });
+      const msg = e?.message || String(e);
+      setActionStatus({ kind: 'err', text: msg });
+      toast.error(msg, { id: 'pool', duration: 20000 });
       refreshPending();
     } finally {
       setBusy(false);
@@ -1847,9 +2395,11 @@ export default function FungiblePool({
       className="wi-panel fungible-pool"
       style={{
         marginBottom: '1rem',
-        border: '1px solid rgba(0, 255, 204, 0.35)',
+        border: '1px solid rgba(0, 255, 204, 0.4)',
+        // Near-solid so tropical page bg doesn't wash out pool copy (desktop Chrome/Brave)
         background:
-          'linear-gradient(165deg, rgba(0,40,36,0.55) 0%, rgba(0,0,0,0.35) 100%)',
+          'linear-gradient(165deg, rgba(6, 28, 26, 0.96) 0%, rgba(8, 10, 12, 0.97) 100%)',
+        boxShadow: '0 8px 28px rgba(0, 0, 0, 0.55)',
       }}
     >
       <header
@@ -1877,6 +2427,19 @@ export default function FungiblePool({
             }}
           >
             Path A · real WART
+          </span>
+          <span
+            title="Release needs d_dapp + browser d1 + browser d2 (3P ECDSA). Hot key retired."
+            style={{
+              fontSize: '0.68rem',
+              padding: '0.12rem 0.4rem',
+              borderRadius: 6,
+              background: 'rgba(253,185,19,0.22)',
+              color: '#FDB913',
+              fontWeight: 700,
+            }}
+          >
+            3P pool · d_dapp + d1 + d2
           </span>
         </div>
         <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }}>
@@ -1926,8 +2489,71 @@ export default function FungiblePool({
         Withdraw wWART or <strong>Redeem WART</strong>.{' '}
         <strong>A-β holder redeem:</strong> any holder with portal pool-wWART can burn;
         payout comes from <em>shared pool collateral</em> (FIFO across depositors — not only
-        your own deposit). <strong>No cosigner / personal vaults</strong>.
+        your own deposit). <strong>Fungible peg</strong> (unlike ZK Vault personal custody).
       </p>
+      <div
+        style={{
+          margin: '0 0 0.65rem',
+          fontSize: '0.78rem',
+          lineHeight: 1.45,
+          color: '#ffe6a8',
+          padding: '0.55rem 0.65rem',
+          borderRadius: 8,
+          background:
+            'linear-gradient(120deg, rgba(50, 36, 0, 0.95) 0%, rgba(12, 14, 16, 0.96) 100%)',
+          border: '1px solid rgba(253,185,19,0.55)',
+        }}
+      >
+        <div style={{ fontWeight: 700, fontSize: '0.82rem', marginBottom: 4 }}>
+          Release custody:{' '}
+          <span style={{ color: '#FDB913' }}>3P vault (d_dapp + d1 + d2)</span>
+        </div>
+        <div className="wi-muted" style={{ fontSize: '0.72rem', color: 'inherit', opacity: 0.92 }}>
+          Same fungible deposit/mint. After burn/redeem, WART leaves only as a
+          3P Lindell ECDSA: browsers hold <strong>d1</strong> and <strong>d2</strong>,
+          VPS holds only <strong>d_dapp</strong> + Enc(d1). No hot-key fallback.
+          A dropped seat is rebuilt from the orbit pack (same Q). Extra tabs vote
+          in orbit and do not hold the spend shares.
+        </div>
+        <div
+          style={{
+            marginTop: 8,
+            fontSize: '0.72rem',
+            fontFamily: 'monospace',
+            opacity: 0.95,
+            wordBreak: 'break-all',
+          }}
+        >
+          3P address: {FUNGIBLE_POOL.address}
+          {pool3pSt?.configured ? (
+            <>
+              <br />
+              d1: {pool3pSt.d1Live ? `${String(pool3pSt.holder1).slice(0, 14)}… live` : pool3pSt.holder1 ? 'assigned' : 'vacant (rebuild from pack)'}
+              {' · '}
+              d2: {pool3pSt.d2Live ? `${String(pool3pSt.holder2).slice(0, 14)}… live` : pool3pSt.holder2 ? 'assigned' : 'vacant (rebuild from pack)'}
+              {pool3pSt.orbit ? (
+                <>
+                  <br />
+                  orbit: {pool3pSt.orbit.liveCount || 0} live
+                </>
+              ) : null}
+              {(pool3pSt.paid || []).length ? (
+                <>
+                  <br />
+                  last 3P pay:{' '}
+                  {String((pool3pSt.paid[0] || {}).txHash || '').slice(0, 16) || 'submitted'}
+                  {(pool3pSt.paid[0] || {}).txHash ? '…' : ''}
+                </>
+              ) : null}
+            </>
+          ) : (
+            <>
+              <br />
+              3P status: {pool3pSt ? 'not configured' : 'loading…'}
+            </>
+          )}
+        </div>
+      </div>
       {snap?.redeemPhase === 'A-beta' || snap?.holderRedeem ? (
         <p
           style={{
@@ -1980,19 +2606,39 @@ export default function FungiblePool({
             style={{ marginBottom: '0.65rem', fontSize: '0.78rem' }}
           >
             <div className="sw-meta-row">
-              <span className="sw-meta-k">Pool address</span>
+              <span className="sw-meta-k">3P pool (send here)</span>
               <span
                 className="sw-meta-v"
                 style={{
                   fontFamily: 'monospace',
                   fontSize: '0.7rem',
                   wordBreak: 'break-all',
+                  color: '#FDB913',
                 }}
-                title={poolAddr}
+                title={FUNGIBLE_POOL.address}
               >
-                {poolAddr}
+                {FUNGIBLE_POOL.address}
               </span>
             </div>
+            {rollupPoolAddr &&
+            String(rollupPoolAddr).toLowerCase() !==
+              String(FUNGIBLE_POOL.address).toLowerCase() ? (
+              <div className="sw-meta-row">
+                <span className="sw-meta-k">Rollup inspect (legacy)</span>
+                <span
+                  className="sw-meta-v"
+                  style={{
+                    fontFamily: 'monospace',
+                    fontSize: '0.7rem',
+                    wordBreak: 'break-all',
+                    opacity: 0.75,
+                  }}
+                  title="Cartesi machine still lists the old empty address until restart"
+                >
+                  {rollupPoolAddr}
+                </span>
+              </div>
+            ) : null}
             <div className="sw-meta-row">
               <span className="sw-meta-k">Data</span>
               <span className="sw-meta-v">{snap?.source || '—'}</span>
@@ -2051,7 +2697,7 @@ export default function FungiblePool({
                 borderRadius: 8,
                 border: '1px solid rgba(0, 255, 204, 0.45)',
                 background:
-                  'linear-gradient(120deg, rgba(0,80,70,0.45) 0%, rgba(0,30,40,0.4) 100%)',
+                  'linear-gradient(120deg, rgba(0, 70, 62, 0.92) 0%, rgba(10, 18, 22, 0.95) 100%)',
               }}
             >
               <div
@@ -2080,10 +2726,16 @@ export default function FungiblePool({
                     busy ||
                     !owner ||
                     !signer ||
-                    !wartBridgeApi?.sendTransaction
+                    !wartBridgeApi?.sendTransaction ||
+                    bindBlocked
                   }
                   onClick={() => run('one_click_wwart')}
-                  title="Deposit WART → mint claim → withdraw → execute voucher (MetaMask gets wWART)"
+                  title={
+                    bindBlocked
+                      ? wartBind?.error ||
+                        'This Warthog wallet is bound to another L1 address'
+                      : 'Deposit WART → mint claim → withdraw → execute voucher (MetaMask gets wWART)'
+                  }
                   style={{
                     display: 'inline-flex',
                     alignItems: 'center',
@@ -2117,6 +2769,39 @@ export default function FungiblePool({
               ) : null}
             </div>
           )}
+
+          {actionStatus ? (
+            <div
+              role="status"
+              style={{
+                margin: '0 0 0.65rem',
+                padding: '0.5rem 0.65rem',
+                borderRadius: 8,
+                fontSize: '0.78rem',
+                lineHeight: 1.4,
+                border:
+                  actionStatus.kind === 'err'
+                    ? '1px solid rgba(255,120,100,0.55)'
+                    : actionStatus.kind === 'ok'
+                      ? '1px solid rgba(0,255,204,0.45)'
+                      : '1px solid rgba(240,198,116,0.5)',
+                background:
+                  actionStatus.kind === 'err'
+                    ? 'rgba(60,16,12,0.85)'
+                    : actionStatus.kind === 'ok'
+                      ? 'rgba(0,40,36,0.85)'
+                      : 'rgba(40,30,0,0.85)',
+                color:
+                  actionStatus.kind === 'err'
+                    ? '#ffb4a2'
+                    : actionStatus.kind === 'ok'
+                      ? '#7dffa3'
+                      : '#ffe6a8',
+              }}
+            >
+              {actionStatus.text}
+            </div>
+          ) : null}
 
           <div
             style={{
@@ -2155,17 +2840,27 @@ export default function FungiblePool({
             <button
               type="button"
               className="btn primary small"
-              disabled={busy || !owner}
+              disabled={busy || !owner || bindBlocked}
               onClick={() => run('deposit')}
-              title="Send WART once; relayer credits rollup automatically"
+              title={
+                bindBlocked
+                  ? wartBind?.error ||
+                    'This Warthog wallet is bound to another L1 address'
+                  : 'Send WART once; relayer credits rollup automatically'
+              }
             >
               Deposit WART
             </button>
             <button
               type="button"
               className="btn secondary small"
-              disabled={busy || !owner}
+              disabled={busy || !owner || !send || !signer}
               onClick={() => run('mint')}
+              title={
+                !signer
+                  ? 'Connect MetaMask first — mint must come from your L1 address'
+                  : 'Mint a pool claim against your credited WART'
+              }
             >
               Mint claim
             </button>
@@ -2224,29 +2919,76 @@ export default function FungiblePool({
               Unlock Warthog below to deposit real WART into the pool.
             </p>
           )}
+          {bindBlocked && (
+            <p
+              className="wi-muted"
+              style={{ fontSize: '0.8rem', color: '#ffb4a2', marginTop: '0.45rem' }}
+            >
+              {wartBind?.error ||
+                'This Warthog wallet is already bound to another L1 address. Switch MetaMask to that account — WART will not be sent from here.'}
+            </p>
+          )}
+          {!bindBlocked && wartBind?.needsRegister && owner && wartFrom && (
+            <p
+              className="wi-muted"
+              style={{ fontSize: '0.8rem', color: '#f0c674', marginTop: '0.45rem' }}
+            >
+              First deposit will bind this Warthog wallet to {String(owner).slice(0, 10)}…
+              (Warthog + MetaMask signatures). Nobody else can claim it after that.
+            </p>
+          )}
 
-          {mode === 'live' && owner && openFlows.length > 0 && (
+          {mode === 'live' && owner && (openFlows.length > 0 || pendingList.length > 0) && (
             <div
               style={{
                 marginTop: '0.65rem',
                 padding: '0.65rem 0.75rem',
                 borderRadius: 8,
                 border: '1px solid rgba(0, 255, 204, 0.4)',
-                background: 'rgba(0, 40, 36, 0.45)',
+                background: 'rgba(0, 40, 36, 0.92)',
               }}
             >
               <div
                 style={{
-                  fontSize: '0.8rem',
-                  fontWeight: 700,
-                  color: '#00ffcc',
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '0.4rem',
                   marginBottom: '0.35rem',
                 }}
               >
-                Pending pool cycle
-                <span className="wi-muted" style={{ fontWeight: 500, marginLeft: 6 }}>
-                  (like mempool — stays until WART is back)
-                </span>
+                <div
+                  style={{
+                    fontSize: '0.8rem',
+                    fontWeight: 700,
+                    color: '#00ffcc',
+                  }}
+                >
+                  Pending pool cycle
+                  <span className="wi-muted" style={{ fontWeight: 500, marginLeft: 6 }}>
+                    (browser tracker — dismiss if 1-click hung)
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="btn secondary small"
+                  disabled={busy}
+                  title="Clear stuck 1-click / deposit trackers in this browser. Does not move WART or change rollup Available/Used/Locked."
+                  onClick={() => {
+                    const nFlow = wipeFlowsForOwner(owner);
+                    const nPend = clearPendingForOwner(owner);
+                    refreshFlows();
+                    refreshPending();
+                    void refresh();
+                    toast.success(
+                      `Cleared pipeline tracker (${nFlow} cycle row${nFlow === 1 ? '' : 's'}, ${nPend} pending)`,
+                      { id: 'pool-clear-pipeline', duration: 4500 },
+                    );
+                  }}
+                >
+                  Clear stuck pipeline
+                </button>
               </div>
               {openFlows.map((flow) => {
                 const cur = stepMeta(flow.step);
@@ -2294,6 +3036,10 @@ export default function FungiblePool({
                     <p className="wi-muted" style={{ fontSize: '0.72rem', margin: '0 0 0.4rem' }}>
                       {cur.hint}
                       {flow.note ? ` · ${flow.note}` : ''}
+                      {flow.step === 'deposit_pending' ||
+                      flow.step === 'credit_pending'
+                        ? ' · Confirmations first — mint is the next button after Your deposit rises.'
+                        : ''}
                     </p>
                     <div
                       style={{
