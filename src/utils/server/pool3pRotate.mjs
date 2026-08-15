@@ -123,9 +123,16 @@ export async function inspectPoolSnap() {
 }
 
 export async function machineSupportsSetAddress() {
+  const r = loadRotate();
+  if (r.machineHasSetAddress) return true;
   try {
     const snap = await inspectPoolSnap();
-    return !!(snap && Object.prototype.hasOwnProperty.call(snap, 'rotationEpoch'));
+    const ok = !!(snap && Object.prototype.hasOwnProperty.call(snap, 'rotationEpoch'));
+    if (ok) {
+      r.machineHasSetAddress = true;
+      await saveRotate(r);
+    }
+    return ok;
   } catch {
     return false;
   }
