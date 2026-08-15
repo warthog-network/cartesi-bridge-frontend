@@ -1698,10 +1698,10 @@ export default function FungiblePool({
 
     setActionStatus({
       kind: 'info',
-      text: `Confirm mint of ${mintAmt} more (you already have ${humanFrom18(prevClaim)}; pool available ${humanFrom18(avail)}). MetaMask popup.`,
+      text: `Sign mint of ${mintAmt} in MetaMask (InputBox on Anvil 31337). Deposit is already credited — this only records the claim.`,
     });
     toast.loading(
-      `Confirm mint of ${mintAmt} more in MetaMask — check the extension popup`,
+      `Sign mint of ${mintAmt} in MetaMask (InputBox.addInput). Approve the tx, not a network dialog.`,
       { id: 'pool', duration: Infinity },
     );
     // Skip in-page preview: one extra dialog was eating the toast and
@@ -1762,7 +1762,7 @@ export default function FungiblePool({
       return;
     }
     throw new Error(
-      'Mint not confirmed on inspect. Refresh — if Your claim increased it worked. If Your deposit is still 0, wait for confirmations then mint (do not re-deposit). RPC: https://cartesi-bridge.duckdns.org/rpc',
+      'Mint InputBox was sent (or timed out) but inspect still shows claim 0. Refresh. If claim is still 0 the wallet tx never landed — MetaMask → Advanced → Clear activity tab data, stay on Anvil 31337, mint again. Do not re-deposit WART.',
     );
   };
 

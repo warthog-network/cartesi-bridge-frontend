@@ -841,20 +841,25 @@ export default function WalletIsland() {
       );
     }
 
-    // 2) Point MetaMask at public RPC (fixes stale localhost:8545 for chain 31337)
+    // 2) Switch if needed. Do NOT forceAdd on every mint — that pops MetaMask
+    // for a network dialog instead of InputBox.addInput.
+    const eth = getEip1193();
+    if (!eth) throw new Error('No browser wallet');
+    let chainHex = null;
     try {
-      await ensureCartesiNetwork({ silent: true, forceAdd: true });
+      chainHex = await eth.request({ method: 'eth_chainId' });
     } catch {
+      /* */
+    }
+    if (Number.parseInt(String(chainHex || '0'), 16) !== wantChain) {
       try {
         await ensureCartesiNetwork({ silent: true });
       } catch {
-        /* user may already be on chain */
+        /* add/switch may have been cancelled */
       }
     }
 
     // 3) Rebind signer after network change
-    const eth = getEip1193();
-    if (!eth) throw new Error('No browser wallet');
     const prov = new ethers.BrowserProvider(eth);
     const sign = await prov.getSigner();
     setProvider(prov);
@@ -875,19 +880,25 @@ export default function WalletIsland() {
       );
     }
 
-    // 4) Wallet’s own RPC must answer (catches localhost:8545 still configured)
+    // 4) If the wallet's own RPC is dead (localhost:8545 after a VPS Anvil
+    // wipe), rewrite the chain URL. Only then do we open a network dialog.
     try {
       await Promise.race([
         prov.getBlockNumber(),
         new Promise((_, rej) =>
-          setTimeout(() => rej(new Error('wallet rpc timeout')), 10000),
+          setTimeout(() => rej(new Error('wallet rpc timeout')), 8000),
         ),
       ]);
     } catch {
+      try {
+        await ensureCartesiNetwork({ silent: true, forceAdd: true });
+      } catch {
+        /* */
+      }
       throw new Error(
-        `MetaMask RPC for chain ${wantChain} is dead (often still http://localhost:8545). ` +
-          `Anvil on the server IS up. Fix: MetaMask → Settings → Networks → chain ${wantChain} → ` +
-          `RPC URL = ${publicRpc} (or remove the network and reconnect).`,
+        `MetaMask RPC for chain ${wantChain} is stale (often http://localhost:8545 after Anvil reset). ` +
+          `Approve the network update, then: MetaMask → Settings → Advanced → Clear activity tab data. ` +
+          `RPC must be ${publicRpc}.`,
       );
     }
     return sign;
@@ -1423,6 +1434,15 @@ export default function WalletIsland() {
 
       // Server Anvil is usually up; MetaMask often still points 31337 at localhost:8545.
       const liveSigner = await ensureL1ReadyForSend();
+      const publicRpc =
+        (getNetwork() || ACTIVE_NETWORK)?.rpcUrl ||
+        RPC_URL ||
+        'https://cartesi-bridge.duckdns.org/rpc';
+      const pub = new ethers.JsonRpcProvider(publicRpc);
+      const from = await liveSigner.getAddress();
+      // After `cartesi run` wipe, MetaMask keeps a stale nonce → "nonce too high".
+      const nonce = await pub.getTransactionCount(from, 'pending');
+      const fee = await pub.getFeeData();
 
       // UTF-8 JSON bytes — MetaMask may offer a UTF-8 view of the `input` param
       const message = JSON.stringify(payload);
@@ -1430,26 +1450,32 @@ export default function WalletIsland() {
       // Gas scales with calldata; 200k was tight for larger InputBox payloads (e.g. proofs).
       const gasLimit = BigInt(Math.min(1_500_000, 80_000 + payloadBytes.length * 16 + 50_000));
       const inputBox = new ethers.Contract(INPUT_BOX_ADDRESS, INPUT_BOX_ABI, liveSigner);
-      const tx = await inputBox.addInput(DAPP_ADDRESS, payloadBytes, { gasLimit });
-      // Never hang forever if wallet RPC stops returning receipts.
-      const publicRpc =
-        (getNetwork() || ACTIVE_NETWORK)?.rpcUrl ||
-        RPC_URL ||
-        'https://cartesi-bridge.duckdns.org/rpc';
-      const receipt = await Promise.race([
-        tx.wait(),
-        new Promise((_, reject) =>
-          setTimeout(
-            () =>
-              reject(
-                new Error(
-                  `L1 receipt timeout (90s). Server Anvil is fine — MetaMask network 31337 must use RPC ${publicRpc} (not localhost:8545).`,
-                ),
-              ),
-            90_000,
-          ),
-        ),
-      ]);
+      toast.loading('Confirm InputBox.addInput in MetaMask…', { duration: 20000 });
+      let tx;
+      try {
+        tx = await inputBox.addInput(DAPP_ADDRESS, payloadBytes, {
+          gasLimit,
+          nonce,
+          maxFeePerGas: fee.maxFeePerGas ?? undefined,
+          maxPriorityFeePerGas: fee.maxPriorityFeePerGas ?? undefined,
+        });
+      } catch (sendErr) {
+        const m = sendErr?.message || String(sendErr);
+        if (/nonce too high|nonce has already been used|NONCE/i.test(m)) {
+          throw new Error(
+            'Anvil was reset — MetaMask has a stale nonce. MetaMask → Settings → Advanced → Clear activity tab data, then mint again.',
+          );
+        }
+        if (/user rejected|denied/i.test(m)) throw sendErr;
+        throw new Error(`InputBox send failed: ${m}`);
+      }
+      // Wait on the public RPC, not MetaMask's (often localhost after wipe).
+      const receipt = await pub.waitForTransaction(tx.hash, 1, 90_000);
+      if (!receipt) {
+        throw new Error(
+          `L1 receipt timeout (90s) for ${tx.hash}. Check Anvil RPC ${publicRpc}.`,
+        );
+      }
       // ethers-v6: receipt.hash (v5 used transactionHash)
       const txHash = receipt?.hash || receipt?.transactionHash || tx?.hash || '';
       if (successMessage) {
