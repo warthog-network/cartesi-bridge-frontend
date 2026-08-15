@@ -388,7 +388,64 @@ export async function POST({ request }) {
 
     if (action === 'pool3p_status') {
       await maybeAbandonStaleSeats().catch(() => []);
-      return json(200, { ...pool3pPublicStatus(), orbit: orbitSnapshot() });
+      let rotation = null;
+      try {
+        const { tickRotation } = await import('../../utils/server/pool3pRotate.mjs');
+        rotation = await tickRotation();
+      } catch {
+        /* */
+      }
+      return json(200, { ...pool3pPublicStatus(), orbit: orbitSnapshot(), rotation });
+    }
+    if (action === 'pool3p_birth_next') {
+      const { birthNextSeat } = await import('../../utils/server/pool3pRotate.mjs');
+      return json(200, await birthNextSeat({
+        signerId: body.signerId,
+        role: body.role,
+        P: body.P,
+        encD1: body.encD1,
+        paillierN: body.paillierN,
+        paillierG: body.paillierG,
+      }));
+    }
+    if (action === 'pool3p_announce_next') {
+      const { tickRotation, submitPoolAdvance } = await import('../../utils/server/pool3pRotate.mjs');
+      const rot = await tickRotation();
+      if (!rot.next?.address) return json(400, { error: 'next Q not ready' });
+      return json(200, await submitPoolAdvance({
+        type: 'pool_announce_next',
+        address: rot.next.address,
+        publicKey: rot.next.publicKey,
+      }));
+    }
+    if (action === 'pool3p_set_address') {
+      const {
+        tickRotation,
+        submitPoolAdvance,
+        activateNextDapp,
+      } = await import('../../utils/server/pool3pRotate.mjs');
+      const rot = await tickRotation();
+      const nextAddr = rot.next?.address;
+      const addr = String(body.address || nextAddr || '')
+        .replace(/^0x/i, '')
+        .toLowerCase();
+      if (!nextAddr || addr !== String(nextAddr).toLowerCase()) {
+        return json(400, {
+          error: 'pool_set_address only accepts the client-born next Q',
+          next: nextAddr || null,
+        });
+      }
+      const posted = await submitPoolAdvance({
+        type: 'pool_set_address',
+        address: addr,
+        accountId: body.accountId || null,
+        sweepTxHash: body.sweepTxHash || null,
+      });
+      const act = await activateNextDapp({
+        sweepTxHash: body.sweepTxHash,
+        accountId: body.accountId,
+      }).catch((e) => ({ ok: false, error: e.message }));
+      return json(200, { ...posted, activate: act });
     }
     if (action === 'pool3p_heartbeat' || action === 'orbit_heartbeat') {
       return json(200, await heartbeatPool3p({
@@ -668,8 +725,19 @@ export async function POST({ request }) {
 
     if (action === 'request_credit' || action === 'credit') {
       const pub = await getPoolHotPublic();
+      let inspected = null;
+      try {
+        inspected = await fetchRollupPoolInspect('');
+      } catch {
+        /* */
+      }
+      const pool3p = pool3pOn() ? pool3pPublicStatus() : null;
       const poolAddress =
-        body.poolAddress || pub.address || FUNGIBLE_POOL.address;
+        body.poolAddress ||
+        inspected?.poolAddress ||
+        pool3p?.address ||
+        pub.address ||
+        FUNGIBLE_POOL.address;
       let verified = null;
       let verifyError = null;
       if (body.txHash) {

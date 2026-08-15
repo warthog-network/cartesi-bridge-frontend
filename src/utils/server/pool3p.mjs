@@ -682,6 +682,25 @@ async function saveHolders(h) {
   await writeFile(HOLDERS_PATH, JSON.stringify(h, null, 2));
 }
 
+/** After Q cutover, the browsers who born next d1/d2 become the live holders. */
+export async function adoptHoldersFromDapp(dapp) {
+  const h = loadHolders();
+  const ts = new Date().toISOString();
+  h.roles = h.roles || {};
+  for (const r of [1, 2]) {
+    const sid = dapp?.seats?.[r]?.signerId || dapp?.seats?.[String(r)]?.signerId;
+    if (!sid) continue;
+    h.roles[String(r)] = {
+      signerId: sid,
+      assignedAt: ts,
+      lastSeen: ts,
+      claimedBorn: true,
+    };
+  }
+  await saveHolders(h);
+  return holderSnapshot();
+}
+
 function loadOrbit() {
   try {
     return JSON.parse(readFileSync(ORBIT_PATH, 'utf8'));
@@ -729,7 +748,7 @@ async function writeSignerFile(role, rec) {
   }
 }
 
-async function writeDapp(dapp) {
+export async function writeDapp(dapp) {
   await mkdir(path.dirname(DAPP_PATH), { recursive: true });
   await writeFile(DAPP_PATH, JSON.stringify(dapp, null, 2));
   try {
@@ -1411,6 +1430,7 @@ export function publicStatus() {
     open: listOpenPool3pTickets(),
     rooms: listOpenPool3pTickets(),
     paid: listPaidPool3pTickets(),
+    rotation: null,
     d1Live: !!(currentHolderId(1) && liveOrbitMembers().includes(currentHolderId(1))),
     d2Live: !!(currentHolderId(2) && liveOrbitMembers().includes(currentHolderId(2))),
     hasDappShare: !!d.dappShareHex,
