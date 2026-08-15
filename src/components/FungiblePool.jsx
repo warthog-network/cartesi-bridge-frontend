@@ -1815,11 +1815,33 @@ export default function FungiblePool({
         : await maxOwnerVoucherInputIndex(owner);
     const seen = await snapshotNoticePayloads();
 
-    toast.loading(
-      'Withdraw: confirm the preview dialog, then MetaMask…',
-      { id: 'pool', duration: 20000 },
-    );
-    await send({ type: 'pool_withdraw_wwart', amount: amt });
+    toast.loading(`Withdrawing ${amt} (InputBox → voucher)…`, {
+      id: 'pool',
+      duration: Infinity,
+    });
+    try {
+      const relayed = await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({
+          action: 'anvil_pool_withdraw',
+          owner,
+          amount: amt,
+        }),
+      });
+      if (!relayed?.ok || !relayed.txHash) {
+        throw new Error(relayed?.error || 'anvil withdraw declined');
+      }
+      toast.loading(
+        `Withdraw InputBox ${String(relayed.txHash).slice(0, 12)}… waiting voucher`,
+        { id: 'pool', duration: Infinity },
+      );
+    } catch {
+      toast.loading(
+        `Sign withdraw of ${amt} in the wallet (InputBox on 31337)`,
+        { id: 'pool', duration: Infinity },
+      );
+      await send({ type: 'pool_withdraw_wwart', amount: amt }, { skipConfirm: true });
+    }
     toast.loading('Confirming voucher on rollup…', { id: 'pool' });
 
     void waitForNotice('pool_wwart_withdrawn', {

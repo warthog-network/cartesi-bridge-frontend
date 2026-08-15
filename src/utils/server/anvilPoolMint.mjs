@@ -20,22 +20,15 @@ export function anvilDemoAccount(addr) {
   return ACCOUNT[String(addr || '').toLowerCase()] || null;
 }
 
-export async function submitAnvilPoolMint({ owner, amount, tokenAddress } = {}) {
+async function submitAnvilPoolInput(owner, payload, mode) {
   const rec = anvilDemoAccount(owner);
   if (!rec) {
     throw new Error(
       'Not an Anvil demo account — connect 0x7099… / 0xf39… or send InputBox from the wallet',
     );
   }
-  const token = String(tokenAddress || LOCAL_WWART.address || '')
-    .toLowerCase();
-  if (!/^0x[0-9a-f]{40}$/.test(token)) throw new Error('tokenAddress required');
-  const amt = String(amount || '').trim();
-  if (!amt || Number(amt) <= 0) throw new Error('amount required');
-
   const { ethers } = await import('ethers-v6');
-  // Same Anvil as wallets: nginx /rpc → 127.0.0.1:8545. Prefer the public
-  // URL so host mint exercises the path Rabby/MetaMask must use.
+  // Same Anvil as wallets: nginx /rpc → 127.0.0.1:8545.
   const rpc =
     env('PUBLIC_L1_RPC') ||
     env('CARTESI_PUBLIC_RPC') ||
@@ -44,26 +37,44 @@ export async function submitAnvilPoolMint({ owner, amount, tokenAddress } = {}) 
   const boxAddr = env('INPUT_BOX', '0x59b22D57D4f067708AB0c00552767405926dc768');
   const provider = new ethers.JsonRpcProvider(rpc);
   const wallet = new ethers.Wallet(rec.privateKey, provider);
+  const nonce = await provider.getTransactionCount(wallet.address, 'latest');
   const box = new ethers.Contract(
     boxAddr,
     ['function addInput(address app, bytes input) returns (bytes32)'],
     wallet,
   );
-  const payload = {
-    type: 'pool_mint_wwart',
-    amount: amt,
-    tokenAddress: token,
-  };
   const bytes = ethers.toUtf8Bytes(JSON.stringify(payload));
-  const tx = await box.addInput(dapp, bytes);
+  const tx = await box.addInput(dapp, bytes, { nonce });
   const recpt = await tx.wait();
   return {
     ok: true,
-    mode: 'anvil-demo-mint',
+    mode,
     owner: rec.address,
-    amount: amt,
-    tokenAddress: token,
+    payload,
     txHash: recpt?.hash || tx.hash,
     from: wallet.address,
+    nonce,
   };
+}
+
+export async function submitAnvilPoolMint({ owner, amount, tokenAddress } = {}) {
+  const token = String(tokenAddress || LOCAL_WWART.address || '').toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(token)) throw new Error('tokenAddress required');
+  const amt = String(amount || '').trim();
+  if (!amt || Number(amt) <= 0) throw new Error('amount required');
+  return submitAnvilPoolInput(
+    owner,
+    { type: 'pool_mint_wwart', amount: amt, tokenAddress: token },
+    'anvil-demo-mint',
+  );
+}
+
+export async function submitAnvilPoolWithdraw({ owner, amount } = {}) {
+  const amt = String(amount || '').trim();
+  if (!amt || Number(amt) <= 0) throw new Error('amount required');
+  return submitAnvilPoolInput(
+    owner,
+    { type: 'pool_withdraw_wwart', amount: amt },
+    'anvil-demo-withdraw',
+  );
 }

@@ -744,6 +744,18 @@ export async function POST({ request }) {
         }),
       );
     }
+    if (action === 'anvil_pool_withdraw' || action === 'pool_withdraw_anvil') {
+      const { submitAnvilPoolWithdraw } = await import(
+        '../../utils/server/anvilPoolMint.mjs'
+      );
+      return json(
+        200,
+        await submitAnvilPoolWithdraw({
+          owner: body.owner,
+          amount: body.amount,
+        }),
+      );
+    }
 
     if (action === 'request_credit' || action === 'credit') {
       const pub = await getPoolHotPublic();
