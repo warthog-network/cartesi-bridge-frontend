@@ -458,8 +458,11 @@ async function maybeOpenOrAdvanceSweep(r, next) {
 async function cutOver(r, next) {
   try {
     let accountId = null;
-    const found = await wartAccount(next.address);
-    if (found?.accountId) accountId = found.accountId;
+    for (let i = 0; i < 8 && !accountId; i += 1) {
+      const found = await wartAccount(next.address);
+      if (found?.accountId) accountId = found.accountId;
+      else await new Promise((res) => setTimeout(res, 400));
+    }
     const posted = await submitPoolAdvance({
       type: 'pool_set_address',
       address: next.address,
