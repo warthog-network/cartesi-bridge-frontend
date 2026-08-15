@@ -107,10 +107,19 @@ function decodeInspectPayload(payload) {
 }
 
 export async function inspectPoolSnap() {
-  const res = await fetch(`${INSPECT.replace(/\/$/, '')}/pool`, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`inspect HTTP ${res.status}`);
-  const data = await res.json();
-  return decodeInspectPayload(data?.reports?.[0]?.payload);
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 4000);
+  try {
+    const res = await fetch(`${INSPECT.replace(/\/$/, '')}/pool`, {
+      cache: 'no-store',
+      signal: ac.signal,
+    });
+    if (!res.ok) throw new Error(`inspect HTTP ${res.status}`);
+    const data = await res.json();
+    return decodeInspectPayload(data?.reports?.[0]?.payload);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function machineSupportsSetAddress() {
@@ -247,7 +256,11 @@ async function tickRotationInner() {
   if (r.anchorBlock == null || block < Number(r.anchorBlock)) {
     r.anchorBlock = block;
     await saveRotate(r);
-    if (r.phase === 'idle') return rotationView(r, block);
+    if (r.phase === 'idle') {
+      return rotationView(r, block, {
+        machineReady: await machineSupportsSetAddress(),
+      });
+    }
   }
 
   const auto = envOn('POOL_3P_AUTO_ROTATE', true);
