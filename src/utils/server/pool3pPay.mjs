@@ -135,6 +135,9 @@ export async function preparePool3pTransfer({
     wartE8: amt,
   });
 
+  // Reserve the nonce as soon as a room prepares so a second room cannot reuse it.
+  await recordOutgoingNonce(from, nonceId);
+
   return {
     ok: true,
     fromAddress: from,

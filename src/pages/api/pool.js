@@ -61,6 +61,8 @@ import {
   orbitSnapshot,
   refreshSeat,
   maybeAbandonStaleSeats,
+  closePool3pRoom,
+  expireStaleUserRooms,
 } from '../../utils/server/pool3p.mjs';
 import { preparePool3pTransfer, submitPool3pTransfer } from '../../utils/server/pool3pPay.mjs';
 import { allowLabMutation } from '../../utils/server/poolOpsAuth.mjs';
@@ -385,7 +387,11 @@ export async function POST({ request }) {
       return json(200, hb);
     }
 
+    if (action === 'pool3p_close_room' || action === 'pool3p_reset_room') {
+      return json(200, await closePool3pRoom(body.ticketId, body.reason || 'manual-reset'));
+    }
     if (action === 'pool3p_status') {
+      await expireStaleUserRooms().catch(() => ({ closed: [] }));
       await maybeAbandonStaleSeats().catch(() => []);
       let rotation = null;
       try {

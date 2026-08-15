@@ -15,7 +15,11 @@ import {
   writeDapp,
   openPool3pPayout,
   listOpenPool3pTickets,
+  listOpenUserPool3pTickets,
   listPaidPool3pTickets,
+  expireStaleUserRooms,
+  closePool3pRoom,
+  holdersFrozen,
   adoptHoldersFromDapp,
   invalidateOpenLindell,
   ORBIT_VPS_ID,
@@ -178,6 +182,10 @@ export function rotationView(r = loadRotate(), block = null, extra = {}) {
   const elapsed =
     r.anchorBlock != null && block != null ? Math.max(0, block - Number(r.anchorBlock)) : null;
   const dueIn = elapsed == null ? null : Math.max(0, Number(r.intervalEpochs || INTERVAL) - elapsed);
+  const rooms = extra.userRooms ?? listOpenUserPool3pTickets();
+  const deferredForRooms = rooms.length > 0;
+  const need1 = !!(next && !next.seats?.[1]?.P);
+  const need2 = !!(next && !next.seats?.[2]?.P);
   return {
     intervalEpochs: Number(r.intervalEpochs || INTERVAL),
     autoRotate: envOn('POOL_3P_AUTO_ROTATE', true),
@@ -195,16 +203,19 @@ export function rotationView(r = loadRotate(), block = null, extra = {}) {
     sweepTxHash: r.sweepTxHash || lastPaidRotate()?.txHash || null,
     announceTx: r.announceTx || null,
     setTx: r.setTx || null,
-    lastError: r.lastError || null,
+    lastError: r.lastError || extra.lastError || null,
+    deferredForRooms,
+    openUserRooms: rooms.map((t) => t.ticketId),
     next: next
       ? {
           address: next.address || null,
           publicKey: next.publicKey || null,
           Pdapp: next.Pdapp || null,
           seatsReady: { 1: !!next.seats?.[1]?.P, 2: !!next.seats?.[2]?.P },
+          // Hide birth so live d1/d2 tabs do not swap in next-epoch hex mid-sign.
           needBirth: {
-            1: !next.seats?.[1]?.P,
-            2: !next.seats?.[2]?.P,
+            1: !deferredForRooms && need1,
+            2: !deferredForRooms && need2,
           },
           bornBy: {
             1: next.seats?.[1]?.signerId || null,
@@ -224,7 +235,7 @@ function lastPaidRotate() {
 }
 
 function userRoomsOpen() {
-  return listOpenPool3pTickets().filter((t) => !/^wart-pool-rotate-/.test(String(t.ticketId || '')));
+  return listOpenUserPool3pTickets();
 }
 
 let tickLock = null;
@@ -272,20 +283,41 @@ async function tickRotationInner() {
 
   const auto = envOn('POOL_3P_AUTO_ROTATE', true);
   const elapsed = Math.max(0, block - Number(r.anchorBlock));
+  await expireStaleUserRooms().catch(() => ({ closed: [] }));
+  const rooms = userRoomsOpen();
   if (
     auto &&
     elapsed >= Number(r.intervalEpochs || INTERVAL) &&
     r.phase === 'idle'
   ) {
-    const { dapp } = await createDappOnlyPool();
-    await writeNextDapp(dapp);
-    r.phase = 'need_birth';
-    r.nextStartedAt = new Date().toISOString();
-    r.lastError = null;
+    if (rooms.length) {
+      r.lastError = `rotate wait: ${rooms.length} user 3P room(s) open`;
+      await saveRotate(r);
+    } else {
+      const { dapp } = await createDappOnlyPool();
+      await writeNextDapp(dapp);
+      r.phase = 'need_birth';
+      r.nextStartedAt = new Date().toISOString();
+      r.lastError = null;
+      r.sweepTicketId = null;
+      r.sweepTxHash = null;
+      r.announceTx = null;
+      r.setTx = null;
+      await saveRotate(r);
+    }
+  }
+
+  const live = loadDapp();
+  if (
+    ['need_birth', 'next_ready', 'announced', 'sweeping', 'cutover'].includes(r.phase) &&
+    !loadNextDapp() &&
+    r.last?.address &&
+    live?.address &&
+    String(live.address).toLowerCase() === String(r.last.address).toLowerCase()
+  ) {
+    r.phase = 'idle';
     r.sweepTicketId = null;
-    r.sweepTxHash = null;
-    r.announceTx = null;
-    r.setTx = null;
+    r.lastError = null;
     await saveRotate(r);
   }
 
@@ -297,6 +329,12 @@ async function tickRotationInner() {
 
   const machineReady = await machineSupportsSetAddress();
   if (!auto) return rotationView(loadRotate(), block, { machineReady });
+
+  if (rooms.length && ['need_birth', 'next_ready'].includes(r.phase)) {
+    r.lastError = `rotate wait: user 3P room still open`;
+    await saveRotate(r);
+    return rotationView(loadRotate(), block, { machineReady, userRooms: rooms });
+  }
 
   if (r.phase === 'next_ready' && machineReady && next?.address) {
     try {
@@ -326,6 +364,10 @@ async function tickRotationInner() {
   return rotationView(loadRotate(), block, { machineReady });
 }
 
+function openRotateRooms() {
+  return listOpenPool3pTickets().filter((t) => /^wart-pool-rotate-/.test(String(t.ticketId || '')));
+}
+
 async function maybeOpenOrAdvanceSweep(r, next) {
   const paid = listPaidPool3pTickets(48).find(
     (p) =>
@@ -353,7 +395,28 @@ async function maybeOpenOrAdvanceSweep(r, next) {
     return;
   }
 
+  const existing = openRotateRooms();
+  if (existing.length) {
+    const keep =
+      (r.sweepTicketId && existing.some((t) => t.ticketId === r.sweepTicketId)
+        ? r.sweepTicketId
+        : existing[0].ticketId);
+    if (existing.length > 1) {
+      for (const t of existing) {
+        if (String(t.ticketId) === String(keep)) continue;
+        await closePool3pRoom(t.ticketId, 'rotate-collapse').catch(() => null);
+      }
+    }
+    r.sweepTicketId = keep;
+    r.phase = 'sweeping';
+    r.lastError = null;
+    await saveRotate(r);
+    return;
+  }
+
   if (r.sweepTicketId) {
+    // Ticket id with no open room and no paid tx — do not mint another nonce.
+    r.lastError = `sweep wait: ${r.sweepTicketId} not open`;
     r.phase = 'sweeping';
     await saveRotate(r);
     return;
@@ -424,6 +487,14 @@ export async function birthNextSeat({ signerId, role, P, encD1, paillierN, paill
   if (!sid) throw new Error('signerId required');
   if (sid === ORBIT_VPS_ID || /^pool-3p-signer-[12]$/.test(sid)) {
     throw new Error('VPS must not birth next Q');
+  }
+  if (holdersFrozen()) {
+    return {
+      ok: false,
+      deferred: true,
+      error: 'next-Q birth deferred — user 3P room is open',
+      openUserRooms: listOpenUserPool3pTickets().map((t) => t.ticketId),
+    };
   }
   let dapp = loadNextDapp();
   if (!dapp) {

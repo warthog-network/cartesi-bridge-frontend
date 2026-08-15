@@ -633,6 +633,14 @@ function sessionLooksPaid(t) {
   return !!(t && (t.status === 'paid' || t.payout?.ok || t.payout?.txHash));
 }
 
+function sessionAbandoned(t) {
+  return !!(t && (t.status === 'abandoned' || t.status === 'cancelled'));
+}
+
+export function isRotateTicketId(ticketId) {
+  return /^wart-pool-rotate-/.test(String(ticketId || ''));
+}
+
 function paidRowFromSession(t) {
   if (!t || !sessionLooksPaid(t)) return null;
   return {
@@ -707,6 +715,10 @@ const LEASE_MS = Number(env('POOL_3P_LEASE_MS', '900000')) || 900000;
 const ORBIT_LIVE_MS = Number(env('POOL_3P_ORBIT_LIVE_MS', '20000')) || 20000;
 const SEAT_IDLE_MS = Number(env('POOL_3P_SEAT_IDLE_MS', '300000')) || 300000;
 const ORBIT_MIN = Number(env('POOL_3P_ORBIT_MIN', '2')) || 2;
+/** Close a hung user room so auto-rotate can proceed. Idle = no session write. */
+const ROOM_IDLE_MS = Number(env('POOL_3P_ROOM_IDLE_MS', '480000')) || 480000;
+/** Lindell done but never paid — k1 is gone; do not block rotation. */
+const ROOM_PARTIAL_MS = Number(env('POOL_3P_ROOM_PARTIAL_MS', '240000')) || 240000;
 
 function vpsFallbackOn() {
   const v = env('POOL_3P_VPS_FALLBACK', '1').trim().toLowerCase();
@@ -957,20 +969,12 @@ export async function reissueToCurrentHolders(reason = 'epoch-rotate') {
 }
 
 function signInFlight() {
-  try {
-    const s = JSON.parse(readFileSync(SESS_PATH, 'utf8'));
-    const now = Date.now();
-    for (const t of Object.values(s.tickets || {})) {
-      if (!t || t.status === 'paid' || t.payout?.txHash) continue;
-      const raw = t.updatedAt;
-      const ts = typeof raw === 'number' ? raw : Date.parse(raw || 0);
-      const age = now - ts;
-      if (Number.isFinite(age) && age >= 0 && age < 10 * 60 * 1000) return true;
-    }
-  } catch {
-    /* */
-  }
-  return false;
+  return listOpenPool3pTickets().length > 0;
+}
+
+/** True while any 3P room is open — freeze live seats + next-Q birth. */
+export function holdersFrozen() {
+  return listOpenPool3pTickets().length > 0;
 }
 
 export async function maybeAbandonStaleSeats() {
@@ -1109,8 +1113,8 @@ export async function heartbeatPool3p({ signerId, seatEpoch } = {}) {
   // so the client never needs a page refresh.
   let share = null;
   let justClaimed = false;
-  // Vacant seats can be claimed during a sign. Do not steal a live holder.
-  if (role === 0) {
+  // Vacant seats can be claimed when idle. Never steal a seat during a room.
+  if (role === 0 && !holdersFrozen()) {
     const claimed = await enrollPool3pSigner({ signerId: sid });
     if (claimed && !claimed.waitlist && (claimed.role === 1 || claimed.role === 2)) {
       role = Number(claimed.role);
@@ -1376,6 +1380,7 @@ export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
   }
 
   async function claim(role) {
+    if (holdersFrozen()) return null;
     const rec = h.roles[String(role)];
     const occupant = rec?.signerId;
     const bornSid =
@@ -1471,6 +1476,10 @@ export async function claimBornSeat({ signerId, role, shareHex }) {
   const ts = new Date().toISOString();
   const h = loadHolders();
   h.roles = h.roles || {};
+  const occupant = h.roles[String(r)]?.signerId || null;
+  if (holdersFrozen() && occupant && occupant !== sid) {
+    throw new Error('claim denied — user 3P room is open; live seats are frozen');
+  }
   h.roles[String(r)] = { signerId: sid, assignedAt: ts, lastSeen: ts, claimedBorn: true };
   await saveHolders(h);
   if (dapp.seats?.[String(r)]) {
@@ -1752,6 +1761,7 @@ function runLindellInto(sess, dapp) {
   sess.ciphertext = step.ciphertext;
   sess.RHex = step.RHex;
   sess.status = 'partial';
+  if (!sess.partialAt) sess.partialAt = Date.now();
 }
 
 /** Drop R1 + ciphertext on unpaid rooms so d1 can post a fresh k1 after rekey. Keep d2. */
@@ -1829,16 +1839,18 @@ export async function openPool3pPayout({ ticketId, toAddress, amountE8 }) {
   const paid = paidRecordFor(id);
   if (paid) return { ok: true, alreadyPaid: true, ticketId: id, ...paid };
   return withSessions((s) => {
-    const prev = s.tickets[id] || {};
-    if (sessionLooksPaid(prev)) {
-      return { ok: true, alreadyPaid: true, ...summarizeSess(prev) };
+    const raw = s.tickets[id] || {};
+    if (sessionLooksPaid(raw)) {
+      return { ok: true, alreadyPaid: true, ...summarizeSess(raw) };
     }
+    const prev = sessionAbandoned(raw) ? { ticketId: id } : raw;
     const hint = hintFor(id);
     s.tickets[id] = fillRoomMeta(
       {
         ...prev,
         ticketId: id,
         status: prev.haveR1 || prev.haveD2 ? prev.status || 'open' : 'open',
+        openedAt: prev.openedAt || Date.now(),
         updatedAt: Date.now(),
         room: true,
       },
@@ -1863,7 +1875,7 @@ export function listOpenPool3pTickets() {
   const push = (t) => {
     const id = String(t?.ticketId || '').trim();
     if (!id || seen.has(id)) return;
-    if (ticketIsPaid(id) || sessionLooksPaid(t)) return;
+    if (ticketIsPaid(id) || sessionLooksPaid(t) || sessionAbandoned(t)) return;
     const hint = hintFor(id);
     const amountE8 = t.amountE8 || hint?.amountE8;
     const toAddress = t.toAddress || hint?.toAddress;
@@ -1898,12 +1910,93 @@ export function listOpenPool3pTickets() {
   for (const t of Object.values(s.tickets || {})) push(t);
   for (const hint of inspectRoomHints.values()) {
     const existing = s.tickets?.[String(hint.ticketId)];
-    if (ticketIsPaid(hint.ticketId) || sessionLooksPaid(existing)) {
+    if (
+      ticketIsPaid(hint.ticketId) ||
+      sessionLooksPaid(existing) ||
+      sessionAbandoned(existing)
+    ) {
       continue;
     }
     push({ ticketId: hint.ticketId, amountE8: hint.amountE8, toAddress: hint.toAddress });
   }
   return out;
+}
+
+export function listOpenUserPool3pTickets() {
+  return listOpenPool3pTickets().filter((t) => !isRotateTicketId(t.ticketId));
+}
+
+function wipeRoomSecrets(t) {
+  if (!t) return t;
+  delete t.d2Hex;
+  delete t.ciphertext;
+  delete t.R1Hex;
+  delete t.rHex;
+  delete t.RHex;
+  delete t.hashHex;
+  t.haveR1 = false;
+  t.haveD2 = false;
+  return t;
+}
+
+export async function closePool3pRoom(ticketId, reason = 'reset') {
+  const id = String(ticketId || '').trim();
+  if (!id) throw new Error('ticketId required');
+  inspectRoomHints.delete(id);
+  return withSessions((s) => {
+    const t = s.tickets[id];
+    if (!t) {
+      s.tickets[id] = {
+        ticketId: id,
+        status: 'abandoned',
+        abandonedAt: Date.now(),
+        abandonReason: reason,
+        room: false,
+        updatedAt: Date.now(),
+      };
+      return { ok: true, ticketId: id, closed: true, existed: false, reason };
+    }
+    if (sessionLooksPaid(t)) {
+      return { ok: true, ticketId: id, skipped: true, paid: true };
+    }
+    wipeRoomSecrets(t);
+    t.status = 'abandoned';
+    t.abandonedAt = Date.now();
+    t.abandonReason = reason;
+    t.room = false;
+    t.updatedAt = Date.now();
+    return { ok: true, ticketId: id, closed: true, existed: true, reason };
+  });
+}
+
+export async function expireStaleUserRooms(now = Date.now()) {
+  let s;
+  try {
+    s = JSON.parse(readFileSync(SESS_PATH, 'utf8'));
+  } catch {
+    return { ok: true, closed: [] };
+  }
+  const closed = [];
+  for (const t of Object.values(s.tickets || {})) {
+    const id = String(t?.ticketId || '');
+    if (!id || isRotateTicketId(id)) continue;
+    if (sessionLooksPaid(t) || sessionAbandoned(t)) continue;
+    const updated = Number(t.updatedAt || 0);
+    const partialAt = Number(t.partialAt || 0);
+    const idle = updated ? now - updated : 0;
+    const partialAge = partialAt ? now - partialAt : 0;
+    let reason = null;
+    if (t.ciphertext && partialAge >= ROOM_PARTIAL_MS) {
+      reason = 'expire-partial-unpaid';
+    } else if (updated && idle >= ROOM_IDLE_MS) {
+      reason = 'expire-idle';
+    }
+    if (reason) closed.push({ ticketId: id, reason });
+  }
+  for (const row of closed) {
+    await closePool3pRoom(row.ticketId, row.reason);
+  }
+  return { ok: true, closed };
 }
 
 function loadPaidLog() {
