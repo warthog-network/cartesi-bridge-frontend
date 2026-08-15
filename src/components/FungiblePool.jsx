@@ -759,8 +759,15 @@ export default function FungiblePool({
   const owner = ownerAddress || '';
   const wartFrom = wartBridgeApi?.address || '';
   const bindBlocked = Boolean(wartBind?.conflict);
-  const poolAddr = FUNGIBLE_POOL.address || snap?.poolAddress;
-  const rollupPoolAddr = snap?.poolAddress || null;
+  const poolAddr =
+    pool3pSt?.address ||
+    pool3pSt?.seal?.address ||
+    snap?.poolAddress ||
+    FUNGIBLE_POOL.address;
+  const previousQ =
+    pool3pSt?.rotation?.last?.previous ||
+    snap?.previousAddress ||
+    null;
   const wwartToken = LOCAL_WWART?.address;
   const spv = snap?.spv || null;
 
@@ -2576,7 +2583,7 @@ export default function FungiblePool({
             wordBreak: 'break-all',
           }}
         >
-          3P address: {FUNGIBLE_POOL.address}
+          3P address: {poolAddr}
           {pool3pSt?.configured ? (
             <>
               <br />
@@ -2667,16 +2674,15 @@ export default function FungiblePool({
                   wordBreak: 'break-all',
                   color: '#FDB913',
                 }}
-                title={FUNGIBLE_POOL.address}
+                title={poolAddr}
               >
-                {FUNGIBLE_POOL.address}
+                {poolAddr}
               </span>
             </div>
-            {rollupPoolAddr &&
-            String(rollupPoolAddr).toLowerCase() !==
-              String(FUNGIBLE_POOL.address).toLowerCase() ? (
+            {previousQ &&
+            String(previousQ).toLowerCase() !== String(poolAddr || '').toLowerCase() ? (
               <div className="sw-meta-row">
-                <span className="sw-meta-k">Rollup inspect (legacy)</span>
+                <span className="sw-meta-k">Previous Q (swept)</span>
                 <span
                   className="sw-meta-v"
                   style={{
@@ -2685,9 +2691,9 @@ export default function FungiblePool({
                     wordBreak: 'break-all',
                     opacity: 0.75,
                   }}
-                  title="Cartesi machine still lists the old empty address until restart"
+                  title="Old 3P address after rotation — do not send here"
                 >
-                  {rollupPoolAddr}
+                  {previousQ}
                 </span>
               </div>
             ) : null}
