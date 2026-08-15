@@ -1416,7 +1416,7 @@ export default function WalletIsland() {
     }
   };
 
-  const send = async (payload, { successMessage = null, skipConfirm = false } = {}) => {
+  const send = async (payload, { successMessage = null, skipConfirm = false, quiet = false } = {}) => {
     if (!signer) {
       toast.error("Wallet not connected!");
       throw new Error("Wallet not connected!");
@@ -1444,7 +1444,10 @@ export default function WalletIsland() {
       const payloadBytes = new TextEncoder().encode(message);
       const gasLimit = BigInt(Math.min(1_500_000, 80_000 + payloadBytes.length * 16 + 50_000));
       const inputBox = new ethers.Contract(INPUT_BOX_ADDRESS, INPUT_BOX_ABI, liveSigner);
-      toast.loading('Confirm InputBox.addInput in the wallet…', { duration: 20000 });
+      toast.loading('Confirm InputBox.addInput in the wallet…', {
+        id: 'inputbox',
+        duration: Infinity,
+      });
       let tx;
       try {
         tx = await inputBox.addInput(DAPP_ADDRESS, payloadBytes, { gasLimit });
@@ -1458,6 +1461,7 @@ export default function WalletIsland() {
         if (/user rejected|denied/i.test(m)) throw sendErr;
         throw new Error(`InputBox send failed: ${m}`);
       }
+      toast.dismiss('inputbox');
       const pub = new ethers.JsonRpcProvider(publicRpc);
       let receipt = null;
       try {
@@ -1481,7 +1485,7 @@ export default function WalletIsland() {
       const txHash = receipt?.hash || receipt?.transactionHash || tx?.hash || '';
       if (successMessage) {
         toast.success(successMessage);
-      } else {
+      } else if (!quiet) {
         toast.success(txHash ? `Sent! Tx: ${String(txHash).slice(0, 10)}…` : 'Sent to rollup InputBox');
       }
       setTimeout(() => refreshVault(address), 8000);
@@ -1497,6 +1501,7 @@ export default function WalletIsland() {
       console.error(err);
       throw err; // Re-throw to propagate to callers
     } finally {
+      toast.dismiss('inputbox');
       setLoading(false);
     }
   };

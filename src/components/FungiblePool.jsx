@@ -1799,7 +1799,7 @@ export default function FungiblePool({
           amount: mintAmt,
           tokenAddress: String(wwartToken).toLowerCase(),
         },
-        { skipConfirm: true },
+        { skipConfirm: true, quiet: true },
       );
     }
     setActionStatus({
@@ -1901,7 +1901,7 @@ export default function FungiblePool({
         `Sign withdraw of ${amt} in the wallet (InputBox on 31337)`,
         { id: 'pool', duration: Infinity },
       );
-      await send({ type: 'pool_withdraw_wwart', amount: amt }, { skipConfirm: true });
+      await send({ type: 'pool_withdraw_wwart', amount: amt }, { skipConfirm: true, quiet: true });
     }
     toast.loading('Confirming voucher on rollup…', { id: 'pool' });
 
@@ -2219,11 +2219,14 @@ export default function FungiblePool({
         : 'Burn: confirm the preview dialog, then MetaMask…',
       { id: 'pool', duration: 20000 },
     );
-    await send({
-      type: 'pool_burn_wwart',
-      amount: amt,
-      ...(to ? { toAddress: to, autoUnlock: true } : { autoUnlock: true }),
-    });
+    await send(
+      {
+        type: 'pool_burn_wwart',
+        amount: amt,
+        ...(to ? { toAddress: to, autoUnlock: true } : { autoUnlock: true }),
+      },
+      { quiet: true },
+    );
     toast.loading('Confirming burn on rollup…', { id: 'pool' });
 
     // Collect ticket/reject from notices without blocking success on them
@@ -2350,11 +2353,14 @@ export default function FungiblePool({
       'Redeem: confirm the preview dialog, then MetaMask…',
       { id: 'pool', duration: 20000 },
     );
-    await send({
-      type: 'pool_redeem',
-      amount: amt,
-      toAddress: to,
-    });
+    await send(
+      {
+        type: 'pool_redeem',
+        amount: amt,
+        toAddress: to,
+      },
+      { quiet: true },
+    );
     toast.loading('Confirming redeem on rollup…', { id: 'pool' });
 
     const ticketP = waitForNotice('pool_release_ticket', {
