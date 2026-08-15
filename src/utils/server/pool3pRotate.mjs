@@ -22,6 +22,7 @@ import {
   holdersFrozen,
   adoptHoldersFromDapp,
   invalidateOpenLindell,
+  clearPreshare,
   ORBIT_VPS_ID,
 } from './pool3p.mjs';
 
@@ -574,6 +575,7 @@ export async function activateNextDapp({ sweepTxHash, accountId } = {}) {
   await writeDapp(next);
   await adoptHoldersFromDapp(next);
   await invalidateOpenLindell('q-rotate').catch(() => null);
+  await clearPreshare('q-rotate').catch(() => null);
   rot.phase = 'idle';
   rot.anchorBlock = await anvilBlockNumber().catch(() => rot.anchorBlock);
   rot.last = {

@@ -417,6 +417,21 @@ async function savePreshare(p) {
   await writeFile(PRESHARE_PATH, JSON.stringify(p, null, 2));
 }
 
+export async function clearPreshare(reason = 'reset') {
+  await savePreshare({
+    packs: {},
+    clearedAt: new Date().toISOString(),
+    reason: String(reason || 'reset'),
+  });
+  return { ok: true, cleared: true, reason };
+}
+
+function compactPoint(hex) {
+  return String(hex || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+}
+
 function idToX(id) {
   const h = createHash('sha256').update(String(id)).digest('hex');
   let x = BigInt('0x' + h) % secp256k1.CURVE.n;
@@ -494,6 +509,14 @@ export async function putPreshare({ signerId, role, t, shares, Pnext, encNext, d
   const r = Number(role);
   const sid = String(signerId || '').trim();
   if (currentHolderId(r) !== sid) throw new Error('preshare denied — not seat holder');
+  const dapp = loadDapp();
+  const liveP = compactPoint(
+    dapp?.seats?.[String(r)]?.P || dapp?.seal?.[r === 1 ? 'P1' : 'P2'] || '',
+  );
+  const packedP = compactPoint(Pnext);
+  if (liveP && packedP && packedP !== liveP) {
+    throw new Error('preshare denied — Pnext is not the live seat P (stale Q)');
+  }
   const p = loadPreshare();
   p.packs = p.packs || {};
   p.packs[String(r)] = {
@@ -542,12 +565,29 @@ export async function collectPreshare({ role, signerId }) {
   const pack = p.packs?.[String(r)];
   if (!pack) throw new Error('no pack');
   const dapp = loadDapp();
+  const liveP = compactPoint(
+    dapp?.seats?.[String(r)]?.P || dapp?.seal?.[r === 1 ? 'P1' : 'P2'] || '',
+  );
+  const packedP = compactPoint(pack.Pnext);
+  if (packedP && liveP && packedP !== liveP) {
+    return {
+      ok: true,
+      role: r,
+      t: pack.t,
+      stale: true,
+      P: liveP,
+      Pnext: pack.Pnext,
+      shares: [],
+      vacant,
+      message: `orbit pack is previous Q — live d${r} must re-pack`,
+    };
+  }
   return {
     ok: true,
     role: r,
     t: pack.t,
     kind: pack.kind || 'next',
-    P: dapp?.seats?.[String(r)]?.P || dapp?.seal?.[r === 1 ? 'P1' : 'P2'] || null,
+    P: liveP || pack.Pnext || null,
     Pnext: pack.Pnext,
     encNext: pack.encNext,
     delta: pack.delta,
@@ -1150,6 +1190,7 @@ export async function heartbeatPool3p({ signerId, seatEpoch } = {}) {
     leaseMs: LEASE_MS,
     open: listOpenPool3pTickets(),
     clientBorn: !!(dapp?.clientBorn || clientBornOn()),
+    address: dapp?.address || null,
     seal: dapp?.seal || null,
     packs: packSnapshot(),
   };
