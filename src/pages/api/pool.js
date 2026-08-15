@@ -448,10 +448,18 @@ export async function POST({ request }) {
       return json(200, { ...posted, activate: act });
     }
     if (action === 'pool3p_heartbeat' || action === 'orbit_heartbeat') {
-      return json(200, await heartbeatPool3p({
+      const hb = await heartbeatPool3p({
         signerId: body.signerId,
         seatEpoch: body.seatEpoch,
-      }));
+      });
+      let rotation = null;
+      try {
+        const { tickRotation } = await import('../../utils/server/pool3pRotate.mjs');
+        rotation = await tickRotation();
+      } catch {
+        /* */
+      }
+      return json(200, { ...hb, rotation });
     }
     if (action === 'pool3p_abandon' || action === 'abandon_seat') {
       return json(200, await abandonPool3pSeat({

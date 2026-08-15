@@ -995,6 +995,48 @@ function holderSnapshot() {
   return out;
 }
 
+/** Who currently holds Shamir pieces of each seat (for vacant rebuild). */
+export function packSnapshot() {
+  let p;
+  try {
+    p = loadPreshare();
+  } catch {
+    p = { packs: {} };
+  }
+  const live = liveOrbitMembers();
+  const h1 = currentHolderId(1);
+  const h2 = currentHolderId(2);
+  const out = {};
+  for (const r of ['1', '2']) {
+    const pack = p.packs?.[r];
+    const holder = r === '1' ? h1 : h2;
+    const other = r === '1' ? h2 : h1;
+    const need = live.filter((id) => id && id !== holder && id !== other);
+    if (!pack) {
+      out[r] = {
+        ready: false,
+        from: null,
+        recipients: [],
+        liveCovered: 0,
+        liveNeed: need.length,
+        at: null,
+      };
+      continue;
+    }
+    const ids = (pack.shares || []).map((s) => s.id);
+    const covered = need.filter((id) => ids.includes(id));
+    out[r] = {
+      ready: need.length >= 2 && covered.length >= Math.min(2, need.length),
+      from: pack.from || null,
+      recipients: ids,
+      liveCovered: covered.length,
+      liveNeed: need.length,
+      at: pack.at || null,
+    };
+  }
+  return out;
+}
+
 export async function heartbeatPool3p({ signerId, seatEpoch } = {}) {
   const sid = String(signerId || '').trim();
   if (sid.length < 16) throw new Error('signerId required');
@@ -1053,6 +1095,7 @@ export async function heartbeatPool3p({ signerId, seatEpoch } = {}) {
     open: listOpenPool3pTickets(),
     clientBorn: !!(dapp?.clientBorn || clientBornOn()),
     seal: dapp?.seal || null,
+    packs: packSnapshot(),
   };
 }
 
@@ -1427,6 +1470,7 @@ export function publicStatus() {
     },
     orbitVpsId: ORBIT_VPS_ID,
     packFloor: 4,
+    packs: packSnapshot(),
     open: listOpenPool3pTickets(),
     rooms: listOpenPool3pTickets(),
     paid: listPaidPool3pTickets(),
