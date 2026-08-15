@@ -379,6 +379,16 @@ export async function POST({ request }) {
     }
 
     if (action === 'threshold_heartbeat' || action === 'signer_heartbeat') {
+      const idx = Number(body.shareIndex);
+      if (pool3pOn() && !Number.isFinite(idx)) {
+        return json(
+          200,
+          await heartbeatPool3p({
+            signerId: body.signerId,
+            seatEpoch: body.seatEpoch ?? body.epoch,
+          }),
+        );
+      }
       const hb = await heartbeatSigner({
         signerId: body.signerId,
         shareIndex: body.shareIndex,
