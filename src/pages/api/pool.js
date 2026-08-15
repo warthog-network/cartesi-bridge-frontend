@@ -35,9 +35,6 @@ import {
   pool3pOfferR1,
   pool3pOfferD2,
   pool3pStatusTicket,
-  pool3pMarkPaid,
-  pool3pRememberPrepare,
-  pool3pGetPrep,
   enrollPool3pSigner,
   heartbeatPool3p,
   reissueToCurrentHolders,
@@ -48,6 +45,8 @@ import {
   rekeyClientD1Paillier,
   rebuildLindell,
   pool3pReuseOrPrepare,
+  pool3pSubmitGuarded,
+  paidRecordFor,
   resetPool3pR1,
   invalidateOpenLindell,
   claimBornSeat,
@@ -531,6 +530,7 @@ export async function POST({ request }) {
           amountE8: body.amountE8,
         }),
       });
+      if (prep?.alreadyPaid) return json(200, { ok: true, ...prep });
       return json(200, prep);
     }
     if (action === 'pool3p_relindell' || action === 'relindell') {
@@ -569,27 +569,23 @@ export async function POST({ request }) {
     if (action === 'pool3p_submit') {
       const dapp = loadPool3pDapp();
       if (!dapp) return json(400, { error: '3P pool not configured' });
+      const already = paidRecordFor(body.ticketId);
+      if (already) return json(200, { ok: true, alreadyPaid: true, ticketId: body.ticketId, ...already });
       const oq = orbitQuorumInfo(body.ticketId);
       if (!oq.ok) return json(403, { error: oq.message, orbit: oq });
-      let prep = await pool3pGetPrep(body.ticketId);
-      if (!prep && body.toAddress && body.amountE8) {
-        prep = await preparePool3pTransfer({
-          fromAddress: dapp.address,
-          toAddress: body.toAddress,
-          amountE8: body.amountE8,
+      try {
+        const paid = await pool3pSubmitGuarded(body.ticketId, {
+          hashHex: body.hashHex,
+          submitFn: (prep) => submitPool3pTransfer({
+            ...prep,
+            signature65: body.signature65,
+          }),
         });
-        await pool3pRememberPrepare(body.ticketId, prep);
+        return json(200, paid);
+      } catch (e) {
+        if (e?.code === 'HASH_MISMATCH') return json(409, { error: e.message });
+        throw e;
       }
-      if (!prep) return json(400, { error: 'missing prepare — signer1 must pool3p_prepare first' });
-      if (body.hashHex && prep.hashHex !== String(body.hashHex).replace(/^0x/i, '')) {
-        return json(409, { error: 'hash mismatch vs prepare' });
-      }
-      const paid = await submitPool3pTransfer({
-        ...prep,
-        signature65: body.signature65,
-      });
-      await pool3pMarkPaid(body.ticketId, paid);
-      return json(200, { ok: true, ...paid });
     }
 
     if (action === 'signer_onchain_enroll' || action === 'onchain_enroll') {
