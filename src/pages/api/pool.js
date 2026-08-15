@@ -18,13 +18,64 @@ import {
   listPoolCredits,
 } from '../../utils/server/poolCreditQueue.mjs';
 import {
+  checkWartOwnerBind,
+  registerWartOwnerBind,
+} from '../../utils/server/poolOwnerBind.mjs';
+import {
   verifyPoolDepositTx,
   flattenWartLookup,
   lookupWartTx,
 } from '../../utils/server/wartLookup.mjs';
 import { FUNGIBLE_POOL } from '../../utils/fungiblePoolConfig.js';
+import { submitPoolSignerInput } from '../../utils/server/poolOnchainSigners.mjs';
+import {
+  pool3pOn,
+  publicStatus as pool3pPublicStatus,
+  loadDapp as loadPool3pDapp,
+  pool3pOfferR1,
+  pool3pOfferD2,
+  pool3pStatusTicket,
+  pool3pMarkPaid,
+  pool3pRememberPrepare,
+  pool3pGetPrep,
+  enrollPool3pSigner,
+  heartbeatPool3p,
+  reissueToCurrentHolders,
+  openPool3pPayout,
+  listOpenPool3pTickets,
+  rememberInspectTickets,
+  birthClientSeat,
+  rekeyClientD1Paillier,
+  rebuildLindell,
+  pool3pReuseOrPrepare,
+  resetPool3pR1,
+  invalidateOpenLindell,
+  claimBornSeat,
+  putPreshare,
+  getPresharePiece,
+  collectPreshare,
+  ORBIT_VPS_ID,
+
+  abandonPool3pSeat,
+  orbitAttest,
+  orbitQuorumInfo,
+  orbitSnapshot,
+  refreshSeat,
+  maybeAbandonStaleSeats,
+} from '../../utils/server/pool3p.mjs';
+import { preparePool3pTransfer, submitPool3pTransfer } from '../../utils/server/pool3pPay.mjs';
 import { allowLabMutation } from '../../utils/server/poolOpsAuth.mjs';
 import { assertPayoutMatchesTicket } from '../../utils/server/poolTicketVerify.mjs';
+import {
+  getThresholdStatus,
+  openThresholdPayout,
+  openLabDemoThreshold,
+  contributeThresholdShare,
+  listOpenThresholdRequests,
+  heartbeatSigner,
+  enrollThresholdSigner,
+  getTicketVerifySnapshot,
+} from '../../utils/server/poolThreshold.mjs';
 
 export const prerender = false;
 
@@ -36,6 +87,8 @@ function corsHeaders() {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers':
       'Content-Type, Authorization, X-Pool-Ops-Token',
+    // Browser-node extension is COEP require-corp — allow the fetch.
+    'Cross-Origin-Resource-Policy': 'cross-origin',
   };
 }
 
@@ -50,9 +103,55 @@ export async function OPTIONS() {
   return new Response(null, { status: 204, headers: corsHeaders() });
 }
 
+function decodeInspectHex(payload) {
+  if (payload == null) return null;
+  if (typeof payload === 'object') return payload;
+  const s = String(payload);
+  try {
+    if (s.startsWith('0x')) {
+      return JSON.parse(Buffer.from(s.slice(2), 'hex').toString('utf8'));
+    }
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchRollupPoolInspect(owner) {
+  const base = String(
+    process.env.CARTESI_INSPECT_URL || 'http://127.0.0.1:8080/inspect',
+  ).replace(/\/$/, '');
+  const path = owner
+    ? `${base}/pool/${String(owner).replace(/^0x/i, '').toLowerCase()}`
+    : `${base}/pool`;
+  const res = await fetch(path, { cache: 'no-store' });
+  if (!res.ok) {
+    throw new Error(`inspect HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  const decoded = decodeInspectHex(data?.reports?.[0]?.payload);
+  if (!decoded || decoded.error) {
+    throw new Error(decoded?.error || 'inspect returned no pool report');
+  }
+  return decoded;
+}
+
 export async function GET({ request }) {
   try {
     const url = new URL(request.url);
+    if (url.searchParams.get('inspect') === '1') {
+      const owner = url.searchParams.get('owner') || '';
+      try {
+        const decoded = await fetchRollupPoolInspect(owner);
+        return json(200, { ok: true, source: 'server-inspect', ...decoded });
+      } catch (e) {
+        return json(502, {
+          ok: false,
+          error: e?.message || String(e),
+          source: 'server-inspect',
+        });
+      }
+    }
     if (url.searchParams.get('public') === '1') {
       return json(200, { ok: true, ...(await getPoolHotPublic()) });
     }
@@ -75,6 +174,33 @@ export async function GET({ request }) {
         mode: 'credit-queue',
         note: 'Relayer posts wart_deposit_claim (SPV) by default; legacy only if POOL_SPV_FALLBACK=1.',
       });
+    }
+    if (url.searchParams.get('bind') === '1') {
+      const check = await checkWartOwnerBind({
+        fromAddress: url.searchParams.get('from'),
+        owner: url.searchParams.get('owner'),
+      });
+      return json(check.conflict ? 409 : 200, {
+        ...check,
+        mode: 'owner-bind',
+      });
+    }
+    const verifyTicket = url.searchParams.get('verifyTicket');
+    if (verifyTicket != null && verifyTicket !== '') {
+      const snap = await getTicketVerifySnapshot(verifyTicket);
+      return json(200, snap);
+    }
+    // Path A3 — 3-of-4 threshold pool status (no secrets)
+    if (url.searchParams.get('threshold') === '1') {
+      const ticketId = url.searchParams.get('ticket') || undefined;
+      const st = await getThresholdStatus(ticketId);
+      if (pool3pOn()) {
+        const extra = listOpenPool3pTickets();
+        const have = new Set((st.open || []).map((r) => String(r.ticketId)));
+        st.open = [...(st.open || []), ...extra.filter((r) => !have.has(String(r.ticketId)))];
+        st.openCount = (st.open || []).length;
+      }
+      return json(200, st);
     }
     if (url.searchParams.get('lookup')) {
       const txHash = url.searchParams.get('lookup');
@@ -135,6 +261,55 @@ export async function POST({ request }) {
         amountE8: body.amountE8,
         owner: body.owner,
       });
+      // Path A3: UI can toggle useThreshold (default true when server allows).
+      // forceHot / useThreshold:false → single pool hot key (real WART).
+      const thrAvailable =
+        String(globalThis.process?.env?.['POOL_THRESHOLD_MODE'] || '') === '1';
+      const wantThreshold =
+        thrAvailable &&
+        body.forceHot !== true &&
+        body.useThreshold !== false &&
+        String(body.useThreshold).toLowerCase() !== '0' &&
+        String(body.useThreshold).toLowerCase() !== 'false';
+      if (pool3pOn()) {
+        rememberInspectTickets([verified]);
+        const opened = await openPool3pPayout({
+          ticketId: verified.ticketId,
+          toAddress: verified.toAddress || body.toAddress,
+          amountE8: verified.amountE8,
+        });
+        return json(200, {
+          ok: true,
+          ...opened,
+          ticketId: verified.ticketId,
+          toAddress: verified.toAddress || body.toAddress,
+          amountE8: String(verified.amountE8),
+          verifiedTicket: true,
+          phase: verified.phase,
+          mode: 'pool-3p',
+          custody: '3p-d1-d2',
+          note: 'Waiting for browser d1 + d2 Lindell (orbit n-of-n among live)',
+        });
+      }
+      if (wantThreshold) {
+        const pub = await getPoolHotPublic();
+        const opened = await openThresholdPayout({
+          ticketId: verified.ticketId,
+          toAddress: verified.toAddress || body.toAddress,
+          amountE8: verified.amountE8,
+          owner: verified.owner || body.owner,
+          poolAddress: pub.address || FUNGIBLE_POOL.address,
+          noticeIndex: verified.notice?._index,
+        });
+        return json(200, {
+          ...opened,
+          verifiedTicket: true,
+          phase: verified.phase,
+          mode: 'threshold-3of4',
+          custody: '3-of-4',
+          note: 'Waiting for ≥3 of 4 signers — real WART leaves pool after assemble',
+        });
+      }
       const result = await payoutPoolTicket({
         ticketId: verified.ticketId,
         toAddress: verified.toAddress || body.toAddress,
@@ -142,11 +317,294 @@ export async function POST({ request }) {
         owner: verified.owner || body.owner,
         verifiedFromNotice: true,
         noticeIndex: verified.notice?._index,
+        forceHot: true,
       });
       return json(200, {
         ...result,
         verifiedTicket: true,
         phase: verified.phase,
+        mode: 'hot-wallet',
+        custody: 'hot-wallet',
+      });
+    }
+
+    // Path A3 — open threshold payout (explicit; also used when mode off for lab)
+    if (
+      action === 'threshold_open' ||
+      action === 'open_threshold' ||
+      action === 'threshold_request'
+    ) {
+      const verified = await assertPayoutMatchesTicket({
+        ticketId: body.ticketId,
+        toAddress: body.toAddress,
+        amountE8: body.amountE8,
+        owner: body.owner,
+      });
+      const pub = await getPoolHotPublic();
+      const opened = await openThresholdPayout({
+        ticketId: verified.ticketId,
+        toAddress: verified.toAddress || body.toAddress,
+        amountE8: verified.amountE8,
+        owner: verified.owner || body.owner,
+        poolAddress: body.poolAddress || pub.address || FUNGIBLE_POOL.address,
+        noticeIndex: verified.notice?._index,
+      });
+      return json(200, {
+        ...opened,
+        verifiedTicket: true,
+        phase: verified.phase,
+        mode: 'threshold-3of4',
+      });
+    }
+
+    if (
+      action === 'threshold_contribute' ||
+      action === 'contribute_share' ||
+      action === 'threshold_share'
+    ) {
+      const result = await contributeThresholdShare({
+        ticketId: body.ticketId,
+        shareIndex: body.shareIndex,
+        shareHex: body.shareHex,
+        signerId: body.signerId,
+        verification: body.verification,
+      });
+      return json(200, { ...result, mode: 'threshold-3of4' });
+    }
+
+    if (action === 'threshold_status' || action === 'threshold') {
+      const st = await getThresholdStatus(body.ticketId);
+      return json(200, st);
+    }
+
+    if (action === 'threshold_heartbeat' || action === 'signer_heartbeat') {
+      const hb = await heartbeatSigner({
+        signerId: body.signerId,
+        shareIndex: body.shareIndex,
+        epoch: body.epoch,
+      });
+      return json(200, hb);
+    }
+
+    if (action === 'pool3p_status') {
+      await maybeAbandonStaleSeats().catch(() => []);
+      return json(200, { ...pool3pPublicStatus(), orbit: orbitSnapshot() });
+    }
+    if (action === 'pool3p_heartbeat' || action === 'orbit_heartbeat') {
+      return json(200, await heartbeatPool3p({
+        signerId: body.signerId,
+        seatEpoch: body.seatEpoch,
+      }));
+    }
+    if (action === 'pool3p_abandon' || action === 'abandon_seat') {
+      return json(200, await abandonPool3pSeat({
+        signerId: body.signerId,
+        role: body.role,
+      }));
+    }
+    if (action === 'pool3p_orbit_attest' || action === 'orbit_attest') {
+      return json(200, await orbitAttest({
+        signerId: body.signerId,
+        ticketId: body.ticketId,
+      }));
+    }
+    if (action === 'pool3p_orbit') {
+      return json(200, {
+        ...orbitSnapshot(),
+        ticket: body.ticketId ? orbitQuorumInfo(body.ticketId) : null,
+      });
+    }
+    if (action === 'pool3p_reissue_holders' || action === 'pool3p_epoch_rotate') {
+      const rotated = await reissueToCurrentHolders(body.reason || 'epoch-rotate');
+      return json(200, rotated);
+    }
+    if (action === 'pool3p_claim_born' || action === 'claim_born') {
+      return json(200, await claimBornSeat({
+        signerId: body.signerId,
+        role: body.role,
+        shareHex: body.shareHex || body.d1Hex || body.d2Hex,
+      }));
+    }
+    if (action === 'pool3p_rekey_d1' || action === 'rekey_d1') {
+      return json(200, await rekeyClientD1Paillier({
+        signerId: body.signerId,
+        d1Hex: body.d1Hex,
+        encD1: body.encD1,
+        paillierN: body.paillierN,
+        paillierG: body.paillierG,
+      }));
+    }
+    if (action === 'pool3p_birth') {
+      const born = await birthClientSeat({
+        signerId: body.signerId,
+        role: body.role,
+        P: body.P,
+        encD1: body.encD1,
+        paillierN: body.paillierN,
+        paillierG: body.paillierG,
+      });
+      return json(200, born);
+    }
+    if (action === 'pool3p_preshare_put') {
+      return json(200, await putPreshare(body));
+    }
+    if (action === 'pool3p_preshare_get') {
+      return json(200, await getPresharePiece({ signerId: body.signerId, role: body.role }));
+    }
+    if (action === 'pool3p_preshare_collect') {
+      return json(200, await collectPreshare({ signerId: body.signerId, role: body.role }));
+    }
+    if (action === 'pool3p_prepare') {
+      const dapp = loadPool3pDapp();
+      if (!dapp) return json(400, { error: '3P pool not configured' });
+      const prep = await pool3pReuseOrPrepare(body.ticketId, {
+        toAddress: body.toAddress,
+        amountE8: body.amountE8,
+        makePrep: () => preparePool3pTransfer({
+          fromAddress: dapp.address,
+          toAddress: body.toAddress,
+          amountE8: body.amountE8,
+        }),
+      });
+      return json(200, prep);
+    }
+    if (action === 'pool3p_relindell' || action === 'relindell') {
+      return json(200, await rebuildLindell(body.ticketId));
+    }
+    if (action === 'pool3p_reset_r1' || action === 'reset_r1') {
+      return json(200, await resetPool3pR1({
+        ticketId: body.ticketId,
+        signerId: body.signerId,
+      }));
+    }
+    if (action === 'pool3p_r1') {
+      const r = await pool3pOfferR1({
+        ticketId: body.ticketId,
+        signerId: body.signerId,
+        R1Hex: body.R1Hex,
+        hashHex: body.hashHex,
+        amountE8: body.amountE8,
+        toAddress: body.toAddress,
+      });
+      return json(200, r);
+    }
+    if (action === 'pool3p_d2') {
+      const r = await pool3pOfferD2({
+        ticketId: body.ticketId,
+        signerId: body.signerId,
+        d2Hex: body.d2Hex,
+        amountE8: body.amountE8,
+        toAddress: body.toAddress,
+      });
+      return json(200, r);
+    }
+    if (action === 'pool3p_ticket') {
+      return json(200, await pool3pStatusTicket(body.ticketId));
+    }
+    if (action === 'pool3p_submit') {
+      const dapp = loadPool3pDapp();
+      if (!dapp) return json(400, { error: '3P pool not configured' });
+      const oq = orbitQuorumInfo(body.ticketId);
+      if (!oq.ok) return json(403, { error: oq.message, orbit: oq });
+      let prep = await pool3pGetPrep(body.ticketId);
+      if (!prep && body.toAddress && body.amountE8) {
+        prep = await preparePool3pTransfer({
+          fromAddress: dapp.address,
+          toAddress: body.toAddress,
+          amountE8: body.amountE8,
+        });
+        await pool3pRememberPrepare(body.ticketId, prep);
+      }
+      if (!prep) return json(400, { error: 'missing prepare — signer1 must pool3p_prepare first' });
+      if (body.hashHex && prep.hashHex !== String(body.hashHex).replace(/^0x/i, '')) {
+        return json(409, { error: 'hash mismatch vs prepare' });
+      }
+      const paid = await submitPool3pTransfer({
+        ...prep,
+        signature65: body.signature65,
+      });
+      await pool3pMarkPaid(body.ticketId, paid);
+      return json(200, { ok: true, ...paid });
+    }
+
+    if (action === 'signer_onchain_enroll' || action === 'onchain_enroll') {
+      const posted = await submitPoolSignerInput({
+        type: 'pool_signer_enroll',
+        signerId: body.signerId,
+        pubkey: body.pubkey,
+        shareIndex: body.shareIndex,
+        signature: body.signature,
+        poolId: body.poolId || 'wart-pool-0',
+        epoch: body.epoch || 1,
+      });
+      return json(200, { ok: true, onchain: true, ...posted });
+    }
+    if (action === 'signer_onchain_attest' || action === 'onchain_attest') {
+      const posted = await submitPoolSignerInput({
+        type: 'pool_signer_attest',
+        signerId: body.signerId,
+        ticketId: body.ticketId,
+        signature: body.signature,
+      });
+      return json(200, { ok: true, onchain: true, ...posted });
+    }
+    if (action === 'signer_onchain_policy' || action === 'onchain_policy') {
+      const posted = await submitPoolSignerInput({
+        type: 'pool_signer_policy',
+        policyT: body.policyT,
+        requireQuorum: body.requireQuorum,
+      });
+      return json(200, { ok: true, onchain: true, ...posted });
+    }
+
+    if (action === 'threshold_enroll' || action === 'enroll_signer' || action === 'pool3p_enroll') {
+      const d3 = loadPool3pDapp();
+      if (d3) {
+        const enrolled = await enrollPool3pSigner({
+          signerId: body.signerId,
+          role: body.role,
+        });
+        return json(200, enrolled);
+      }
+      const enrolled = await enrollThresholdSigner({
+        signerId: body.signerId,
+        role: body.role,
+      });
+      return json(200, enrolled);
+    }
+
+    if (action === 'threshold_list' || action === 'list_threshold') {
+      const st = await listOpenThresholdRequests();
+      return json(200, st);
+    }
+
+    // Lab: open faux 3-of-4 request (no real burn) for UI + faux-signers demo
+    if (
+      action === 'threshold_lab_demo' ||
+      action === 'threshold_demo' ||
+      action === 'lab_threshold_demo'
+    ) {
+      // Allow on lab host without ops token when POOL_THRESHOLD_LAB=1 (default on for demo)
+      const thrLab = String(globalThis.process?.env?.['POOL_THRESHOLD_LAB'] ?? '1');
+      const thrMode = String(globalThis.process?.env?.['POOL_THRESHOLD_MODE'] || '');
+      const labOk = thrLab !== '0' || thrMode === '1';
+      if (!labOk) {
+        const auth = (
+          await import('../../utils/server/poolOpsAuth.mjs')
+        ).requirePoolOps(request, body);
+        if (!auth.ok) {
+          return json(auth.status || 403, { ok: false, error: auth.error });
+        }
+      }
+      const opened = await openLabDemoThreshold({
+        amountE8: body.amountE8,
+        poolAddress: body.poolAddress,
+        toAddress: body.toAddress,
+      });
+      return json(200, {
+        ...opened,
+        mode: 'threshold-3of4-lab-demo',
+        note: 'Faux request opened — run pool-threshold-faux-signers.mjs to contribute 3/4 shares',
       });
     }
 
@@ -189,6 +647,23 @@ export async function POST({ request }) {
         dryRun: Boolean(body.dryRun),
       });
       return json(200, result);
+    }
+
+    if (action === 'register_bind' || action === 'bind') {
+      try {
+        const result = await registerWartOwnerBind({
+          fromAddress: body.fromAddress,
+          owner: body.owner,
+          issuedAt: body.issuedAt,
+          wartSig: body.wartSig,
+          ownerSig: body.ownerSig,
+        });
+        return json(200, { ...result, mode: 'owner-bind' });
+      } catch (e) {
+        const msg = e?.message || String(e);
+        const status = /already bound/i.test(msg) ? 409 : 400;
+        return json(status, { ok: false, error: msg, mode: 'owner-bind' });
+      }
     }
 
     if (action === 'request_credit' || action === 'credit') {
@@ -256,7 +731,7 @@ export async function POST({ request }) {
 
     return json(400, {
       ok: false,
-      error: `unknown action "${action}" (payout|resync_nonce|list_unpaid|sweep_unpaid|request_credit|status|lab*)`,
+      error: `unknown action "${action}" (payout|threshold_open|threshold_contribute|threshold_status|resync_nonce|list_unpaid|sweep_unpaid|request_credit|status|lab*)`,
     });
   } catch (e) {
     const msg = e?.message || String(e);

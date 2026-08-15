@@ -75,7 +75,12 @@ export function randomScalar() {
 }
 
 export function hexToScalar(hex) {
-  const h = String(hex).replace(/^0x/i, '');
+  const h = String(hex ?? '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (!/^[0-9a-f]+$/.test(h)) {
+    throw new Error(`bad hex scalar (${String(hex).slice(0, 18) || 'empty'})`);
+  }
   const x = modN(BigInt('0x' + h));
   if (x === 0n) throw new Error('zero scalar');
   return x;
