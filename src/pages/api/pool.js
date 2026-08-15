@@ -731,6 +731,20 @@ export async function POST({ request }) {
       }
     }
 
+    if (action === 'anvil_pool_mint' || action === 'pool_mint_anvil') {
+      const { submitAnvilPoolMint } = await import(
+        '../../utils/server/anvilPoolMint.mjs'
+      );
+      return json(
+        200,
+        await submitAnvilPoolMint({
+          owner: body.owner,
+          amount: body.amount,
+          tokenAddress: body.tokenAddress,
+        }),
+      );
+    }
+
     if (action === 'request_credit' || action === 'credit') {
       const pub = await getPoolHotPublic();
       let inspected = null;

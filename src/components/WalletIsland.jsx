@@ -1432,49 +1432,50 @@ export default function WalletIsland() {
       }
       setLoading(true);
 
-      // Server Anvil is usually up; MetaMask often still points 31337 at localhost:8545.
       const liveSigner = await ensureL1ReadyForSend();
       const publicRpc =
         (getNetwork() || ACTIVE_NETWORK)?.rpcUrl ||
         RPC_URL ||
         'https://cartesi-bridge.duckdns.org/rpc';
-      const pub = new ethers.JsonRpcProvider(publicRpc);
-      const from = await liveSigner.getAddress();
-      // After `cartesi run` wipe, MetaMask keeps a stale nonce → "nonce too high".
-      const nonce = await pub.getTransactionCount(from, 'pending');
-      const fee = await pub.getFeeData();
 
-      // UTF-8 JSON bytes — MetaMask may offer a UTF-8 view of the `input` param
+      // Same shape as before 3P rotation: gasLimit only. Extra nonce/fee fields
+      // made Rabby "sign" a tx that this Anvil never saw (nonce 0x7099 still 0).
       const message = JSON.stringify(payload);
       const payloadBytes = new TextEncoder().encode(message);
-      // Gas scales with calldata; 200k was tight for larger InputBox payloads (e.g. proofs).
       const gasLimit = BigInt(Math.min(1_500_000, 80_000 + payloadBytes.length * 16 + 50_000));
       const inputBox = new ethers.Contract(INPUT_BOX_ADDRESS, INPUT_BOX_ABI, liveSigner);
-      toast.loading('Confirm InputBox.addInput in MetaMask…', { duration: 20000 });
+      toast.loading('Confirm InputBox.addInput in the wallet…', { duration: 20000 });
       let tx;
       try {
-        tx = await inputBox.addInput(DAPP_ADDRESS, payloadBytes, {
-          gasLimit,
-          nonce,
-          maxFeePerGas: fee.maxFeePerGas ?? undefined,
-          maxPriorityFeePerGas: fee.maxPriorityFeePerGas ?? undefined,
-        });
+        tx = await inputBox.addInput(DAPP_ADDRESS, payloadBytes, { gasLimit });
       } catch (sendErr) {
         const m = sendErr?.message || String(sendErr);
-        if (/nonce too high|nonce has already been used|NONCE/i.test(m)) {
+        if (/nonce too high|nonce has already been used/i.test(m)) {
           throw new Error(
-            'Anvil was reset — MetaMask has a stale nonce. MetaMask → Settings → Advanced → Clear activity tab data, then mint again.',
+            'Anvil was reset — wallet nonce is stale. Settings → Advanced → Clear activity tab data, then mint again.',
           );
         }
         if (/user rejected|denied/i.test(m)) throw sendErr;
         throw new Error(`InputBox send failed: ${m}`);
       }
-      // Wait on the public RPC, not MetaMask's (often localhost after wipe).
-      const receipt = await pub.waitForTransaction(tx.hash, 1, 90_000);
+      const pub = new ethers.JsonRpcProvider(publicRpc);
+      let receipt = null;
+      try {
+        receipt = await Promise.race([
+          tx.wait(),
+          pub.waitForTransaction(tx.hash, 1, 45_000),
+        ]);
+      } catch {
+        receipt = await pub.getTransactionReceipt(tx.hash);
+      }
       if (!receipt) {
-        throw new Error(
-          `L1 receipt timeout (90s) for ${tx.hash}. Check Anvil RPC ${publicRpc}.`,
-        );
+        const seen = await pub.getTransaction(tx.hash);
+        if (!seen) {
+          throw new Error(
+            `Wallet signed ${String(tx.hash).slice(0, 12)}… but this Anvil never received it. Rabby/MetaMask 31337 RPC must be ${publicRpc} (not another Anvil).`,
+          );
+        }
+        throw new Error(`L1 tx ${String(tx.hash).slice(0, 12)}… is pending on Anvil — wait and refresh.`);
       }
       // ethers-v6: receipt.hash (v5 used transactionHash)
       const txHash = receipt?.hash || receipt?.transactionHash || tx?.hash || '';

@@ -1698,22 +1698,49 @@ export default function FungiblePool({
 
     setActionStatus({
       kind: 'info',
-      text: `Sign mint of ${mintAmt} in MetaMask (InputBox on Anvil 31337). Deposit is already credited — this only records the claim.`,
+      text: `Minting ${mintAmt} claim (deposit already credited)…`,
     });
-    toast.loading(
-      `Sign mint of ${mintAmt} in MetaMask (InputBox.addInput). Approve the tx, not a network dialog.`,
-      { id: 'pool', duration: Infinity },
-    );
-    // Skip in-page preview: one extra dialog was eating the toast and
-    // looking like a hang. Payload is tiny (type/amount/token).
-    await send(
-      {
-        type: 'pool_mint_wwart',
-        amount: mintAmt,
-        tokenAddress: String(wwartToken).toLowerCase(),
-      },
-      { skipConfirm: true },
-    );
+    toast.loading(`Minting ${mintAmt} claim via Anvil InputBox…`, {
+      id: 'pool',
+      duration: Infinity,
+    });
+    // Mode A: same as deposit credit — host posts InputBox from the demo
+    // key. Wallet addInput has not reached this Anvil since the last wipe.
+    let mintedVia = 'wallet';
+    try {
+      const relayed = await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({
+          action: 'anvil_pool_mint',
+          owner,
+          amount: mintAmt,
+          tokenAddress: String(wwartToken).toLowerCase(),
+        }),
+      });
+      if (relayed?.ok && relayed.txHash) {
+        mintedVia = 'anvil';
+        toast.loading(`Mint InputBox ${String(relayed.txHash).slice(0, 12)}… waiting rollup`, {
+          id: 'pool',
+          duration: Infinity,
+        });
+      } else {
+        throw new Error(relayed?.error || 'anvil mint declined');
+      }
+    } catch {
+      mintedVia = 'wallet';
+      toast.loading(
+        `Sign mint of ${mintAmt} in the wallet (InputBox.addInput on 31337)`,
+        { id: 'pool', duration: Infinity },
+      );
+      await send(
+        {
+          type: 'pool_mint_wwart',
+          amount: mintAmt,
+          tokenAddress: String(wwartToken).toLowerCase(),
+        },
+        { skipConfirm: true },
+      );
+    }
     setActionStatus({
       kind: 'info',
       text: 'Mint submitted to Anvil — waiting for rollup inspect (up to ~45s)…',
@@ -1755,10 +1782,13 @@ export default function FungiblePool({
         kind: 'ok',
         text: `Minted ${mintAmt} more (claim now ${humanFrom18(userBn(after, 'claim18'))}). Withdraw when you want wWART.`,
       });
-      toast.success(`Minted ${mintAmt} more pool claim`, {
-        id: 'pool',
-        duration: 10000,
-      });
+      toast.success(
+        `Minted ${mintAmt} more pool claim${mintedVia === 'anvil' ? ' (Anvil InputBox)' : ''}`,
+        {
+          id: 'pool',
+          duration: 10000,
+        },
+      );
       return;
     }
     throw new Error(
