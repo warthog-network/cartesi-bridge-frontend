@@ -695,22 +695,35 @@ function paidRowFromSession(t) {
   };
 }
 
-/** Paid if the durable log or the session already has this ticketId. */
-export function paidRecordFor(ticketId) {
-  const id = String(ticketId || '').trim();
-  if (!id) return null;
-  const fromLog = (loadPaidLog().pays || []).find((p) => String(p.ticketId || '') === id);
-  if (fromLog) return { ...fromLog, status: 'paid', scheme: fromLog.scheme || POOL3P_SCHEME };
-  try {
-    const s = JSON.parse(readFileSync(SESS_PATH, 'utf8'));
-    return paidRowFromSession(s.tickets?.[id]);
-  } catch {
-    return null;
-  }
+function samePaidAmount(row, amountE8) {
+  if (amountE8 == null || amountE8 === '') return false;
+  if (row?.amountE8 == null || row.amountE8 === '') return false;
+  return String(row.amountE8) === String(amountE8);
 }
 
-export function ticketIsPaid(ticketId) {
-  return !!paidRecordFor(ticketId);
+/** Paid if log/session has this ticketId for the same amount (ids reuse after a machine reset). */
+export function paidRecordFor(ticketId, extra = {}) {
+  const id = String(ticketId || '').trim();
+  if (!id) return null;
+  const amt = extra.amountE8 != null && extra.amountE8 !== '' ? String(extra.amountE8) : null;
+  if (amt) {
+    const fromLog = (loadPaidLog().pays || []).find(
+      (p) => String(p.ticketId || '') === id && samePaidAmount(p, amt),
+    );
+    if (fromLog) return { ...fromLog, status: 'paid', scheme: fromLog.scheme || POOL3P_SCHEME };
+  }
+  try {
+    const s = JSON.parse(readFileSync(SESS_PATH, 'utf8'));
+    const row = paidRowFromSession(s.tickets?.[id]);
+    if (row && (amt ? samePaidAmount(row, amt) : true)) return row;
+  } catch {
+    /* */
+  }
+  return null;
+}
+
+export function ticketIsPaid(ticketId, extra = {}) {
+  return !!paidRecordFor(ticketId, extra);
 }
 
 function fillRoomMeta(ticket, extra = {}) {
@@ -729,7 +742,7 @@ export function rememberInspectTickets(tickets) {
   const map = new Map(inspectRoomHints);
   for (const t of tickets || []) {
     const id = String(t?.ticketId || '').trim();
-    if (!id || ticketIsPaid(id)) continue;
+    if (!id || ticketIsPaid(id, { amountE8: t.amountE8 })) continue;
     map.set(id, {
       ticketId: id,
       amountE8: t.amountE8 != null ? String(t.amountE8) : null,
@@ -1599,7 +1612,7 @@ export async function pool3pReuseOrPrepare(ticketId, { toAddress, amountE8, make
   const id = String(ticketId || '').trim();
   if (!id) throw new Error('ticketId required');
   return withTicketGate(id, async () => {
-    const paid = paidRecordFor(id);
+    const paid = paidRecordFor(id, { amountE8 });
     if (paid) return { alreadyPaid: true, ticketId: id, ...paid };
     const s = await loadSessions();
     const prev = s.tickets[id] || {};
@@ -1644,7 +1657,7 @@ export async function rebuildLindell(ticketId) {
 
 export async function pool3pRememberPrepare(ticketId, prep) {
   const id = String(ticketId);
-  if (ticketIsPaid(id)) return prep;
+  if (ticketIsPaid(id, { amountE8: prep?.amountE8 })) return prep;
   await withSessions((s) => {
     const prev = s.tickets[id] || {};
     if (sessionLooksPaid(prev)) return;
@@ -1877,11 +1890,11 @@ function summarizeSess(sess) {
 export async function openPool3pPayout({ ticketId, toAddress, amountE8 }) {
   const id = String(ticketId || '').trim();
   if (!id) throw new Error('ticketId required');
-  const paid = paidRecordFor(id);
+  const paid = paidRecordFor(id, { amountE8 });
   if (paid) return { ok: true, alreadyPaid: true, ticketId: id, ...paid };
   return withSessions((s) => {
     const raw = s.tickets[id] || {};
-    if (sessionLooksPaid(raw)) {
+    if (sessionLooksPaid(raw) && samePaidAmount(paidRowFromSession(raw) || raw, amountE8)) {
       return { ok: true, alreadyPaid: true, ...summarizeSess(raw) };
     }
     const prev = sessionAbandoned(raw) ? { ticketId: id } : raw;
@@ -1916,9 +1929,9 @@ export function listOpenPool3pTickets() {
   const push = (t) => {
     const id = String(t?.ticketId || '').trim();
     if (!id || seen.has(id)) return;
-    if (ticketIsPaid(id) || sessionLooksPaid(t) || sessionAbandoned(t)) return;
     const hint = hintFor(id);
     const amountE8 = t.amountE8 || hint?.amountE8;
+    if (ticketIsPaid(id, { amountE8 }) || sessionLooksPaid(t) || sessionAbandoned(t)) return;
     const toAddress = t.toAddress || hint?.toAddress;
     if (!amountE8 || !toAddress) return;
     seen.add(id);
@@ -1952,7 +1965,7 @@ export function listOpenPool3pTickets() {
   for (const hint of inspectRoomHints.values()) {
     const existing = s.tickets?.[String(hint.ticketId)];
     if (
-      ticketIsPaid(hint.ticketId) ||
+      ticketIsPaid(hint.ticketId, { amountE8: hint.amountE8 }) ||
       sessionLooksPaid(existing) ||
       sessionAbandoned(existing)
     ) {
@@ -2054,7 +2067,11 @@ async function rememberPaid(row) {
   const tx = row?.txHash ? String(row.txHash) : '';
   const id = String(row?.ticketId || '');
   const dup = log.pays.some(
-    (p) => (tx && p.txHash === tx) || (id && String(p.ticketId || '') === id),
+    (p) =>
+      (tx && p.txHash === tx) ||
+      (id &&
+        String(p.ticketId || '') === id &&
+        String(p.amountE8 || '') === String(row.amountE8 || '')),
   );
   if (!dup && (tx || id)) {
     log.pays.unshift({
@@ -2181,9 +2198,11 @@ export async function pool3pSubmitGuarded(ticketId, { hashHex, submitFn }) {
   if (!id) throw new Error('ticketId required');
   if (typeof submitFn !== 'function') throw new Error('submitFn required');
   return withTicketGate(id, async () => {
-    const paid = paidRecordFor(id);
+    const s0 = await loadSessions();
+    const amt0 = s0.tickets[id]?.amountE8 || s0.tickets[id]?.prep?.amountE8;
+    const paid = paidRecordFor(id, { amountE8: amt0 });
     if (paid) return { ok: true, alreadyPaid: true, ticketId: id, ...paid };
-    const s = await loadSessions();
+    const s = s0;
     const t = s.tickets[id];
     if (sessionLooksPaid(t)) {
       return { ok: true, alreadyPaid: true, ticketId: id, ...paidRowFromSession(t) };
