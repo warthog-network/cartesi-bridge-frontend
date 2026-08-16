@@ -11,7 +11,15 @@
  * (fresh cycle — they do not pick up a hung tracker).
  */
 import { useCallback, useEffect, useState } from 'react';
-import { Droplets, RefreshCw, Layers, Zap, ArrowRightLeft } from 'lucide-react';
+import {
+  Droplets,
+  RefreshCw,
+  Layers,
+  Zap,
+  ArrowDownUp,
+  ChevronDown,
+  ChevronRight,
+} from 'lucide-react';
 import { toast } from 'react-hot-toast';
 import { ethers } from 'ethers-v6';
 import { FUNGIBLE_POOL } from '../utils/fungiblePoolConfig.js';
@@ -819,6 +827,8 @@ export default function FungiblePool({
   onRefreshMmWwart,
 }) {
   const [open, setOpen] = useState(true);
+  const [showManual, setShowManual] = useState(false);
+  const [swapDir, setSwapDir] = useState('to_wwart'); // to_wwart | to_wart
   const [busy, setBusy] = useState(false);
   const [snap, setSnap] = useState(null);
   const [amount, setAmount] = useState('1');
@@ -2773,102 +2783,17 @@ export default function FungiblePool({
         </div>
       </header>
 
-      <p
-        className="wi-muted"
-        style={{ margin: '0.45rem 0 0.65rem', fontSize: '0.8rem', lineHeight: 1.45 }}
-      >
-        <strong>Live:</strong> <strong>WART → wWART</strong> always sends the box amount
-        and forces mint of that deposit (does not resume a leftover tracker).{' '}
-        <strong>wWART → WART</strong> portals MetaMask wWART and 3P-pays native WART.
-        Old <strong>Get wWART (1-click)</strong> may skip steps if inspect already
-        shows credit. <strong>Deposit WART</strong>{' '}
-        alone sends → SPV credit via relayer. If credit never lands,{' '}
-        <strong>Resume credit</strong> with the Warthog tx hash — never re-send. Then Mint →
-        Withdraw wWART or <strong>Redeem WART</strong>.{' '}
-        <strong>A-β holder redeem:</strong> any holder with portal pool-wWART can burn;
-        payout comes from <em>shared pool collateral</em> (FIFO across depositors — not only
-        your own deposit). <strong>Fungible peg</strong> (unlike ZK Vault personal custody).
+      <p className="fp-status-line">
+        1:1 pool swap. Native WART in → MetaMask wWART out, or the reverse via 3P payout.
+        {pool3pSt?.configured ? (
+          <>
+            {' '}
+            Signers {pool3pSt.d1Live ? 'd1 live' : 'd1 waiting'} ·{' '}
+            {pool3pSt.d2Live ? 'd2 live' : 'd2 waiting'}
+            {pool3pSt.orbit ? ` · orbit ${pool3pSt.orbit.liveCount || 0}` : ''}.
+          </>
+        ) : null}
       </p>
-      <div
-        style={{
-          margin: '0 0 0.65rem',
-          fontSize: '0.78rem',
-          lineHeight: 1.45,
-          color: '#ffe6a8',
-          padding: '0.55rem 0.65rem',
-          borderRadius: 8,
-          background:
-            'linear-gradient(120deg, rgba(50, 36, 0, 0.95) 0%, rgba(12, 14, 16, 0.96) 100%)',
-          border: '1px solid rgba(253,185,19,0.55)',
-        }}
-      >
-        <div style={{ fontWeight: 700, fontSize: '0.82rem', marginBottom: 4 }}>
-          Release custody:{' '}
-          <span style={{ color: '#FDB913' }}>3P vault (d_dapp + d1 + d2)</span>
-        </div>
-        <div className="wi-muted" style={{ fontSize: '0.72rem', color: 'inherit', opacity: 0.92 }}>
-          Same fungible deposit/mint. After burn/redeem, WART leaves only as a
-          3P Lindell ECDSA: browsers hold <strong>d1</strong> and <strong>d2</strong>,
-          VPS holds only <strong>d_dapp</strong> + Enc(d1). No hot-key fallback.
-          A dropped seat is rebuilt from the orbit pack (same Q). Extra tabs vote
-          in orbit and do not hold the spend shares.
-        </div>
-        <div
-          style={{
-            marginTop: 8,
-            fontSize: '0.72rem',
-            fontFamily: 'monospace',
-            opacity: 0.95,
-            wordBreak: 'break-all',
-          }}
-        >
-          3P address: {poolAddr}
-          {pool3pSt?.configured ? (
-            <>
-              <br />
-              d1: {pool3pSt.d1Live ? `${String(pool3pSt.holder1).slice(0, 14)}… live` : pool3pSt.holder1 ? 'assigned' : 'vacant (rebuild from pack)'}
-              {' · '}
-              d2: {pool3pSt.d2Live ? `${String(pool3pSt.holder2).slice(0, 14)}… live` : pool3pSt.holder2 ? 'assigned' : 'vacant (rebuild from pack)'}
-              {pool3pSt.orbit ? (
-                <>
-                  <br />
-                  orbit: {pool3pSt.orbit.liveCount || 0} live
-                </>
-              ) : null}
-              {(pool3pSt.paid || []).length ? (
-                <>
-                  <br />
-                  last 3P pay:{' '}
-                  {String((pool3pSt.paid[0] || {}).txHash || '').slice(0, 16) || 'submitted'}
-                  {(pool3pSt.paid[0] || {}).txHash ? '…' : ''}
-                </>
-              ) : null}
-            </>
-          ) : (
-            <>
-              <br />
-              3P status: {pool3pSt ? 'not configured' : 'loading…'}
-            </>
-          )}
-        </div>
-      </div>
-      {snap?.redeemPhase === 'A-beta' || snap?.holderRedeem ? (
-        <p
-          style={{
-            margin: '0 0 0.65rem',
-            fontSize: '0.75rem',
-            lineHeight: 1.4,
-            color: '#f0c674',
-            padding: '0.4rem 0.55rem',
-            borderRadius: 6,
-            background: 'rgba(240,198,116,0.1)',
-            border: '1px solid rgba(240,198,116,0.35)',
-          }}
-        >
-          Holder redeem spends pool-wide locked WART. Buying wWART and redeeming can debit
-          another depositor’s share if your own deposit is insufficient.
-        </p>
-      ) : null}
 
       {open && (
         <>
@@ -2899,218 +2824,133 @@ export default function FungiblePool({
             </div>
           </div>
 
-          <div
-            className="sw-card-meta"
-            style={{ marginBottom: '0.65rem', fontSize: '0.78rem' }}
-          >
-            <div className="sw-meta-row">
-              <span className="sw-meta-k">3P pool (send here)</span>
-              <span
-                className="sw-meta-v"
-                style={{
-                  fontFamily: 'monospace',
-                  fontSize: '0.7rem',
-                  wordBreak: 'break-all',
-                  color: '#FDB913',
-                }}
-                title={poolAddr}
-              >
-                {poolAddr}
-              </span>
-            </div>
-            {previousQ &&
-            String(previousQ).toLowerCase() !== String(poolAddr || '').toLowerCase() ? (
-              <div className="sw-meta-row">
-                <span className="sw-meta-k">Previous Q (swept)</span>
-                <span
-                  className="sw-meta-v"
-                  style={{
-                    fontFamily: 'monospace',
-                    fontSize: '0.7rem',
-                    wordBreak: 'break-all',
-                    opacity: 0.75,
-                  }}
-                  title="Old 3P address after rotation — do not send here"
-                >
-                  {previousQ}
-                </span>
-              </div>
-            ) : null}
-            <div className="sw-meta-row">
-              <span className="sw-meta-k">Data</span>
-              <span className="sw-meta-v">{snap?.source || '—'}</span>
-            </div>
-            {spv && (
-              <>
-                <div className="sw-meta-row">
-                  <span className="sw-meta-k">SPV</span>
-                  <span className="sw-meta-v" style={{ color: spv.bootstrapped ? '#7dffa3' : '#f0c674' }}>
-                    {spv.bootstrapped ? 'bootstrapped' : 'not ready'}
-                    {spv.requireSpv ? ' · SPV-only' : ' · legacy allowed'}
-                    {spv.minConfirmations != null
-                      ? ` · conf≥${spv.minConfirmations}`
-                      : ''}
-                  </span>
-                </div>
-                <div className="sw-meta-row">
-                  <span className="sw-meta-k">LC tip</span>
-                  <span
-                    className="sw-meta-v"
-                    style={{ fontFamily: 'monospace', fontSize: '0.7rem' }}
-                    title={spv.bestHash || ''}
-                  >
-                    h={spv.bestHeight ?? '—'} · headers={spv.headersStored ?? '—'}
-                  </span>
-                </div>
-              </>
-            )}
-            {u && (
-              <>
-                <div className="sw-meta-row">
-                  <span className="sw-meta-k">Your deposit</span>
-                  <span className="sw-meta-v">{u.depositedHuman} WART</span>
-                </div>
-                <div className="sw-meta-row">
-                  <span className="sw-meta-k">Your freeable</span>
-                  <span className="sw-meta-v" title="Deposit not backing open claims — Redeem pays this">
-                    {u.freeableHuman ?? '0'} WART
-                  </span>
-                </div>
-                <div className="sw-meta-row">
-                  <span className="sw-meta-k">Your claim / portable</span>
-                  <span className="sw-meta-v">
-                    {u.claimHuman} / {u.portableHuman}
-                  </span>
-                </div>
-              </>
-            )}
-          </div>
-
           {mode === 'live' && (
-            <div
-              style={{
-                marginBottom: '0.65rem',
-                padding: '0.55rem 0.65rem',
-                borderRadius: 8,
-                border: '1px solid rgba(0, 255, 204, 0.45)',
-                background:
-                  'linear-gradient(120deg, rgba(0, 70, 62, 0.92) 0%, rgba(10, 18, 22, 0.95) 100%)',
-              }}
-            >
-              <div
-                style={{
-                  display: 'flex',
-                  flexWrap: 'wrap',
-                  gap: '0.4rem',
-                  alignItems: 'center',
-                }}
-              >
+            <div className="fp-swap">
+              <div className="fp-swap-head">
+                <span className="fp-swap-title">Atomic swap</span>
+                <span className="fp-swap-peg">1 WART = 1 wWART</span>
+              </div>
+              <div className="fp-swap-leg">
+                <div className="fp-swap-leg-top">
+                  <span>You pay</span>
+                  <span>
+                    {swapDir === 'to_wwart'
+                      ? u?.depositedHuman
+                        ? `credited ${u.depositedHuman}`
+                        : 'from Warthog'
+                      : mmWwartLabel
+                        ? `wallet ${mmWwartLabel}`
+                        : 'from MetaMask'}
+                  </span>
+                </div>
+                <div className="fp-swap-row">
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    className="fp-swap-input"
+                    value={amount}
+                    onChange={(e) => setAmount(e.target.value)}
+                    placeholder="0.0"
+                    disabled={busy || !owner}
+                    aria-label={
+                      swapDir === 'to_wwart'
+                        ? 'WART amount to swap in'
+                        : 'wWART amount to swap in'
+                    }
+                  />
+                  <span className="fp-swap-asset">
+                    {swapDir === 'to_wwart' ? 'WART' : 'wWART'}
+                  </span>
+                </div>
+              </div>
+              <div className="fp-swap-flip">
+                <button
+                  type="button"
+                  title="Flip swap direction"
+                  disabled={busy}
+                  onClick={() =>
+                    setSwapDir((d) => (d === 'to_wwart' ? 'to_wart' : 'to_wwart'))
+                  }
+                >
+                  <ArrowDownUp size={16} aria-hidden />
+                </button>
+              </div>
+              <div className="fp-swap-leg">
+                <div className="fp-swap-leg-top">
+                  <span>You receive</span>
+                  <span>
+                    {swapDir === 'to_wwart' ? 'to MetaMask' : 'to Warthog'}
+                  </span>
+                </div>
+                <div className="fp-swap-row">
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    className="fp-swap-input"
+                    value={amount}
+                    onChange={(e) => setAmount(e.target.value)}
+                    placeholder="0.0"
+                    disabled={busy || !owner}
+                    aria-label={
+                      swapDir === 'to_wwart'
+                        ? 'wWART amount you receive'
+                        : 'WART amount you receive'
+                    }
+                  />
+                  <span className="fp-swap-asset is-out">
+                    {swapDir === 'to_wwart' ? 'wWART' : 'WART'}
+                  </span>
+                </div>
+              </div>
+              {swapDir === 'to_wart' ? (
                 <input
                   type="text"
-                  inputMode="decimal"
-                  className="input wi-portal-input"
-                  style={{ maxWidth: '7rem' }}
-                  value={amount}
-                  onChange={(e) => setAmount(e.target.value)}
-                  placeholder="Amount"
+                  className="fp-swap-to"
+                  value={toAddress}
+                  onChange={(e) => setToAddress(e.target.value)}
+                  placeholder={
+                    wartBridgeApi?.address
+                      ? `WART pays to ${String(wartBridgeApi.address).slice(0, 12)}… (or paste another)`
+                      : 'Warthog address to receive WART'
+                  }
                   disabled={busy || !owner}
-                  aria-label="Amount for 1-click or step actions"
+                  aria-label="Warthog address for WART payout"
                 />
-                <button
-                  type="button"
-                  className="btn primary small"
-                  disabled={
-                    busy ||
-                    !owner ||
-                    !signer ||
-                    !wartBridgeApi?.sendTransaction ||
-                    bindBlocked
-                  }
-                  onClick={() => run('atomic_to_wwart')}
-                  title={
-                    bindBlocked
-                      ? wartBind?.error ||
-                        'This Warthog wallet is bound to another L1 address'
-                      : 'Always send this WART, mint that deposit, execute wWART. Does not resume leftover tracker.'
-                  }
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '0.3rem',
-                    fontWeight: 700,
-                  }}
-                >
-                  <ArrowRightLeft size={14} aria-hidden />
-                  WART → wWART
-                </button>
-                <button
-                  type="button"
-                  className="btn secondary small"
-                  disabled={
-                    busy ||
-                    !owner ||
-                    !signer ||
-                    !(toAddress || wartBridgeApi?.address)
-                  }
-                  onClick={() => run('atomic_to_wart')}
-                  title="Portal this MetaMask wWART, burn, 3P-pay native WART. Fresh cycle — no leftover ticket resume."
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '0.3rem',
-                    fontWeight: 700,
-                  }}
-                >
-                  <ArrowRightLeft size={14} aria-hidden />
-                  wWART → WART
-                </button>
-                <button
-                  type="button"
-                  className="btn secondary small"
-                  disabled={
-                    busy ||
-                    !owner ||
-                    !signer ||
-                    !wartBridgeApi?.sendTransaction ||
-                    bindBlocked
-                  }
-                  onClick={() => run('one_click_wwart')}
-                  title={
-                    bindBlocked
-                      ? wartBind?.error ||
-                        'This Warthog wallet is bound to another L1 address'
-                      : 'Legacy 1-click — may skip deposit/mint if inspect already shows credit'
-                  }
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '0.3rem',
-                    fontWeight: 700,
-                  }}
-                >
-                  <Zap size={14} aria-hidden />
-                  Get wWART (1-click)
-                </button>
-              </div>
-              <p
-                className="wi-muted"
-                style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', lineHeight: 1.4 }}
+              ) : null}
+              <button
+                type="button"
+                className="btn primary fp-swap-go"
+                disabled={
+                  busy ||
+                  !owner ||
+                  !signer ||
+                  (swapDir === 'to_wwart'
+                    ? !wartBridgeApi?.sendTransaction || bindBlocked
+                    : !(toAddress || wartBridgeApi?.address))
+                }
+                onClick={() =>
+                  run(swapDir === 'to_wwart' ? 'atomic_to_wwart' : 'atomic_to_wart')
+                }
+                title={
+                  bindBlocked && swapDir === 'to_wwart'
+                    ? wartBind?.error ||
+                      'This Warthog wallet is bound to another L1 address'
+                    : swapDir === 'to_wwart'
+                      ? 'Send this WART, mint that deposit, execute wWART'
+                      : 'Portal this wWART, burn, 3P-pay native WART'
+                }
               >
-                <strong>WART → wWART</strong> always sends the box amount and mints
-                that deposit (SPV wait + InputBox + <code>executeVoucher</code>).
-                It will not skip because an old tracker still shows credit.{' '}
-                <strong>wWART → WART</strong> portals MetaMask wWART then 3P-pays
-                your Warthog address. Legacy 1-click still resumes leftover steps.
+                <ArrowDownUp size={16} aria-hidden />
+                {swapDir === 'to_wwart' ? 'Swap WART → wWART' : 'Swap wWART → WART'}
+              </button>
+              <p className="fp-swap-hint">
+                {swapDir === 'to_wwart'
+                  ? 'Always sends the amount above and mints that deposit. Does not resume a leftover tracker.'
+                  : 'Portals the amount above from MetaMask, then 3P-pays native WART. d1 + d2 must be live.'}
               </p>
               {!signer && owner ? (
-                <p
-                  style={{
-                    margin: '0.35rem 0 0',
-                    fontSize: '0.72rem',
-                    color: '#f0c674',
-                  }}
-                >
-                  Connect MetaMask to enable 1-click (voucher execute needs a signer).
+                <p className="fp-swap-hint" style={{ color: '#f0c674' }}>
+                  Connect MetaMask to finish the swap (voucher execute / portal).
                 </p>
               ) : null}
             </div>
@@ -3149,6 +2989,109 @@ export default function FungiblePool({
             </div>
           ) : null}
 
+          {!owner && (
+            <p className="wi-muted" style={{ fontSize: '0.78rem' }}>
+              Connect L1 wallet so credits attach to your address.
+            </p>
+          )}
+          {owner && mode === 'live' && !wartBridgeApi?.address && (
+            <p className="wi-muted" style={{ fontSize: '0.78rem', color: '#f0c674' }}>
+              Unlock Warthog below to swap real WART.
+            </p>
+          )}
+          {bindBlocked && (
+            <p
+              className="wi-muted"
+              style={{ fontSize: '0.8rem', color: '#ffb4a2', marginTop: '0.45rem' }}
+            >
+              {wartBind?.error ||
+                'This Warthog wallet is already bound to another L1 address. Switch MetaMask to that account — WART will not be sent from here.'}
+            </p>
+          )}
+          {!bindBlocked && wartBind?.needsRegister && owner && wartFrom && (
+            <p
+              className="wi-muted"
+              style={{ fontSize: '0.8rem', color: '#f0c674', marginTop: '0.45rem' }}
+            >
+              First swap will bind this Warthog wallet to {String(owner).slice(0, 10)}…
+              (Warthog + MetaMask signatures).
+            </p>
+          )}
+
+          <button
+            type="button"
+            className="fp-manual-toggle"
+            onClick={() => setShowManual((v) => !v)}
+            aria-expanded={showManual}
+          >
+            {showManual ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            Manual steps
+          </button>
+
+          {showManual ? (
+          <div>
+          <div
+            className="sw-card-meta"
+            style={{ marginBottom: '0.65rem', fontSize: '0.78rem' }}
+          >
+            <div className="sw-meta-row">
+              <span className="sw-meta-k">3P pool (send here)</span>
+              <span
+                className="sw-meta-v"
+                style={{
+                  fontFamily: 'monospace',
+                  fontSize: '0.7rem',
+                  wordBreak: 'break-all',
+                  color: '#FDB913',
+                }}
+                title={poolAddr}
+              >
+                {poolAddr}
+              </span>
+            </div>
+            {previousQ &&
+            String(previousQ).toLowerCase() !== String(poolAddr || '').toLowerCase() ? (
+              <div className="sw-meta-row">
+                <span className="sw-meta-k">Previous Q (swept)</span>
+                <span
+                  className="sw-meta-v"
+                  style={{
+                    fontFamily: 'monospace',
+                    fontSize: '0.7rem',
+                    wordBreak: 'break-all',
+                    opacity: 0.75,
+                  }}
+                  title="Old 3P address after rotation — do not send here"
+                >
+                  {previousQ}
+                </span>
+              </div>
+            ) : null}
+            {spv && (
+              <div className="sw-meta-row">
+                <span className="sw-meta-k">SPV</span>
+                <span className="sw-meta-v" style={{ color: spv.bootstrapped ? '#7dffa3' : '#f0c674' }}>
+                  {spv.bootstrapped ? 'bootstrapped' : 'not ready'}
+                  {spv.minConfirmations != null ? ` · conf≥${spv.minConfirmations}` : ''}
+                  {spv.bestHeight != null ? ` · h=${spv.bestHeight}` : ''}
+                </span>
+              </div>
+            )}
+            {u && (
+              <>
+                <div className="sw-meta-row">
+                  <span className="sw-meta-k">Your deposit</span>
+                  <span className="sw-meta-v">{u.depositedHuman} WART</span>
+                </div>
+                <div className="sw-meta-row">
+                  <span className="sw-meta-k">Your claim / portable</span>
+                  <span className="sw-meta-v">
+                    {u.claimHuman} / {u.portableHuman}
+                  </span>
+                </div>
+              </>
+            )}
+          </div>
           <div
             style={{
               display: 'flex',
@@ -3181,8 +3124,23 @@ export default function FungiblePool({
                 marginBottom: '0.1rem',
               }}
             >
-              Manual steps
+              Recovery / step-by-step
             </span>
+            <button
+              type="button"
+              className="btn secondary small"
+              disabled={
+                busy ||
+                !owner ||
+                !signer ||
+                !wartBridgeApi?.sendTransaction ||
+                bindBlocked
+              }
+              onClick={() => run('one_click_wwart')}
+              title="Legacy 1-click — may skip deposit/mint if inspect already shows credit"
+            >
+              <Zap size={14} aria-hidden style={{ verticalAlign: -2 }} /> Get wWART (1-click)
+            </button>
             <button
               type="button"
               className="btn primary small"
@@ -3254,35 +3212,6 @@ export default function FungiblePool({
             }
             disabled={busy || !owner}
           />
-
-          {!owner && (
-            <p className="wi-muted" style={{ fontSize: '0.78rem' }}>
-              Connect L1 wallet so credits attach to your address.
-            </p>
-          )}
-          {owner && mode === 'live' && !wartBridgeApi?.address && (
-            <p className="wi-muted" style={{ fontSize: '0.78rem', color: '#f0c674' }}>
-              Unlock Warthog below to deposit real WART into the pool.
-            </p>
-          )}
-          {bindBlocked && (
-            <p
-              className="wi-muted"
-              style={{ fontSize: '0.8rem', color: '#ffb4a2', marginTop: '0.45rem' }}
-            >
-              {wartBind?.error ||
-                'This Warthog wallet is already bound to another L1 address. Switch MetaMask to that account — WART will not be sent from here.'}
-            </p>
-          )}
-          {!bindBlocked && wartBind?.needsRegister && owner && wartFrom && (
-            <p
-              className="wi-muted"
-              style={{ fontSize: '0.8rem', color: '#f0c674', marginTop: '0.45rem' }}
-            >
-              First deposit will bind this Warthog wallet to {String(owner).slice(0, 10)}…
-              (Warthog + MetaMask signatures). Nobody else can claim it after that.
-            </p>
-          )}
 
           {mode === 'live' && owner && (openFlows.length > 0 || pendingList.length > 0) && (
             <div
@@ -3576,6 +3505,8 @@ export default function FungiblePool({
               {lastTicket.amountE8 ? ` · ${humanFromE8(lastTicket.amountE8)} WART` : ''}
             </p>
           )}
+          </div>
+          ) : null}
         </>
       )}
     </section>
