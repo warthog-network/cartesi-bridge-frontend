@@ -1198,17 +1198,20 @@ export default function FungiblePool({
           err.row = row;
           throw err;
         }
-        // Surface relayer progress so UI does not look hung
-        const note =
-          row?.error ||
-          row?.note ||
-          (row?.status === 'submitted'
-            ? 'L1 input in; waiting rollup notice…'
-            : row?.status === 'pending'
-              ? 'queued for relayer…'
-              : row?.status === 'processing'
-                ? 'relayer processing (SPV / LC catch-up)…'
-                : '');
+        // Surface relayer progress so UI does not look hung.
+        // Confirmation waits used to be written as "SPV failed: need 2 confs,
+        // have 1" even though the next tick credited.
+        const rawNote = String(row?.error || row?.note || '');
+        const note = /need \d+ confs, have \d+|waiting conf/i.test(rawNote)
+          ? 'waiting for Warthog confirmations…'
+          : rawNote ||
+            (row?.status === 'submitted'
+              ? 'L1 input in; waiting rollup notice…'
+              : row?.status === 'pending'
+                ? 'queued for relayer…'
+                : row?.status === 'processing'
+                  ? 'relayer processing (SPV / LC catch-up)…'
+                  : '');
         if (note && note !== lastStatusNote) {
           lastStatusNote = note;
           toast.loading(`Pool credit: ${note}`, { id: 'pool' });
