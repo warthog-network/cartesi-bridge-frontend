@@ -828,7 +828,13 @@ export default function FungiblePool({
 }) {
   const [open, setOpen] = useState(true);
   const [swapDir, setSwapDir] = useState('to_wwart'); // to_wwart | to_wart
+  const [swapFlipTick, setSwapFlipTick] = useState(0);
   const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (!swapFlipTick) return undefined;
+    const t = setTimeout(() => setSwapFlipTick(0), 520);
+    return () => clearTimeout(t);
+  }, [swapFlipTick]);
   const [snap, setSnap] = useState(null);
   const [amount, setAmount] = useState('1');
   const [toAddress, setToAddress] = useState('');
@@ -2905,7 +2911,7 @@ export default function FungiblePool({
           </div>
 
           {mode === 'live' && (
-            <div className="fp-swap">
+            <div className={`fp-swap${swapFlipTick ? ' is-flipping' : ''}`}>
               <div className="fp-swap-head">
                 <span className="fp-swap-title">
                   {swapDir === 'to_wwart' ? 'WART → wWART' : 'wWART → WART'}
@@ -2939,14 +2945,21 @@ export default function FungiblePool({
                   </span>
                 </div>
               </div>
-              <div className="fp-swap-flip">
+              <div
+                className={`fp-swap-flip${swapDir === 'to_wart' ? ' is-reverse' : ''}${swapFlipTick ? ' is-spinning' : ''}`}
+                style={{
+                  '--fp-from': swapDir === 'to_wart' ? '0deg' : '180deg',
+                  '--fp-to': swapDir === 'to_wart' ? '180deg' : '360deg',
+                }}
+              >
                 <button
                   type="button"
                   title="Flip direction"
                   disabled={busy}
-                  onClick={() =>
-                    setSwapDir((d) => (d === 'to_wwart' ? 'to_wart' : 'to_wwart'))
-                  }
+                  onClick={() => {
+                    setSwapDir((d) => (d === 'to_wwart' ? 'to_wart' : 'to_wwart'));
+                    setSwapFlipTick((n) => n + 1);
+                  }}
                 >
                   <ArrowDownUp size={16} aria-hidden />
                 </button>
