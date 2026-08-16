@@ -820,6 +820,8 @@ export default function FungiblePool({
   send,
   /** MetaMask / L1 signer — required for 1-click auto voucher execute */
   signer = null,
+  /** Same MmTxConfirm preview used for withdraw / InputBox */
+  confirmMmTx = null,
   wartBridgeApi,
   onRefreshL1Vault,
   /** Live MetaMask ERC-20 wWART balance (human string) — same source as Warthog Overview */
@@ -828,7 +830,6 @@ export default function FungiblePool({
 }) {
   const [open, setOpen] = useState(true);
   const [showManual, setShowManual] = useState(false);
-  const [swapDir, setSwapDir] = useState('to_wwart'); // to_wwart | to_wart
   const [busy, setBusy] = useState(false);
   const [snap, setSnap] = useState(null);
   const [amount, setAmount] = useState('1');
@@ -1223,7 +1224,7 @@ export default function FungiblePool({
     prevLocked,
     timeoutMs = 120000,
   }) => {
-    const hardDeadline = Date.now() + Math.max(timeoutMs, 180000);
+    const hardDeadline = Date.now() + Math.max(timeoutMs, 300000);
     let softDeadline = Date.now() + timeoutMs;
     updatePendingStatus(txHash, 'awaiting_rollup');
     advanceFlowForOwner(owner, 'credit_pending', { depositTxHash: txHash });
@@ -1292,6 +1293,34 @@ export default function FungiblePool({
         if (e?.row) throw e;
       }
       await sleep(2500);
+    }
+    // Last look — credit often lands a second after the wait window.
+    try {
+      const insp = await fetchPoolInspect(owner);
+      if (insp && !insp.error) {
+        const locked = BigInt(String(insp.lockedE8 || 0));
+        const deposited = BigInt(String(insp.user?.depositedE8 || 0));
+        if (deposited > prevDeposited || locked > prevLocked) {
+          return { ok: true, source: 'inspect-late', deposited, locked };
+        }
+      }
+    } catch {
+      /* */
+    }
+    try {
+      const credits = await poolApi(
+        `/api/pool?credits=1&owner=${encodeURIComponent(owner)}&limit=30`,
+      );
+      const row = (credits.items || []).find(
+        (i) =>
+          String(i.txHash || '').toLowerCase() ===
+          String(txHash).replace(/^0x/i, '').toLowerCase(),
+      );
+      if (row?.status === 'credited') {
+        return { ok: true, source: 'queue-credited-late', row };
+      }
+    } catch {
+      /* */
     }
     return { ok: false };
   };
@@ -1564,11 +1593,19 @@ export default function FungiblePool({
     );
   };
 
+  const confirmStyled = async (desc) => {
+    if (typeof confirmMmTx !== 'function') return true;
+    const ok = await confirmMmTx(desc);
+    if (!ok) throw new Error('Cancelled — nothing sent');
+    return true;
+  };
+
   /**
    * 1-button live deposit: send WART once → relayer credits rollup.
    * Never re-sends WART on credit failure — surfaces Resume instead.
+   * @param {{ timeoutMs?: number, preview?: boolean }} [opts]
    */
-  const liveDeposit = async () => {
+  const liveDeposit = async (opts = {}) => {
     if (!owner) throw new Error('Connect L1 wallet');
     if (!wartBridgeApi?.sendTransaction || !wartBridgeApi?.getWartTxProof) {
       throw new Error('Unlock Warthog wallet first (needed to send real WART)');
@@ -1602,6 +1639,30 @@ export default function FungiblePool({
       }
     } catch {
       /* first deposit / inspect lag */
+    }
+
+    if (opts.preview !== false) {
+      await confirmStyled({
+        title: 'Send WART to pool',
+        method: 'Warthog transfer to 3P pool',
+        summary: [
+          `You pay: ${amt} WART`,
+          `You receive: ${amt} wWART`,
+          `To pool: ${String(poolAddr).slice(0, 12)}…`,
+        ].join('\n'),
+        sections: [
+          {
+            label: 'Deposit',
+            json: {
+              youPay: `${amt} WART`,
+              youReceive: `${amt} wWART`,
+              poolAddress: poolAddr,
+              from: wartBridgeApi.address,
+              owner,
+            },
+          },
+        ],
+      });
     }
 
     toast.loading(`Sending ${amt} WART → pool…`, { id: 'pool' });
@@ -1713,7 +1774,7 @@ export default function FungiblePool({
       txHash,
       prevDeposited,
       prevLocked,
-      timeoutMs: 120000,
+      timeoutMs: opts.timeoutMs || 240000,
     });
 
     if (!result.ok) {
@@ -1869,7 +1930,7 @@ export default function FungiblePool({
           amount: mintAmt,
           tokenAddress: String(wwartToken).toLowerCase(),
         },
-        { skipConfirm: true, quiet: true },
+        { quiet: true },
       );
     }
     setActionStatus({
@@ -1971,7 +2032,7 @@ export default function FungiblePool({
         `Sign withdraw of ${amt} in the wallet (InputBox on 31337)`,
         { id: 'pool', duration: Infinity },
       );
-      await send({ type: 'pool_withdraw_wwart', amount: amt }, { skipConfirm: true, quiet: true });
+      await send({ type: 'pool_withdraw_wwart', amount: amt }, { quiet: true });
     }
     toast.loading('Confirming voucher on rollup…', { id: 'pool' });
 
@@ -2129,21 +2190,26 @@ export default function FungiblePool({
     if (!amt) throw new Error('Enter amount');
 
     wipeFlowsForOwner(owner);
-    clearPendingForOwner(owner);
     refreshFlows();
-    refreshPending();
     setActionStatus({
       kind: 'info',
-      text: `Atomic WART → wWART ${amt} (fresh send + forced mint)…`,
+      text: `Swapping ${amt} WART → wWART…`,
     });
 
-    toast.loading(`Atomic: sending ${amt} WART (not resuming tracker)…`, {
+    toast.loading(`Sending ${amt} WART…`, {
       id: 'pool',
       duration: Infinity,
     });
-    await liveDeposit();
+    try {
+      await liveDeposit({ timeoutMs: 240000, preview: true });
+    } catch (e) {
+      const insp = await fetchPoolInspect(owner).catch(() => null);
+      const dep = userBn(insp, 'depositedE8');
+      if (!(insp && dep > 0n)) throw e;
+      toast.loading('Deposit already credited — minting…', { id: 'pool' });
+    }
 
-    toast.loading(`Atomic: minting this deposit (${amt})…`, {
+    toast.loading(`Minting ${amt}…`, {
       id: 'pool',
       duration: Infinity,
     });
@@ -2204,7 +2270,23 @@ export default function FungiblePool({
       text: `Atomic wWART → WART ${amt} (portal + burn + 3P pay)…`,
     });
 
-    toast.loading(`Atomic: portal-deposit ${amt} wWART…`, {
+    await confirmStyled({
+      title: 'Swap wWART → WART',
+      method: 'ERC20Portal.depositERC20Tokens + burn + 3P pay',
+      summary: [
+        `You pay: ${amt} wWART`,
+        `You receive: ${amt} WART`,
+        `Payout to: ${String(to).slice(0, 12)}…`,
+      ].join('\n'),
+      sections: [
+        {
+          label: 'Redeem',
+          json: { youPay: `${amt} wWART`, youReceive: `${amt} WART`, to, owner },
+        },
+      ],
+    });
+
+    toast.loading(`Portal-deposit ${amt} wWART…`, {
       id: 'pool',
       duration: Infinity,
     });
@@ -2825,84 +2907,127 @@ export default function FungiblePool({
           </div>
 
           {mode === 'live' && (
-            <div className="fp-swap">
-              <div className="fp-swap-head">
-                <span className="fp-swap-title">Atomic swap</span>
-                <span className="fp-swap-peg">1 WART = 1 wWART</span>
-              </div>
-              <div className="fp-swap-leg">
-                <div className="fp-swap-leg-top">
-                  <span>You pay</span>
-                  <span>
-                    {swapDir === 'to_wwart'
-                      ? u?.depositedHuman
-                        ? `credited ${u.depositedHuman}`
-                        : 'from Warthog'
-                      : mmWwartLabel
-                        ? `wallet ${mmWwartLabel}`
-                        : 'from MetaMask'}
+            <>
+              <div className="fp-swap">
+                <div className="fp-swap-head">
+                  <span className="fp-swap-title">WART → wWART</span>
+                  <span className="fp-swap-peg">1 = 1</span>
+                </div>
+                <div className="fp-swap-leg">
+                  <div className="fp-swap-leg-top">
+                    <span>You pay</span>
+                    <span>from Warthog</span>
+                  </div>
+                  <div className="fp-swap-row">
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      className="fp-swap-input"
+                      value={amount}
+                      onChange={(e) => setAmount(e.target.value)}
+                      placeholder="0.0"
+                      disabled={busy || !owner}
+                      aria-label="WART amount to swap in"
+                    />
+                    <span className="fp-swap-asset">WART</span>
+                  </div>
+                </div>
+                <div className="fp-swap-flip" aria-hidden>
+                  <span className="fp-swap-flip-mark">
+                    <ArrowDownUp size={16} />
                   </span>
                 </div>
-                <div className="fp-swap-row">
-                  <input
-                    type="text"
-                    inputMode="decimal"
-                    className="fp-swap-input"
-                    value={amount}
-                    onChange={(e) => setAmount(e.target.value)}
-                    placeholder="0.0"
-                    disabled={busy || !owner}
-                    aria-label={
-                      swapDir === 'to_wwart'
-                        ? 'WART amount to swap in'
-                        : 'wWART amount to swap in'
-                    }
-                  />
-                  <span className="fp-swap-asset">
-                    {swapDir === 'to_wwart' ? 'WART' : 'wWART'}
-                  </span>
+                <div className="fp-swap-leg">
+                  <div className="fp-swap-leg-top">
+                    <span>You receive</span>
+                    <span>to MetaMask</span>
+                  </div>
+                  <div className="fp-swap-row">
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      className="fp-swap-input"
+                      value={amount}
+                      onChange={(e) => setAmount(e.target.value)}
+                      placeholder="0.0"
+                      disabled={busy || !owner}
+                      aria-label="wWART amount you receive"
+                    />
+                    <span className="fp-swap-asset is-out">wWART</span>
+                  </div>
                 </div>
-              </div>
-              <div className="fp-swap-flip">
                 <button
                   type="button"
-                  title="Flip swap direction"
-                  disabled={busy}
-                  onClick={() =>
-                    setSwapDir((d) => (d === 'to_wwart' ? 'to_wart' : 'to_wwart'))
+                  className="btn primary fp-swap-go"
+                  disabled={
+                    busy ||
+                    !owner ||
+                    !signer ||
+                    !wartBridgeApi?.sendTransaction ||
+                    bindBlocked
+                  }
+                  onClick={() => run('atomic_to_wwart')}
+                  title={
+                    bindBlocked
+                      ? wartBind?.error ||
+                        'This Warthog wallet is bound to another L1 address'
+                      : 'Send this WART, mint that deposit, execute wWART'
                   }
                 >
-                  <ArrowDownUp size={16} aria-hidden />
+                  Swap WART → wWART
                 </button>
               </div>
-              <div className="fp-swap-leg">
-                <div className="fp-swap-leg-top">
-                  <span>You receive</span>
-                  <span>
-                    {swapDir === 'to_wwart' ? 'to MetaMask' : 'to Warthog'}
+
+              <div className="fp-swap">
+                <div className="fp-swap-head">
+                  <span className="fp-swap-title">wWART → WART</span>
+                  <span className="fp-swap-peg">1 = 1</span>
+                </div>
+                <div className="fp-swap-leg">
+                  <div className="fp-swap-leg-top">
+                    <span>You pay</span>
+                    <span>
+                      {mmWwartLabel ? `wallet ${mmWwartLabel}` : 'from MetaMask'}
+                    </span>
+                  </div>
+                  <div className="fp-swap-row">
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      className="fp-swap-input"
+                      value={amount}
+                      onChange={(e) => setAmount(e.target.value)}
+                      placeholder="0.0"
+                      disabled={busy || !owner}
+                      aria-label="wWART amount to swap in"
+                    />
+                    <span className="fp-swap-asset">wWART</span>
+                  </div>
+                </div>
+                <div className="fp-swap-flip" aria-hidden>
+                  <span className="fp-swap-flip-mark">
+                    <ArrowDownUp size={16} />
                   </span>
                 </div>
-                <div className="fp-swap-row">
-                  <input
-                    type="text"
-                    inputMode="decimal"
-                    className="fp-swap-input"
-                    value={amount}
-                    onChange={(e) => setAmount(e.target.value)}
-                    placeholder="0.0"
-                    disabled={busy || !owner}
-                    aria-label={
-                      swapDir === 'to_wwart'
-                        ? 'wWART amount you receive'
-                        : 'WART amount you receive'
-                    }
-                  />
-                  <span className="fp-swap-asset is-out">
-                    {swapDir === 'to_wwart' ? 'wWART' : 'WART'}
-                  </span>
+                <div className="fp-swap-leg">
+                  <div className="fp-swap-leg-top">
+                    <span>You receive</span>
+                    <span>to Warthog</span>
+                  </div>
+                  <div className="fp-swap-row">
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      className="fp-swap-input"
+                      value={amount}
+                      onChange={(e) => setAmount(e.target.value)}
+                      placeholder="0.0"
+                      disabled={busy || !owner}
+                      aria-label="WART amount you receive"
+                    />
+                    <span className="fp-swap-asset is-out">WART</span>
+                  </div>
                 </div>
-              </div>
-              {swapDir === 'to_wart' ? (
                 <input
                   type="text"
                   className="fp-swap-to"
@@ -2916,44 +3041,27 @@ export default function FungiblePool({
                   disabled={busy || !owner}
                   aria-label="Warthog address for WART payout"
                 />
-              ) : null}
-              <button
-                type="button"
-                className="btn primary fp-swap-go"
-                disabled={
-                  busy ||
-                  !owner ||
-                  !signer ||
-                  (swapDir === 'to_wwart'
-                    ? !wartBridgeApi?.sendTransaction || bindBlocked
-                    : !(toAddress || wartBridgeApi?.address))
-                }
-                onClick={() =>
-                  run(swapDir === 'to_wwart' ? 'atomic_to_wwart' : 'atomic_to_wart')
-                }
-                title={
-                  bindBlocked && swapDir === 'to_wwart'
-                    ? wartBind?.error ||
-                      'This Warthog wallet is bound to another L1 address'
-                    : swapDir === 'to_wwart'
-                      ? 'Send this WART, mint that deposit, execute wWART'
-                      : 'Portal this wWART, burn, 3P-pay native WART'
-                }
-              >
-                <ArrowDownUp size={16} aria-hidden />
-                {swapDir === 'to_wwart' ? 'Swap WART → wWART' : 'Swap wWART → WART'}
-              </button>
-              <p className="fp-swap-hint">
-                {swapDir === 'to_wwart'
-                  ? 'Always sends the amount above and mints that deposit. Does not resume a leftover tracker.'
-                  : 'Portals the amount above from MetaMask, then 3P-pays native WART. d1 + d2 must be live.'}
-              </p>
+                <button
+                  type="button"
+                  className="btn primary fp-swap-go"
+                  disabled={
+                    busy ||
+                    !owner ||
+                    !signer ||
+                    !(toAddress || wartBridgeApi?.address)
+                  }
+                  onClick={() => run('atomic_to_wart')}
+                  title="Portal this wWART, burn, 3P-pay native WART"
+                >
+                  Swap wWART → WART
+                </button>
+              </div>
               {!signer && owner ? (
                 <p className="fp-swap-hint" style={{ color: '#f0c674' }}>
-                  Connect MetaMask to finish the swap (voucher execute / portal).
+                  Connect MetaMask to finish the swap.
                 </p>
               ) : null}
-            </div>
+            </>
           )}
 
           {actionStatus ? (

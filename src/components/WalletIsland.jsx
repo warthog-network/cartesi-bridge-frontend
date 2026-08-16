@@ -2344,6 +2344,7 @@ export default function WalletIsland() {
         ownerAddress={address}
         send={send}
         signer={signer}
+        confirmMmTx={confirmMmTx}
         wartBridgeApi={wartBridgeApi}
         onRefreshL1Vault={() => refreshVault(address)}
         mmWwartBal={mmWwartBal}

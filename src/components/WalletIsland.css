@@ -1353,7 +1353,8 @@ button.eth-section-btn:hover {
   position: relative;
   z-index: 1;
 }
-.fungible-pool .fp-swap-flip > button {
+.fungible-pool .fp-swap-flip > button,
+.fungible-pool .fp-swap-flip-mark {
   width: 2.15rem;
   height: 2.15rem;
   padding: 0;
