@@ -194,6 +194,37 @@ export function cancelFlow(id) {
   return updateFlow(id, { step: 'cancelled' });
 }
 
+/** Cancel every open flow for an L1 owner (browser tracker only — no chain effect). */
+export function clearOpenFlowsForOwner(owner) {
+  const o = String(owner || '').toLowerCase();
+  if (!o || typeof localStorage === 'undefined') return 0;
+  const list = readAll();
+  let n = 0;
+  const next = list.map((f) => {
+    if (String(f.owner || '').toLowerCase() !== o || !isOpenFlow(f)) return f;
+    n += 1;
+    return {
+      ...f,
+      step: 'cancelled',
+      note: f.note || 'cleared stuck pipeline',
+      updatedAt: new Date().toISOString(),
+    };
+  });
+  writeAll(next);
+  return n;
+}
+
+/** Wipe all flow rows for an owner (open + terminal). */
+export function wipeFlowsForOwner(owner) {
+  const o = String(owner || '').toLowerCase();
+  if (!o || typeof localStorage === 'undefined') return 0;
+  const list = readAll();
+  const next = list.filter((f) => String(f.owner || '').toLowerCase() !== o);
+  const removed = list.length - next.length;
+  writeAll(next);
+  return removed;
+}
+
 export function stepMeta(stepId) {
   return FLOW_STEPS.find((s) => s.id === stepId) || {
     id: stepId,

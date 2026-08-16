@@ -6,15 +6,22 @@
  * posts pool_deposit (no second MetaMask in happy path). Resume via pending
  * store / tx hash if credit never lands. Phase 3 SPV is the trust north star.
  *
- * Optional **Get wWART (1-click)** runs deposit → mint → withdraw → execute
- * voucher (MetaMask). Manual step buttons stay available.
+ * Optional **Get wWART (1-click)** may resume leftover tracker/claim.
+ * **WART → wWART** / **wWART → WART** always move the entered amount
+ * (fresh cycle — they do not pick up a hung tracker).
  */
 import { useCallback, useEffect, useState } from 'react';
-import { Droplets, RefreshCw, Layers, Zap } from 'lucide-react';
+import { Droplets, RefreshCw, Layers, Zap, ArrowRightLeft } from 'lucide-react';
 import { toast } from 'react-hot-toast';
+import { ethers } from 'ethers-v6';
 import { FUNGIBLE_POOL } from '../utils/fungiblePoolConfig.js';
 import { LOCAL_WWART } from '../utils/localTokens.js';
-import { getInspectUrl, getRollupGraphqlUrl } from '../utils/bridgeConfig.js';
+import {
+  getInspectUrl,
+  getRollupGraphqlUrl,
+  getAddresses,
+  LOCAL_ADDRESSES,
+} from '../utils/bridgeConfig.js';
 import { normalizeTxLookup } from '../utils/txProof.js';
 import {
   fetchVouchers,
@@ -79,6 +86,53 @@ function humanTo18(human) {
   const frac = `${f}000000000000000000`.slice(0, 18);
   const n = BigInt(w || '0') * 10n ** 18n + BigInt(frac || '0');
   return neg ? -n : n;
+}
+
+const ERC20_PORTAL_ABI = [
+  'function depositERC20Tokens(address _erc20, address _dapp, uint256 _amount, bytes calldata _execLayerData) external',
+];
+const ERC20_ABI = [
+  'function approve(address spender, uint256 amount) external returns (bool)',
+  'function allowance(address owner, address spender) view returns (uint256)',
+];
+
+/** Portal-deposit MetaMask wWART into Path A (needed before burn → native WART). */
+async function portalDepositPoolWwart(signer, amountHuman) {
+  const addrs = getAddresses() || LOCAL_ADDRESSES;
+  const portalAddr = addrs.erc20Portal || LOCAL_ADDRESSES.erc20Portal;
+  const dapp = addrs.dapp || LOCAL_ADDRESSES.dapp;
+  const token = LOCAL_WWART?.address;
+  if (!signer) throw new Error('Connect MetaMask to portal-deposit wWART');
+  if (!portalAddr || !dapp || !token) {
+    throw new Error('Portal / dApp / wWART address missing');
+  }
+  const amt = ethers.parseUnits(String(amountHuman || '').trim() || '0', 18);
+  if (amt <= 0n) throw new Error('Amount must be > 0');
+  try {
+    const net = await signer.provider?.getNetwork?.();
+    const chainId = net?.chainId != null ? Number(net.chainId) : null;
+    if (chainId != null && chainId !== 31337 && typeof window !== 'undefined' && window.ethereum) {
+      await window.ethereum.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: '0x7a69' }],
+      });
+    }
+  } catch {
+    /* switch is best-effort; deposit will fail clearly if still wrong chain */
+  }
+  const tokenC = new ethers.Contract(token, ERC20_ABI, signer);
+  const portal = new ethers.Contract(portalAddr, ERC20_PORTAL_ABI, signer);
+  const from = await signer.getAddress();
+  const allowance = await tokenC.allowance(from, portalAddr);
+  if (allowance < amt) {
+    const txA = await tokenC.approve(portalAddr, amt);
+    await txA.wait();
+  }
+  const tx = await portal.depositERC20Tokens(token, dapp, amt, '0x', {
+    gasLimit: 500_000n,
+  });
+  await tx.wait();
+  return tx.hash;
 }
 
 async function poolApi(path, init) {
@@ -2049,6 +2103,118 @@ export default function FungiblePool({
   };
 
   /**
+   * Atomic WART → wWART for the entered amount only.
+   * Always sends that WART and always mints that deposit. Ignores leftover
+   * tracker / leftover claim so a hung 1-click cannot skip the send or mint.
+   */
+  const liveAtomicToWwart = async () => {
+    if (!owner) throw new Error('Connect L1 wallet');
+    if (!signer) {
+      throw new Error('Connect MetaMask (L1 signer) to execute the wWART voucher');
+    }
+    if (!wartBridgeApi?.sendTransaction || !wartBridgeApi?.getWartTxProof) {
+      throw new Error('Unlock Warthog wallet first (needed to send real WART)');
+    }
+    const amt = String(amount || '').trim();
+    if (!amt) throw new Error('Enter amount');
+
+    wipeFlowsForOwner(owner);
+    clearPendingForOwner(owner);
+    refreshFlows();
+    refreshPending();
+    setActionStatus({
+      kind: 'info',
+      text: `Atomic WART → wWART ${amt} (fresh send + forced mint)…`,
+    });
+
+    toast.loading(`Atomic: sending ${amt} WART (not resuming tracker)…`, {
+      id: 'pool',
+      duration: Infinity,
+    });
+    await liveDeposit();
+
+    toast.loading(`Atomic: minting this deposit (${amt})…`, {
+      id: 'pool',
+      duration: Infinity,
+    });
+    await liveMint();
+
+    const minInputIndex = await maxOwnerVoucherInputIndex(owner);
+    toast.loading('Atomic: withdraw voucher…', { id: 'pool', duration: Infinity });
+    const w = await liveWithdraw({ silentSuccess: true, minInputIndex });
+
+    toast.loading('Atomic: execute voucher → MetaMask wWART…', {
+      id: 'pool',
+      duration: Infinity,
+    });
+    try {
+      const { hash } = await waitAndExecuteWwartVoucher(signer, {
+        owner,
+        minInputIndex: w?.minInputIndex ?? minInputIndex,
+        amountHint: amt,
+        timeoutMs: 180000,
+      });
+      setActionStatus({
+        kind: 'ok',
+        text: `Atomic WART → wWART ${amt} landed on MetaMask.`,
+      });
+      toast.success(
+        `Atomic WART → wWART · execute ${String(hash).slice(0, 10)}…`,
+        { id: 'pool', duration: 10000 },
+      );
+      onRefreshMmWwart?.();
+    } catch (e) {
+      throw new Error(
+        `${formatVoucherExecuteError(e)}. Deposit+mint+withdraw finished — Vouchers → Execute (do not re-send WART).`,
+      );
+    }
+  };
+
+  /**
+   * Atomic wWART → WART: portal the entered MetaMask wWART, burn, 3P pay native WART.
+   * Fresh cycle — does not resume a leftover redeem ticket.
+   */
+  const liveAtomicToWart = async () => {
+    if (!owner) throw new Error('Connect L1 wallet');
+    if (!signer) {
+      throw new Error('Connect MetaMask to portal-deposit wWART');
+    }
+    const amt = String(amount || '').trim();
+    if (!amt) throw new Error('Enter amount');
+    const to =
+      String(toAddress || '').trim() || wartBridgeApi?.address || '';
+    if (!to) {
+      throw new Error('Unlock Warthog or set redeem-to for the WART payout');
+    }
+
+    wipeFlowsForOwner(owner);
+    refreshFlows();
+    setActionStatus({
+      kind: 'info',
+      text: `Atomic wWART → WART ${amt} (portal + burn + 3P pay)…`,
+    });
+
+    toast.loading(`Atomic: portal-deposit ${amt} wWART…`, {
+      id: 'pool',
+      duration: Infinity,
+    });
+    await portalDepositPoolWwart(signer, amt);
+
+    toast.loading(`Atomic: burn ${amt} and 3P-pay WART…`, {
+      id: 'pool',
+      duration: Infinity,
+    });
+    await liveBurn();
+
+    setActionStatus({
+      kind: 'ok',
+      text: `Atomic wWART → WART ${amt} submitted to ${String(to).slice(0, 12)}…`,
+    });
+    toast.success(`Atomic wWART → WART ${amt}`, { id: 'pool', duration: 10000 });
+    onRefreshMmWwart?.();
+  };
+
+  /**
    * Release-ticket payout: under Path A3 opens 3-of-4 threshold request, then
    * waits for faux/browser signers to assemble a real Warthog transfer.
    * Single-key hot path still works if POOL_THRESHOLD_MODE is off.
@@ -2467,11 +2633,17 @@ export default function FungiblePool({
     setBusy(true);
     try {
       if (mode === 'lab') {
-        if (action === 'one_click_wwart') {
-          throw new Error('1-click is live-only (real WART → real wWART)');
+        if (
+          action === 'one_click_wwart' ||
+          action === 'atomic_to_wwart' ||
+          action === 'atomic_to_wart'
+        ) {
+          throw new Error('Atomic / 1-click is live-only (real WART ↔ real wWART)');
         }
         await labAction(action);
       } else if (action === 'one_click_wwart') await liveOneClickToWwart();
+      else if (action === 'atomic_to_wwart') await liveAtomicToWwart();
+      else if (action === 'atomic_to_wart') await liveAtomicToWart();
       else if (action === 'deposit') await liveDeposit();
       else if (action === 'credit_resume') {
         const h = String(resumeTxHash || '').trim();
@@ -2605,8 +2777,11 @@ export default function FungiblePool({
         className="wi-muted"
         style={{ margin: '0.45rem 0 0.65rem', fontSize: '0.8rem', lineHeight: 1.45 }}
       >
-        <strong>Live:</strong> use <strong>Get wWART (1-click)</strong> for deposit → mint →
-        withdraw → auto voucher execute, or step manually. <strong>Deposit WART</strong>{' '}
+        <strong>Live:</strong> <strong>WART → wWART</strong> always sends the box amount
+        and forces mint of that deposit (does not resume a leftover tracker).{' '}
+        <strong>wWART → WART</strong> portals MetaMask wWART and 3P-pays native WART.
+        Old <strong>Get wWART (1-click)</strong> may skip steps if inspect already
+        shows credit. <strong>Deposit WART</strong>{' '}
         alone sends → SPV credit via relayer. If credit never lands,{' '}
         <strong>Resume credit</strong> with the Warthog tx hash — never re-send. Then Mint →
         Withdraw wWART or <strong>Redeem WART</strong>.{' '}
@@ -2851,12 +3026,60 @@ export default function FungiblePool({
                     !wartBridgeApi?.sendTransaction ||
                     bindBlocked
                   }
+                  onClick={() => run('atomic_to_wwart')}
+                  title={
+                    bindBlocked
+                      ? wartBind?.error ||
+                        'This Warthog wallet is bound to another L1 address'
+                      : 'Always send this WART, mint that deposit, execute wWART. Does not resume leftover tracker.'
+                  }
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.3rem',
+                    fontWeight: 700,
+                  }}
+                >
+                  <ArrowRightLeft size={14} aria-hidden />
+                  WART → wWART
+                </button>
+                <button
+                  type="button"
+                  className="btn secondary small"
+                  disabled={
+                    busy ||
+                    !owner ||
+                    !signer ||
+                    !(toAddress || wartBridgeApi?.address)
+                  }
+                  onClick={() => run('atomic_to_wart')}
+                  title="Portal this MetaMask wWART, burn, 3P-pay native WART. Fresh cycle — no leftover ticket resume."
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.3rem',
+                    fontWeight: 700,
+                  }}
+                >
+                  <ArrowRightLeft size={14} aria-hidden />
+                  wWART → WART
+                </button>
+                <button
+                  type="button"
+                  className="btn secondary small"
+                  disabled={
+                    busy ||
+                    !owner ||
+                    !signer ||
+                    !wartBridgeApi?.sendTransaction ||
+                    bindBlocked
+                  }
                   onClick={() => run('one_click_wwart')}
                   title={
                     bindBlocked
                       ? wartBind?.error ||
                         'This Warthog wallet is bound to another L1 address'
-                      : 'Deposit WART → mint claim → withdraw → execute voucher (MetaMask gets wWART)'
+                      : 'Legacy 1-click — may skip deposit/mint if inspect already shows credit'
                   }
                   style={{
                     display: 'inline-flex',
@@ -2873,10 +3096,11 @@ export default function FungiblePool({
                 className="wi-muted"
                 style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', lineHeight: 1.4 }}
               >
-                Runs deposit → mint → withdraw → <strong>auto execute voucher</strong>.
-                Expect MetaMask for rollup inputs + final <code>executeVoucher</code>.
-                Unlock Warthog + connect L1 first. Manual steps below still work for
-                recovery.
+                <strong>WART → wWART</strong> always sends the box amount and mints
+                that deposit (SPV wait + InputBox + <code>executeVoucher</code>).
+                It will not skip because an old tracker still shows credit.{' '}
+                <strong>wWART → WART</strong> portals MetaMask wWART then 3P-pays
+                your Warthog address. Legacy 1-click still resumes leftover steps.
               </p>
               {!signer && owner ? (
                 <p
