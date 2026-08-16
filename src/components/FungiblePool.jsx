@@ -816,6 +816,7 @@ export default function FungiblePool({
   const poolAddr =
     pool3pSt?.address ||
     pool3pSt?.seal?.address ||
+    snap?.livePool?.address ||
     snap?.poolAddress ||
     FUNGIBLE_POOL.address;
   const previousQ =
@@ -1032,6 +1033,8 @@ export default function FungiblePool({
       const s = await poolApi(`/api/pool${q}`);
       setSnap({
         poolId: s.poolId,
+        livePool: s.livePool || null,
+        previousAddress: s.livePool?.previous || s.previousAddress || null,
         poolAddress: s.livePool?.address || s.poolAddress || FUNGIBLE_POOL.address,
         lockedE8: s.lockedE8,
         claimed18: s.claimed18,

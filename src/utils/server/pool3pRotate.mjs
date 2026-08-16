@@ -459,10 +459,15 @@ async function maybeOpenOrAdvanceSweep(r, next) {
 async function cutOver(r, next) {
   try {
     let accountId = null;
-    for (let i = 0; i < 8 && !accountId; i += 1) {
+    for (let i = 0; i < 20 && !accountId; i += 1) {
       const found = await wartAccount(next.address);
       if (found?.accountId) accountId = found.accountId;
-      else await new Promise((res) => setTimeout(res, 400));
+      else await new Promise((res) => setTimeout(res, 500));
+    }
+    if (!accountId) {
+      throw new Error(
+        `cutover blocked — Warthog has no accountId for ${String(next.address).slice(0, 12)}… yet`,
+      );
     }
     const posted = await submitPoolAdvance({
       type: 'pool_set_address',

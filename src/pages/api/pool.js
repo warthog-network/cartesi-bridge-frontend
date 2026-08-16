@@ -154,7 +154,14 @@ export async function GET({ request }) {
       }
     }
     if (url.searchParams.get('public') === '1') {
-      return json(200, { ok: true, ...(await getPoolHotPublic()) });
+      const pub = await getPoolHotPublic();
+      const p3 = pool3pOn() ? pool3pPublicStatus() : null;
+      return json(200, {
+        ok: true,
+        ...pub,
+        address: p3?.address || pub.address,
+        custody: p3 ? '3p-lindell' : pub.custody,
+      });
     }
     if (url.searchParams.get('nonce') === '1') {
       // Ops: show local nonce cursor (no secrets)
@@ -232,12 +239,31 @@ export async function GET({ request }) {
     // Prefer not advertising lab ledger as truth — status is secondary
     const lab = await applyPoolAction({ action: 'status', owner });
     const pub = await getPoolHotPublic();
+    const p3 = pool3pOn() ? pool3pPublicStatus() : null;
+    let inspected = null;
+    try {
+      inspected = await fetchRollupPoolInspect(owner || '');
+    } catch {
+      /* */
+    }
+    const liveAddress =
+      p3?.address ||
+      inspected?.poolAddress ||
+      FUNGIBLE_POOL.address ||
+      pub.address ||
+      null;
     const credits = owner
       ? await listPoolCredits({ owner, limit: 20 })
       : { items: [] };
     return json(200, {
       ...lab,
-      livePool: pub,
+      poolAddress: liveAddress || lab.poolAddress,
+      livePool: {
+        ...pub,
+        address: liveAddress,
+        custody: p3 ? '3p-lindell' : pub.custody,
+        previous: p3?.rotation?.last?.previous || inspected?.previousAddress || null,
+      },
       pendingCredits: credits.items || [],
       mode: 'rollup+hot-payout+relayer',
       labMutations: process.env.POOL_LAB_MUTATIONS === '1' ? 'open' : 'ops-token',
@@ -779,11 +805,11 @@ export async function POST({ request }) {
       }
       const pool3p = pool3pOn() ? pool3pPublicStatus() : null;
       const poolAddress =
-        body.poolAddress ||
-        inspected?.poolAddress ||
         pool3p?.address ||
-        pub.address ||
-        FUNGIBLE_POOL.address;
+        inspected?.poolAddress ||
+        body.poolAddress ||
+        FUNGIBLE_POOL.address ||
+        pub.address;
       let verified = null;
       let verifyError = null;
       if (body.txHash) {
