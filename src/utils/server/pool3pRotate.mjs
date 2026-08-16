@@ -456,6 +456,22 @@ async function maybeOpenOrAdvanceSweep(r, next) {
   }
 }
 
+function normQ(a) {
+  return String(a || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+}
+
+async function waitInspect(pred, tries = 16, ms = 500) {
+  let last = null;
+  for (let i = 0; i < tries; i += 1) {
+    last = await inspectPoolSnap().catch(() => null);
+    if (last && pred(last)) return last;
+    await new Promise((res) => setTimeout(res, ms));
+  }
+  return last;
+}
+
 async function cutOver(r, next) {
   try {
     let accountId = null;
@@ -469,16 +485,46 @@ async function cutOver(r, next) {
         `cutover blocked — Warthog has no accountId for ${String(next.address).slice(0, 12)}… yet`,
       );
     }
-    const posted = await submitPoolAdvance({
-      type: 'pool_set_address',
-      address: next.address,
-      accountId,
-      sweepTxHash: r.sweepTxHash || null,
-    });
-    r.setTx = posted.txHash;
+    const want = normQ(next.address);
+    const snap = await inspectPoolSnap().catch(() => null);
+    const pending = normQ(snap?.pendingNext?.address || snap?.pendingNext);
+    const live = normQ(snap?.poolAddress);
+    if (live !== want && pending !== want) {
+      const announced = await submitPoolAdvance({
+        type: 'pool_announce_next',
+        address: next.address,
+        publicKey: next.publicKey || null,
+      });
+      r.announceTx = announced.txHash;
+      await saveRotate(r);
+      const ready = await waitInspect(
+        (s) => normQ(s?.pendingNext?.address || s?.pendingNext) === want,
+      );
+      if (normQ(ready?.pendingNext?.address || ready?.pendingNext) !== want) {
+        throw new Error('cutover: inspect pendingNext never matched next Q');
+      }
+    }
+    if (live !== want) {
+      const posted = await submitPoolAdvance({
+        type: 'pool_set_address',
+        address: next.address,
+        accountId,
+        sweepTxHash: r.sweepTxHash || null,
+      });
+      r.setTx = posted.txHash;
+      await saveRotate(r);
+      const after = await waitInspect((s) => normQ(s?.poolAddress) === want);
+      if (normQ(after?.poolAddress) !== want) {
+        throw new Error('cutover: inspect poolAddress still not next Q');
+      }
+    } else {
+      r.setTx = r.setTx || 'already-live';
+      await saveRotate(r);
+    }
     const act = await activateNextDapp({
       sweepTxHash: r.sweepTxHash,
       accountId,
+      setTx: r.setTx,
     });
     r.lastError = null;
     return act;
@@ -561,7 +607,7 @@ export async function birthNextSeat({ signerId, role, P, encD1, paillierN, paill
 }
 
 /** Promote next dapp to live after sweep + pool_set_address. */
-export async function activateNextDapp({ sweepTxHash, accountId } = {}) {
+export async function activateNextDapp({ sweepTxHash, accountId, setTx } = {}) {
   const next = loadNextDapp();
   if (!next?.address) throw new Error('next Q not ready');
   if (!next.seats?.[1]?.P || !next.seats?.[2]?.P) {
@@ -589,7 +635,7 @@ export async function activateNextDapp({ sweepTxHash, accountId } = {}) {
     previous: live?.address || null,
     sweepTxHash: sweepTxHash || rot.sweepTxHash || null,
     accountId: accountId || null,
-    setTx: rot.setTx || null,
+    setTx: setTx || rot.setTx || null,
   };
   rot.next = null;
   rot.sweepTicketId = null;
