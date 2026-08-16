@@ -17,8 +17,6 @@ import {
   Layers,
   Zap,
   ArrowDownUp,
-  ChevronDown,
-  ChevronRight,
 } from 'lucide-react';
 import { toast } from 'react-hot-toast';
 import { ethers } from 'ethers-v6';
@@ -829,7 +827,7 @@ export default function FungiblePool({
   onRefreshMmWwart,
 }) {
   const [open, setOpen] = useState(true);
-  const [showManual, setShowManual] = useState(false);
+  const [swapDir, setSwapDir] = useState('to_wwart'); // to_wwart | to_wart
   const [busy, setBusy] = useState(false);
   const [snap, setSnap] = useState(null);
   const [amount, setAmount] = useState('1');
@@ -2907,127 +2905,76 @@ export default function FungiblePool({
           </div>
 
           {mode === 'live' && (
-            <>
-              <div className="fp-swap">
-                <div className="fp-swap-head">
-                  <span className="fp-swap-title">WART → wWART</span>
-                  <span className="fp-swap-peg">1 = 1</span>
-                </div>
-                <div className="fp-swap-leg">
-                  <div className="fp-swap-leg-top">
-                    <span>You pay</span>
-                    <span>from Warthog</span>
-                  </div>
-                  <div className="fp-swap-row">
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      className="fp-swap-input"
-                      value={amount}
-                      onChange={(e) => setAmount(e.target.value)}
-                      placeholder="0.0"
-                      disabled={busy || !owner}
-                      aria-label="WART amount to swap in"
-                    />
-                    <span className="fp-swap-asset">WART</span>
-                  </div>
-                </div>
-                <div className="fp-swap-flip" aria-hidden>
-                  <span className="fp-swap-flip-mark">
-                    <ArrowDownUp size={16} />
+            <div className="fp-swap">
+              <div className="fp-swap-head">
+                <span className="fp-swap-title">
+                  {swapDir === 'to_wwart' ? 'WART → wWART' : 'wWART → WART'}
+                </span>
+                <span className="fp-swap-peg">1 = 1</span>
+              </div>
+              <div className="fp-swap-leg">
+                <div className="fp-swap-leg-top">
+                  <span>You pay</span>
+                  <span>
+                    {swapDir === 'to_wwart'
+                      ? 'from Warthog'
+                      : mmWwartLabel
+                        ? `wallet ${mmWwartLabel}`
+                        : 'from MetaMask'}
                   </span>
                 </div>
-                <div className="fp-swap-leg">
-                  <div className="fp-swap-leg-top">
-                    <span>You receive</span>
-                    <span>to MetaMask</span>
-                  </div>
-                  <div className="fp-swap-row">
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      className="fp-swap-input"
-                      value={amount}
-                      onChange={(e) => setAmount(e.target.value)}
-                      placeholder="0.0"
-                      disabled={busy || !owner}
-                      aria-label="wWART amount you receive"
-                    />
-                    <span className="fp-swap-asset is-out">wWART</span>
-                  </div>
+                <div className="fp-swap-row">
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    className="fp-swap-input"
+                    value={amount}
+                    onChange={(e) => setAmount(e.target.value)}
+                    placeholder="0.0"
+                    disabled={busy || !owner}
+                    aria-label="Amount you pay"
+                  />
+                  <span className="fp-swap-asset">
+                    {swapDir === 'to_wwart' ? 'WART' : 'wWART'}
+                  </span>
                 </div>
+              </div>
+              <div className="fp-swap-flip">
                 <button
                   type="button"
-                  className="btn primary fp-swap-go"
-                  disabled={
-                    busy ||
-                    !owner ||
-                    !signer ||
-                    !wartBridgeApi?.sendTransaction ||
-                    bindBlocked
-                  }
-                  onClick={() => run('atomic_to_wwart')}
-                  title={
-                    bindBlocked
-                      ? wartBind?.error ||
-                        'This Warthog wallet is bound to another L1 address'
-                      : 'Send this WART, mint that deposit, execute wWART'
+                  title="Flip direction"
+                  disabled={busy}
+                  onClick={() =>
+                    setSwapDir((d) => (d === 'to_wwart' ? 'to_wart' : 'to_wwart'))
                   }
                 >
-                  Swap WART → wWART
+                  <ArrowDownUp size={16} aria-hidden />
                 </button>
               </div>
-
-              <div className="fp-swap">
-                <div className="fp-swap-head">
-                  <span className="fp-swap-title">wWART → WART</span>
-                  <span className="fp-swap-peg">1 = 1</span>
-                </div>
-                <div className="fp-swap-leg">
-                  <div className="fp-swap-leg-top">
-                    <span>You pay</span>
-                    <span>
-                      {mmWwartLabel ? `wallet ${mmWwartLabel}` : 'from MetaMask'}
-                    </span>
-                  </div>
-                  <div className="fp-swap-row">
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      className="fp-swap-input"
-                      value={amount}
-                      onChange={(e) => setAmount(e.target.value)}
-                      placeholder="0.0"
-                      disabled={busy || !owner}
-                      aria-label="wWART amount to swap in"
-                    />
-                    <span className="fp-swap-asset">wWART</span>
-                  </div>
-                </div>
-                <div className="fp-swap-flip" aria-hidden>
-                  <span className="fp-swap-flip-mark">
-                    <ArrowDownUp size={16} />
+              <div className="fp-swap-leg">
+                <div className="fp-swap-leg-top">
+                  <span>You receive</span>
+                  <span>
+                    {swapDir === 'to_wwart' ? 'to MetaMask' : 'to Warthog'}
                   </span>
                 </div>
-                <div className="fp-swap-leg">
-                  <div className="fp-swap-leg-top">
-                    <span>You receive</span>
-                    <span>to Warthog</span>
-                  </div>
-                  <div className="fp-swap-row">
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      className="fp-swap-input"
-                      value={amount}
-                      onChange={(e) => setAmount(e.target.value)}
-                      placeholder="0.0"
-                      disabled={busy || !owner}
-                      aria-label="WART amount you receive"
-                    />
-                    <span className="fp-swap-asset is-out">WART</span>
-                  </div>
+                <div className="fp-swap-row">
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    className="fp-swap-input"
+                    value={amount}
+                    onChange={(e) => setAmount(e.target.value)}
+                    placeholder="0.0"
+                    disabled={busy || !owner}
+                    aria-label="Amount you receive"
+                  />
+                  <span className="fp-swap-asset is-out">
+                    {swapDir === 'to_wwart' ? 'wWART' : 'WART'}
+                  </span>
                 </div>
+              </div>
+              {swapDir === 'to_wart' ? (
                 <input
                   type="text"
                   className="fp-swap-to"
@@ -3041,27 +2988,36 @@ export default function FungiblePool({
                   disabled={busy || !owner}
                   aria-label="Warthog address for WART payout"
                 />
-                <button
-                  type="button"
-                  className="btn primary fp-swap-go"
-                  disabled={
-                    busy ||
-                    !owner ||
-                    !signer ||
-                    !(toAddress || wartBridgeApi?.address)
-                  }
-                  onClick={() => run('atomic_to_wart')}
-                  title="Portal this wWART, burn, 3P-pay native WART"
-                >
-                  Swap wWART → WART
-                </button>
-              </div>
+              ) : null}
+              <button
+                type="button"
+                className="btn primary fp-swap-go"
+                disabled={
+                  busy ||
+                  !owner ||
+                  !signer ||
+                  (swapDir === 'to_wwart'
+                    ? !wartBridgeApi?.sendTransaction || bindBlocked
+                    : !(toAddress || wartBridgeApi?.address))
+                }
+                onClick={() =>
+                  run(swapDir === 'to_wwart' ? 'atomic_to_wwart' : 'atomic_to_wart')
+                }
+                title={
+                  bindBlocked && swapDir === 'to_wwart'
+                    ? wartBind?.error ||
+                      'This Warthog wallet is bound to another L1 address'
+                    : 'Swap the amount above'
+                }
+              >
+                Swap
+              </button>
               {!signer && owner ? (
                 <p className="fp-swap-hint" style={{ color: '#f0c674' }}>
                   Connect MetaMask to finish the swap.
                 </p>
               ) : null}
-            </>
+            </div>
           )}
 
           {actionStatus ? (
@@ -3126,17 +3082,11 @@ export default function FungiblePool({
             </p>
           )}
 
-          <button
-            type="button"
-            className="fp-manual-toggle"
-            onClick={() => setShowManual((v) => !v)}
-            aria-expanded={showManual}
-          >
-            {showManual ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-            Manual steps
-          </button>
-
-          {showManual ? (
+          <details className="fp-legacy">
+            <summary>
+              Legacy paths
+              <span className="fp-legacy-tag">pending removal</span>
+            </summary>
           <div>
           <div
             className="sw-card-meta"
@@ -3614,7 +3564,7 @@ export default function FungiblePool({
             </p>
           )}
           </div>
-          ) : null}
+          </details>
         </>
       )}
     </section>
