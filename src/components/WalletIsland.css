@@ -1341,7 +1341,7 @@ button.eth-section-btn:hover {
   color: #00ffcc;
   border: 1px solid rgba(0, 255, 204, 0.35);
 }
-.fungible-pool .fp-swap-asset.is-out {
+.fungible-pool .fp-swap-asset.is-wart {
   background: rgba(253, 185, 19, 0.16);
   color: #FDB913;
   border-color: rgba(253, 185, 19, 0.4);

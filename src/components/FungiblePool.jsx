@@ -2940,7 +2940,9 @@ export default function FungiblePool({
                     disabled={busy || !owner}
                     aria-label="Amount you pay"
                   />
-                  <span className="fp-swap-asset">
+                  <span
+                    className={`fp-swap-asset${swapDir === 'to_wwart' ? ' is-wart' : ''}`}
+                  >
                     {swapDir === 'to_wwart' ? 'WART' : 'wWART'}
                   </span>
                 </div>
@@ -2982,7 +2984,9 @@ export default function FungiblePool({
                     disabled={busy || !owner}
                     aria-label="Amount you receive"
                   />
-                  <span className="fp-swap-asset is-out">
+                  <span
+                    className={`fp-swap-asset${swapDir === 'to_wart' ? ' is-wart' : ''}`}
+                  >
                     {swapDir === 'to_wwart' ? 'wWART' : 'WART'}
                   </span>
                 </div>
