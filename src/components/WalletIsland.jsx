@@ -65,6 +65,7 @@ import {
   isWalletConnectProvider,
   getActiveWalletConnectProvider,
   getWalletConnectProvider,
+  hasStoredWalletConnectSession,
 } from '../utils/walletConnect.js';
 
 // Active network address book (Anvil default; Sepolia when PUBLIC_NETWORK=sepolia)
@@ -423,21 +424,25 @@ export default function WalletIsland() {
         });
       }
 
-      // Resume WalletConnect session (mobile) if pairing still valid
+      // Resume WalletConnect session (mobile) if pairing still valid.
+      // Do not init WC on every page load — EthereumProvider.init() is heavy
+      // and talks EIP-6963 (same channel Rabby uses).
       try {
-        const wc = await getWalletConnectProvider();
-        if (!cancelled && wc?.session && wc.accounts?.length) {
-          bindEip1193(wc, { name: 'WalletConnect' });
-          const prov = new ethers.BrowserProvider(wc);
-          const sign = await prov.getSigner();
-          const addr = await sign.getAddress();
-          setProvider(prov);
-          setSigner(sign);
-          setAddress(addr);
-          setConnected(true);
-          await hydrateVaultPreferApi(addr);
-          toast.success(`WalletConnect session: ${addr.slice(0, 6)}…${addr.slice(-4)}`);
-          refreshVault(addr);
+        if (getActiveWalletConnectProvider() || hasStoredWalletConnectSession()) {
+          const wc = await getWalletConnectProvider();
+          if (!cancelled && wc?.session && wc.accounts?.length) {
+            bindEip1193(wc, { name: 'WalletConnect' });
+            const prov = new ethers.BrowserProvider(wc);
+            const sign = await prov.getSigner();
+            const addr = await sign.getAddress();
+            setProvider(prov);
+            setSigner(sign);
+            setAddress(addr);
+            setConnected(true);
+            await hydrateVaultPreferApi(addr);
+            toast.success(`WalletConnect session: ${addr.slice(0, 6)}…${addr.slice(-4)}`);
+            refreshVault(addr);
+          }
         }
       } catch (e) {
         console.log('[walletconnect] no session to resume', e?.message || e);
@@ -508,19 +513,37 @@ export default function WalletIsland() {
 
     // Attach listeners to every known inject (multi-wallet)
     const attached = [];
-    const attach = (eth) => {
-      if (!eth?.on || attached.includes(eth)) return;
-      eth.on('accountsChanged', onAccountsChanged);
-      eth.on('chainChanged', onChainChanged);
-      attached.push(eth);
+    const attachedKeys = new Set();
+    const attach = (eth, rdns) => {
+      if (!eth?.on) return;
+      const key = rdns || '';
+      if (attached.includes(eth) || (key && attachedKeys.has(key))) return;
+      try {
+        eth.on('accountsChanged', onAccountsChanged);
+        eth.on('chainChanged', onChainChanged);
+        attached.push(eth);
+        if (key) attachedKeys.add(key);
+      } catch (e) {
+        console.warn('[wallet listeners]', e?.message || e);
+      }
     };
-    for (const w of listInjectedWallets()) attach(w.provider);
-    // Also listen when EIP-6963 announces later
+    for (const w of listInjectedWallets()) attach(w.provider, w.rdns);
+    // Also listen when EIP-6963 announces later. Must not re-request
+    // providers here — Rabby announces requestProvider synchronously.
+    let announceBusy = false;
     const onAnnounce = () => {
-      for (const w of listInjectedWallets()) attach(w.provider);
-      if (!eip1193Ref.current) {
-        const p = getInjectedProvider();
-        if (p) bindEip1193(p);
+      if (announceBusy) return;
+      announceBusy = true;
+      try {
+        for (const w of listInjectedWallets()) attach(w.provider, w.rdns);
+        if (!eip1193Ref.current) {
+          const p = getInjectedProvider();
+          if (p) bindEip1193(p);
+        }
+      } catch (e) {
+        console.warn('[eip6963 announce]', e?.message || e);
+      } finally {
+        announceBusy = false;
       }
     };
     window.addEventListener('eip6963:announceProvider', onAnnounce);

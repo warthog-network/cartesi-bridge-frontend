@@ -24,6 +24,10 @@
 const announced = new Map();
 
 let listening = false;
+/** True while a requestProvider dispatch is on the stack (Rabby announces sync). */
+let requesting = false;
+let lastRequestAt = 0;
+const REQUEST_COOLDOWN_MS = 800;
 /** @type {object|null} */
 let preferredProvider = null;
 
@@ -44,18 +48,41 @@ function onAnnounce(event) {
   announced.set(detailKey(detail), detail);
 }
 
-/** Start collecting EIP-6963 announcements (safe to call many times). */
-export function startProviderDiscovery() {
+/**
+ * Ask wallets to announce. Safe to call often: ignored while a request is
+ * already on the stack, and rate-limited. Rabby/Brave answer
+ * `eip6963:requestProvider` *synchronously*, so listing wallets must never
+ * re-dispatch (that froze cartesi-bridge.duckdns.org in a request/announce loop).
+ */
+export function requestProviders() {
+  if (typeof window === 'undefined') return;
+  if (requesting) return;
+  const now = Date.now();
+  if (now - lastRequestAt < REQUEST_COOLDOWN_MS) return;
+  lastRequestAt = now;
+  requesting = true;
+  try {
+    window.dispatchEvent(new Event('eip6963:requestProvider'));
+  } catch {
+    /* ignore */
+  } finally {
+    queueMicrotask(() => {
+      requesting = false;
+    });
+  }
+}
+
+/**
+ * Start collecting EIP-6963 announcements (safe to call many times).
+ * @param {{ request?: boolean }} [opts] request=true also pings wallets (default).
+ */
+export function startProviderDiscovery(opts = {}) {
   if (typeof window === 'undefined') return;
   if (!listening) {
     window.addEventListener('eip6963:announceProvider', onAnnounce);
     listening = true;
   }
-  try {
-    window.dispatchEvent(new Event('eip6963:requestProvider'));
-  } catch {
-    /* ignore */
-  }
+  if (opts.request !== false) requestProviders();
 }
 
 /**
@@ -100,7 +127,8 @@ function walletDedupeKey(provider, rdns, name) {
  */
 export function listInjectedWallets() {
   if (typeof window === 'undefined') return [];
-  startProviderDiscovery();
+  // Listener only — never re-request here. Announce handlers call this.
+  startProviderDiscovery({ request: false });
 
   /** @type {InjectedWallet[]} */
   const out = [];
@@ -180,7 +208,7 @@ export function listInjectedWallets() {
  */
 export function getInjectedProvider(opts = {}) {
   if (typeof window === 'undefined') return null;
-  startProviderDiscovery();
+  startProviderDiscovery({ request: false });
 
   if (preferredProvider && typeof preferredProvider.request === 'function') {
     return preferredProvider;
@@ -290,11 +318,7 @@ export function waitForInjectedProvider(timeoutMs = 2500) {
 
     window.addEventListener('ethereum#initialized', onAny, { once: true });
     window.addEventListener('eip6963:announceProvider', onAny);
-    try {
-      window.dispatchEvent(new Event('eip6963:requestProvider'));
-    } catch {
-      /* ignore */
-    }
+    requestProviders();
 
     const poll = setInterval(onAny, 150);
     const timer = setTimeout(finish, timeoutMs);
@@ -333,12 +357,8 @@ export async function resolveWalletOptions() {
   if (!listInjectedWallets().length) {
     await waitForInjectedProvider(2800);
   } else {
-    // one more EIP-6963 ping so Brave/MM/Rabby all announce
-    try {
-      window.dispatchEvent(new Event('eip6963:requestProvider'));
-    } catch {
-      /* ignore */
-    }
+    // one more (rate-limited) ping so Brave/MM/Rabby all announce
+    requestProviders();
     await new Promise((r) => setTimeout(r, 200));
   }
   return listInjectedWallets();

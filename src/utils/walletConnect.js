@@ -29,6 +29,26 @@ const FEATURED_WALLET_IDS = [
 /** @type {import('@walletconnect/ethereum-provider').default | null} */
 let wcProvider = null;
 
+/**
+ * True if localStorage still has a WC / Reown session we should resume.
+ * Used so page load does not init the heavy WC provider (and its EIP-6963
+ * traffic) unless there is something to resume.
+ */
+export function hasStoredWalletConnectSession() {
+  if (typeof localStorage === 'undefined') return false;
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i) || '';
+      if (!/wc@2|walletconnect|WCM_|@w3m|reown/i.test(k)) continue;
+      const v = localStorage.getItem(k);
+      if (v && v !== 'null' && v !== '{}' && v !== '[]') return true;
+    }
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
 function siteUrl() {
   if (typeof window !== 'undefined' && window.location?.origin) {
     return window.location.origin;

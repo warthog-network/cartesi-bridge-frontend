@@ -531,6 +531,13 @@ function userBn(insp, field) {
   }
 }
 
+/** This owner's unused credited WART (18-dec). 0 if inspect has no user. */
+function ownerUnminted18(insp) {
+  const dep18 = userBn(insp, 'depositedE8') * 10n ** 10n;
+  const claim = userBn(insp, 'claim18');
+  return dep18 > claim ? dep18 - claim : 0n;
+}
+
 function poolBn(insp, field) {
   try {
     return BigInt(String(insp?.[field] ?? 0));
@@ -787,6 +794,71 @@ async function waitAndExecuteWwartVoucher(signer, opts = {}) {
   );
 }
 
+function voucherAmount18(v) {
+  try {
+    if (v?.decoded?.amount != null) return BigInt(v.decoded.amount);
+  } catch {
+    /* */
+  }
+  try {
+    const h = Number(v?.decoded?.amountHuman);
+    if (Number.isFinite(h) && h > 0) return humanTo18(String(h));
+  } catch {
+    /* */
+  }
+  return 0n;
+}
+
+/**
+ * Execute every ready, unexecuted wWART voucher for this owner.
+ * Unclogs leftover withdraws sitting in GraphQL while 1-click tries to mint again.
+ */
+async function executeLeftoverOwnerVouchers(signer, owner) {
+  const want = String(owner || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (!signer || !want) return { amount18: 0n, hashes: [], count: 0 };
+  let list = [];
+  try {
+    list = await fetchVouchers({ last: 50 });
+  } catch {
+    return { amount18: 0n, hashes: [], count: 0 };
+  }
+  const mine = list.filter((v) => {
+    const to = String(v?.decoded?.to || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    const sender = String(v?.msgSender || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    return to === want || sender === want;
+  });
+  const hashes = [];
+  let amount18 = 0n;
+  for (const v of mine.sort((a, b) => b.inputIndex - a.inputIndex)) {
+    if (!v.hasProof) continue;
+    try {
+      const onL1 = await isVoucherClaimedOnL1(signer, v).catch(() => false);
+      if (!onL1) continue;
+      const done = await wasVoucherExecuted(signer, v);
+      if (done) continue;
+    } catch {
+      /* try execute */
+    }
+    try {
+      const { hash } = await executeVoucherOnL1(signer, v);
+      hashes.push(hash);
+      amount18 += voucherAmount18(v);
+    } catch (e) {
+      const msg = formatVoucherExecuteError(e);
+      if (/Already executed|wWART balance/i.test(msg)) continue;
+      if (/rejected/i.test(msg)) throw new Error(msg);
+      console.warn('[leftover voucher]', v.inputIndex, msg);
+    }
+  }
+  return { amount18, hashes, count: hashes.length };
+}
+
 /** Highest GraphQL voucher input index for owner (or -1). */
 async function maxOwnerVoucherInputIndex(owner) {
   const want = String(owner || '')
@@ -993,12 +1065,14 @@ export default function FungiblePool({
             if (!insp) return prev;
             return {
               ...(prev || {}),
-              lockedE8: insp.lockedE8,
-              lockedHuman: humanFromE8(insp.lockedE8),
+              lockedE8: insp.user?.depositedE8 ?? insp.lockedE8,
+              lockedHuman: humanFromE8(insp.user?.depositedE8 ?? insp.lockedE8),
               capacity18: insp.capacity18,
-              claimed18: insp.claimed18,
-              available18: insp.available18,
-              availableHuman: humanFrom18(insp.available18),
+              claimed18: insp.user?.claim18 ?? insp.claimed18,
+              available18: insp.user?.available18 ?? insp.available18,
+              availableHuman: humanFrom18(
+                insp.user?.available18 ?? insp.available18,
+              ),
               user: insp.user
                 ? {
                     ...insp.user,
@@ -1054,26 +1128,39 @@ export default function FungiblePool({
       const path = owner
         ? `pool/${String(owner).replace(/^0x/i, '').toLowerCase()}`
         : 'pool';
-      const res = await fetch(`${base}/${path}`, { cache: 'no-store' });
+      const res = await fetchWithTimeout(
+        `${base}/${path}`,
+        { cache: 'no-store' },
+        8000,
+      );
+      if (!res.ok) throw new Error(`inspect ${res.status}`);
       const data = await res.json();
       if (data.reports?.length) {
         const json = decodeInspectPayload(data.reports[0].payload);
         if (json && !json.error) {
           const user = json.user || null;
+          const lockedE8 = user?.depositedE8 ?? (owner ? '0' : json.lockedE8);
+          const claimed18 = user?.claim18 ?? (owner ? '0' : json.claimed18);
+          const available18 =
+            user?.available18 ??
+            (owner ? '0' : json.available18);
           setSnap({
             poolId: json.poolId,
             poolAddress: json.poolAddress || FUNGIBLE_POOL.address,
-            lockedE8: json.lockedE8,
-            claimed18: json.claimed18,
-            available18: json.available18,
-            redeemedE8: json.redeemedE8,
-            freeableE8: json.freeableE8,
-            lockedHuman: humanFromE8(json.lockedE8),
+            reservedMint: json.reservedMint !== false,
+            globalLockedE8: json.globalLockedE8 ?? json.lockedE8,
+            globalClaimed18: json.globalClaimed18 ?? json.claimed18,
+            lockedE8,
+            claimed18,
+            available18,
+            redeemedE8: user?.redeemedE8 ?? json.redeemedE8,
+            freeableE8: user?.freeableE8 ?? json.freeableE8,
+            lockedHuman: humanFromE8(lockedE8),
             capacityHuman: humanFrom18(json.capacity18),
-            claimedHuman: humanFrom18(json.claimed18),
-            availableHuman: humanFrom18(json.available18),
-            redeemedHuman: humanFromE8(json.redeemedE8),
-            freeableHuman: humanFromE8(json.freeableE8),
+            claimedHuman: humanFrom18(claimed18),
+            availableHuman: humanFrom18(available18),
+            redeemedHuman: humanFromE8(user?.redeemedE8 ?? json.redeemedE8),
+            freeableHuman: humanFromE8(user?.freeableE8 ?? json.freeableE8),
             holderRedeem: json.holderRedeem !== false,
             redeemPhase: json.redeemPhase || 'A-beta',
             spv: json.spv || null,
@@ -1155,11 +1242,14 @@ export default function FungiblePool({
     };
   }, [owner, wartFrom]);
 
-  const pollConfirm = async (txHash, need = 1) => {
+  const pollConfirm = async (txHash, need = 1, { timeoutMs } = {}) => {
     if (!wartBridgeApi?.getWartTxProof) return null;
-    for (let i = 0; i < 40; i++) {
+    const deadline = Date.now() + Math.max(timeoutMs || (need > 1 ? 360000 : 180000), 30000);
+    let last = null;
+    while (Date.now() < deadline) {
       try {
         const proof = await wartBridgeApi.getWartTxProof(txHash);
+        last = proof;
         const conf = proof?.transaction?.confirmations ?? proof?.confirmations ?? 0;
         if (Number(conf) >= need) return proof;
       } catch {
@@ -1167,8 +1257,7 @@ export default function FungiblePool({
       }
       await sleep(3000);
     }
-    // last try
-    return wartBridgeApi.getWartTxProof(txHash);
+    return last || wartBridgeApi.getWartTxProof(txHash);
   };
 
   /** Enqueue server credit + local pending (relayer posts InputBox). */
@@ -1241,7 +1330,9 @@ export default function FungiblePool({
         if (insp && !insp.error) {
           const locked = BigInt(String(insp.lockedE8 || 0));
           const deposited = BigInt(String(insp.user?.depositedE8 || 0));
-          if (deposited > prevDeposited || locked > prevLocked) {
+          // Only THIS owner's deposited balance. Global locked can rise from
+          // someone else's credit and must not mark this wait as done.
+          if (deposited > prevDeposited) {
             return { ok: true, source: 'inspect', deposited, locked };
           }
         }
@@ -1258,9 +1349,17 @@ export default function FungiblePool({
             String(txHash).replace(/^0x/i, '').toLowerCase(),
         );
         if (row?.status === 'credited') {
-          // Queue truth: credit already applied (or duplicate). Always succeed
-          // even if inspect deposited did not *increase* this wait cycle.
-          return { ok: true, source: 'queue-credited', row };
+          // Queue can flip to credited from a GraphQL notice a beat before
+          // inspect shows user.depositedE8. Do not return yet — 1-click used
+          // that stale 0 as "fully minted" and skipped mint.
+          if (softDeadline < hardDeadline) {
+            softDeadline = Math.min(Date.now() + 45000, hardDeadline);
+          }
+          const catchUp = 'credit landed — waiting for Your deposit on inspect…';
+          if (catchUp !== lastStatusNote) {
+            lastStatusNote = catchUp;
+            toast.loading(`Pool credit: ${catchUp}`, { id: 'pool' });
+          }
         }
         if (row?.status === 'rejected' || row?.status === 'failed') {
           const err = new Error(row.error || 'Credit rejected by relayer');
@@ -1281,7 +1380,7 @@ export default function FungiblePool({
                 : row?.status === 'processing'
                   ? 'relayer processing (SPV / LC catch-up)…'
                   : '');
-        if (note && note !== lastStatusNote) {
+        if (row?.status !== 'credited' && note && note !== lastStatusNote) {
           lastStatusNote = note;
           toast.loading(`Pool credit: ${note}`, { id: 'pool' });
         }
@@ -1304,7 +1403,7 @@ export default function FungiblePool({
       if (insp && !insp.error) {
         const locked = BigInt(String(insp.lockedE8 || 0));
         const deposited = BigInt(String(insp.user?.depositedE8 || 0));
-        if (deposited > prevDeposited || locked > prevLocked) {
+        if (deposited > prevDeposited) {
           return { ok: true, source: 'inspect-late', deposited, locked };
         }
       }
@@ -1321,6 +1420,8 @@ export default function FungiblePool({
           String(txHash).replace(/^0x/i, '').toLowerCase(),
       );
       if (row?.status === 'credited') {
+        // Last resort: queue is truth that WART was credited. Callers must
+        // still poll inspect before deciding there is nothing to mint.
         return { ok: true, source: 'queue-credited-late', row };
       }
     } catch {
@@ -1365,7 +1466,7 @@ export default function FungiblePool({
       }
     } catch (e) {
       throw new Error(
-        `Anvil not reachable via wallet: ${e?.message || e}. RPC should be https://cartesi-bridge.duckdns.org/rpc`,
+        `Anvil not reachable via wallet: ${e?.message || e}. Stay on Cartesi Bridge Anvil (31337).`,
       );
     }
   };
@@ -1607,7 +1708,15 @@ export default function FungiblePool({
   /**
    * 1-button live deposit: send WART once → relayer credits rollup.
    * Never re-sends WART on credit failure — surfaces Resume instead.
-   * @param {{ timeoutMs?: number, preview?: boolean }} [opts]
+   * @param {{
+   *   timeoutMs?: number,
+   *   preview?: boolean,
+   *   creditConfirm?: number,
+   *   proceedConfirm?: number,
+   * }} [opts]
+   * creditConfirm: inclusive Warthog confs before treating proof as ready
+   *   (relayer credits at 1). proceedConfirm: extra wait (atomic mint uses 2)
+   *   so rollup credit is already applied before mint/withdraw.
    */
   const liveDeposit = async (opts = {}) => {
     if (!owner) throw new Error('Connect L1 wallet');
@@ -1684,11 +1793,12 @@ export default function FungiblePool({
       txData?.data?.hash;
     if (!txHash) throw new Error('No Warthog tx hash from send');
 
-    // Convert human amount → E8 early so we can queue even if proof parsing lags
+    // Convert human amount → E8 early so we can queue even if proof parsing lags.
+    // Integer path — do not use Number*1e8 (float drift).
     let earlyE8 = null;
     try {
-      const n = Number(amt);
-      if (Number.isFinite(n) && n > 0) earlyE8 = Math.round(n * 1e8);
+      const s = humanToE8(amt);
+      if (s != null && BigInt(s) > 0n) earlyE8 = Number(s);
     } catch {
       /* */
     }
@@ -1732,8 +1842,16 @@ export default function FungiblePool({
       // Continue — proof path will re-enqueue; still surface hash for Resume
     }
 
-    toast.loading('Waiting for Warthog confirmations…', { id: 'pool' });
-    let proof = await pollConfirm(txHash, 1);
+    const creditAt = Math.max(1, Number(opts.creditConfirm ?? 1));
+    const proceedAt = Math.max(creditAt, Number(opts.proceedConfirm ?? creditAt));
+
+    toast.loading(
+      creditAt === 1
+        ? 'Waiting for 1 Warthog confirmation (rollup credits now)…'
+        : `Waiting for ${creditAt} Warthog confirmations…`,
+      { id: 'pool' },
+    );
+    let proof = await pollConfirm(txHash, creditAt);
     if (!proof) {
       updatePendingStatus(txHash, 'stranded', {
         error: 'proof incomplete — Resume when confirmed',
@@ -1772,6 +1890,14 @@ export default function FungiblePool({
       confirmations: slim.confirmations || slim.transaction?.confirmations,
       baselineDepositedE8: String(prevDeposited),
     });
+
+    if (proceedAt > creditAt) {
+      toast.loading(
+        `Rollup crediting at ${creditAt} conf — waiting for confirmation ${proceedAt} before mint…`,
+        { id: 'pool' },
+      );
+      await pollConfirm(txHash, proceedAt, { timeoutMs: 360000 });
+    }
 
     toast.loading('Waiting for pool credit…', { id: 'pool' });
     const result = await waitForRollupCredit({
@@ -1825,7 +1951,7 @@ export default function FungiblePool({
             toast.success(`Deposited ${humanFromE8(amtE8)} WART to pool`, {
               id: 'pool',
             });
-            return;
+            return { amountE8: amtE8, txHash, source: 'optional-wallet' };
           }
         } catch (e) {
           optionalErr = e?.message || String(e);
@@ -1853,6 +1979,7 @@ export default function FungiblePool({
     refreshPending();
     refreshFlows();
     toast.success(`Deposited ${humanFromE8(amtE8)} WART to pool`, { id: 'pool' });
+    return { amountE8: amtE8, txHash, source: result.source || 'inspect' };
   };
 
   const liveMint = async () => {
@@ -1866,25 +1993,62 @@ export default function FungiblePool({
 
     let before = (await fetchPoolInspect(owner).catch(() => null)) || {};
     if (!before.available18 && !before.user && snap) before = snap;
-    const prevClaim = userBn(before, 'claim18');
-    const prevPortable = userBn(before, 'portable18');
-    const avail = poolBn(before, 'available18');
-    const deposited = userBn(before, 'depositedE8');
+    let prevClaim = userBn(before, 'claim18');
+    let prevPortable = userBn(before, 'portable18');
+    let avail = poolBn(before, 'available18');
+    let deposited = userBn(before, 'depositedE8');
     const want18 = humanTo18(amt);
-    if (avail <= 0n) {
+    let ownerUnminted =
+      deposited * 10n ** 10n > prevClaim ? deposited * 10n ** 10n - prevClaim : 0n;
+    // Cap to this owner's unused deposit. Global available can belong to
+    // someone else's credited WART — do not mint it out from under them.
+    let mintCap = ownerUnminted < avail ? ownerUnminted : avail;
+    if (mintCap <= 0n && prevPortable <= 0n && deposited === 0n && prevClaim === 0n) {
+      // Credit just landed (queue / notice) but inspect is still empty.
+      toast.loading('Waiting for Your deposit on inspect before mint…', {
+        id: 'pool',
+        duration: Infinity,
+      });
+      const waited = await waitForPoolState(
+        owner,
+        (s) => ownerUnminted18(s) > 0n || userBn(s, 'portable18') > 0n,
+        { timeoutMs: 60000, intervalMs: 1500 },
+      );
+      if (waited && !waited.error) {
+        before = waited;
+        prevClaim = userBn(before, 'claim18');
+        prevPortable = userBn(before, 'portable18');
+        avail = poolBn(before, 'available18');
+        deposited = userBn(before, 'depositedE8');
+        ownerUnminted =
+          deposited * 10n ** 10n > prevClaim
+            ? deposited * 10n ** 10n - prevClaim
+            : 0n;
+        mintCap = ownerUnminted < avail ? ownerUnminted : avail;
+      }
+    }
+    if (mintCap <= 0n) {
+      if (prevPortable > 0n) {
+        toast.success(
+          `Already portable ${humanFrom18(prevPortable)} — withdrawing that instead of minting`,
+          { id: 'pool', duration: 8000 },
+        );
+        return { skipped: true, reason: 'portable', portable: prevPortable };
+      }
       throw new Error(
-        prevClaim > 0n || deposited > 0n
-          ? `No mint headroom left (your claim ${humanFrom18(prevClaim)}, pool available 0). Withdraw that claim or wait for more pool deposits.`
-          : 'No credited pool deposit yet. Wait until Your deposit / Pool available rises (Warthog confirmations + relayer) — do not send WART again. Then Mint claim.',
+        ownerUnminted <= 0n && (prevClaim > 0n || deposited > 0n)
+          ? `Your deposit is fully minted (claim ${humanFrom18(prevClaim)}). Withdraw portable or deposit more WART — do not mint against someone else's credit.`
+          : avail <= 0n && (prevClaim > 0n || deposited > 0n)
+            ? `No new mint headroom (available 0). Your claim ${humanFrom18(prevClaim)} is already minted. Finish Vouchers → Execute, or deposit more WART.`
+            : 'No credited pool deposit yet. Wait until Your deposit rises (Warthog confirmations + relayer) — do not send WART again. Then Mint claim.',
       );
     }
-    // Explicit Mint always adds `amount` (capped to remaining available).
-    // Do not skip just because an earlier claim already matches the box.
-    const mint18 = want18 > avail ? avail : want18;
+    // Explicit Mint always adds `amount` (capped to this owner's unused deposit).
+    const mint18 = want18 > mintCap ? mintCap : want18;
     const mintAmt = humanFrom18(mint18);
     if (mint18 < want18) {
       toast(
-        `Capping mint to ${mintAmt} (pool available). You already hold claim ${humanFrom18(prevClaim)}.`,
+        `Capping mint to ${mintAmt} (your unused deposit ${humanFrom18(ownerUnminted)}). You already hold claim ${humanFrom18(prevClaim)}.`,
         { id: 'pool-mint-cap', duration: 8000 },
       );
     }
@@ -1999,17 +2163,34 @@ export default function FungiblePool({
    */
   const liveWithdraw = async (opts = {}) => {
     if (!send) throw new Error('Rollup send unavailable');
-    const amt = String(amount || '').trim();
-    if (!amt) throw new Error('Enter amount');
+    const rawAmt = String(amount || '').trim();
+    if (!rawAmt) throw new Error('Enter amount');
 
     const before = (await fetchPoolInspect(owner).catch(() => null)) || {};
     const prevPortable = userBn(before, 'portable18');
+    const want18 = humanTo18(rawAmt);
+    if (prevPortable <= 0n) {
+      throw new Error(
+        'Nothing portable to withdraw. Mint a claim first. If you already withdrew, open Vouchers → Execute the ready row — do not withdraw again.',
+      );
+    }
+    // Rollup rejects amount > portable with no new voucher. Cap so we do not
+    // leave the UI pointing at an old already-listed row.
+    const wd18 = want18 > prevPortable ? prevPortable : want18;
+    const amt = humanFrom18(wd18);
+    if (wd18 < want18) {
+      toast(
+        `Capping withdraw to ${amt} (portable). Extra ${humanFrom18(want18 - wd18)} has no voucher.`,
+        { id: 'pool-wd-cap', duration: 9000 },
+      );
+    }
     const prevVouchers = await countOwnerVouchers(owner);
     const minInputIndex =
       opts.minInputIndex != null
         ? opts.minInputIndex
         : await maxOwnerVoucherInputIndex(owner);
     const seen = await snapshotNoticePayloads();
+    let rejectErr = null;
 
     toast.loading(`Withdrawing ${amt} (InputBox → voucher)…`, {
       id: 'pool',
@@ -2042,12 +2223,19 @@ export default function FungiblePool({
 
     void waitForNotice('pool_wwart_withdrawn', {
       timeoutMs: 25000,
+      rejectType: ['pool_withdraw_rejected'],
       matchOwner: owner,
       seenPayloads: seen,
-    }).catch(() => null);
+    }).catch((e) => {
+      if (e?.notice || String(e?.message || '').startsWith('Rollup rejected')) {
+        rejectErr = e;
+      }
+      return null;
+    });
 
     const deadline = Date.now() + 45000;
     while (Date.now() < deadline) {
+      if (rejectErr) throw rejectErr;
       try {
         const s = await fetchPoolInspect(owner);
         const portable = userBn(s, 'portable18');
@@ -2056,18 +2244,18 @@ export default function FungiblePool({
           refreshFlows();
           if (!opts.silentSuccess) {
             toast.success(
-              `Voucher ready for ${amt} wWART — open Vouchers → Execute`,
+              `Voucher ready for ${amt} wWART — open Vouchers → Execute the newest row`,
               { id: 'pool', duration: 9000 },
             );
           }
           return { prevVoucherCount: prevVouchers, minInputIndex };
         }
-        const vc = await countOwnerVouchers(owner);
-        if (vc >= 0 && prevVouchers >= 0 && vc > prevVouchers) {
+        const newest = await maxOwnerVoucherInputIndex(owner);
+        if (newest > minInputIndex) {
           advanceFlowForOwner(owner, 'voucher_ready', { amountHuman: amt });
           refreshFlows();
           if (!opts.silentSuccess) {
-            toast.success(`Voucher ready — open Vouchers → Execute`, {
+            toast.success(`New voucher #${newest} — open Vouchers → Execute`, {
               id: 'pool',
               duration: 9000,
             });
@@ -2079,12 +2267,15 @@ export default function FungiblePool({
       }
       await sleep(1500);
     }
-    const vc = await countOwnerVouchers(owner);
-    if (vc > 0) {
-      advanceFlowForOwner(owner, 'voucher_ready');
+    if (rejectErr) throw rejectErr;
+    const after = (await fetchPoolInspect(owner).catch(() => null)) || {};
+    const stillPortable = userBn(after, 'portable18');
+    const newest = await maxOwnerVoucherInputIndex(owner);
+    if (newest > minInputIndex) {
+      advanceFlowForOwner(owner, 'voucher_ready', { amountHuman: amt });
       refreshFlows();
       if (!opts.silentSuccess) {
-        toast.success('Open Vouchers and Execute (may already be listed)', {
+        toast.success(`New voucher #${newest} — open Vouchers → Execute`, {
           id: 'pool',
           duration: 10000,
         });
@@ -2092,14 +2283,15 @@ export default function FungiblePool({
       return { prevVoucherCount: prevVouchers, minInputIndex };
     }
     throw new Error(
-      'Withdraw not confirmed. Open Vouchers tab and refresh. RPC: https://cartesi-bridge.duckdns.org/rpc',
+      stillPortable >= prevPortable && prevPortable > 0n
+        ? `Withdraw not accepted. Portable is still ${humanFrom18(stillPortable)} — you can only withdraw up to that. The old voucher on the list is from an earlier withdraw; Execute that if it says ready. Do not withdraw ${rawAmt} again.`
+        : 'Withdraw not confirmed. Open Vouchers → Refresh and Execute the newest ready row.',
     );
   };
 
   /**
-   * One-click Path A: Deposit WART → mint claim → withdraw voucher → execute on L1.
-   * Manual step buttons remain for partial / recovery flows.
-   * MetaMask prompts: mint InputBox, withdraw InputBox, executeVoucher (+ Warthog send).
+   * One-click Path A: finish leftover vouchers/portable first, then
+   * deposit/mint/withdraw only the shortfall.
    */
   const liveOneClickToWwart = async () => {
     if (!owner) throw new Error('Connect L1 wallet');
@@ -2112,39 +2304,144 @@ export default function FungiblePool({
     const amt = String(amount || '').trim();
     if (!amt) throw new Error('Enter amount');
 
-    // Resume from *this owner's* rollup truth — never skip deposit just because
-    // the shared pool still has someone else's available headroom.
     const want18 = humanTo18(amt);
+    toast.loading('1-click: checking leftover vouchers…', { id: 'pool' });
+    const leftover = await executeLeftoverOwnerVouchers(signer, owner);
+    let delivered = leftover.amount18;
+    if (leftover.count) {
+      toast.loading(
+        `Finished ${leftover.count} leftover voucher(s) · ${humanFrom18(delivered)} wWART`,
+        { id: 'pool' },
+      );
+      onRefreshMmWwart?.();
+    }
+
     let insp = (await fetchPoolInspect(owner).catch(() => null)) || {};
     let claim = userBn(insp, 'claim18');
     let portable = userBn(insp, 'portable18');
     let userDep18 = userBn(insp, 'depositedE8') * 10n ** 10n;
+    const avail = poolBn(insp, 'available18');
 
-    if (claim >= want18 || portable >= want18 || userDep18 >= want18) {
-      toast.loading(
-        '1-click: already credited on rollup — skipping deposit…',
-        { id: 'pool' },
+    if (delivered >= want18) {
+      advanceFlowForOwner(owner, 'wwart_on_l1', { amountHuman: humanFrom18(delivered) });
+      refreshFlows();
+      toast.success(
+        `Pipeline cleared — ${humanFrom18(delivered)} wWART already executed`,
+        { id: 'pool', duration: 10000 },
       );
-    } else {
-      if (!wartBridgeApi?.sendTransaction || !wartBridgeApi?.getWartTxProof) {
-        throw new Error('Unlock Warthog wallet first (needed to send real WART)');
+      return;
+    }
+
+    // Portable still sitting on the rollup — withdraw it instead of minting again.
+    if (portable > 0n) {
+      const minInputIndex = await maxOwnerVoucherInputIndex(owner);
+      toast.loading('1-click: withdrawing leftover portable…', { id: 'pool' });
+      const w = await liveWithdraw({ silentSuccess: true, minInputIndex });
+      try {
+        const { hash } = await waitAndExecuteWwartVoucher(signer, {
+          owner,
+          minInputIndex: w?.minInputIndex ?? minInputIndex,
+          amountHint: humanFrom18(portable > want18 ? want18 : portable),
+          timeoutMs: 180000,
+        });
+        delivered += portable > want18 - delivered ? want18 - delivered : portable;
+        onRefreshMmWwart?.();
+        if (delivered >= want18) {
+          advanceFlowForOwner(owner, 'wwart_on_l1', { amountHuman: amt });
+          refreshFlows();
+          toast.success(
+            `wWART on MetaMask · ${String(hash).slice(0, 10)}…`,
+            { id: 'pool', duration: 10000 },
+          );
+          return;
+        }
+      } catch (e) {
+        throw new Error(
+          `${formatVoucherExecuteError(e)}. Leftover withdraw is in Vouchers — Execute that row.`,
+        );
       }
-      toast.loading(`1-click: depositing ${amt} WART…`, { id: 'pool' });
-      await liveDeposit();
       insp = (await fetchPoolInspect(owner).catch(() => null)) || {};
       claim = userBn(insp, 'claim18');
       portable = userBn(insp, 'portable18');
       userDep18 = userBn(insp, 'depositedE8') * 10n ** 10n;
     }
 
-    if (claim >= want18 || portable >= want18) {
-      toast.loading('1-click: claim already minted — skipping mint…', { id: 'pool' });
+    const stillWant = want18 > delivered ? want18 - delivered : 0n;
+    if (stillWant <= 0n) {
+      advanceFlowForOwner(owner, 'wwart_on_l1', { amountHuman: amt });
+      refreshFlows();
+      toast.success(`wWART on MetaMask · ${humanFrom18(delivered)}`, {
+        id: 'pool',
+        duration: 10000,
+      });
+      return;
+    }
+
+    // Only deposit if this owner has no unused credit of their own.
+    const unminted = userDep18 > claim ? userDep18 - claim : 0n;
+    let justDeposited = false;
+    if (unminted < stillWant) {
+      if (!wartBridgeApi?.sendTransaction || !wartBridgeApi?.getWartTxProof) {
+        throw new Error('Unlock Warthog wallet first (needed to send real WART)');
+      }
+      toast.loading(`1-click: depositing ${amt} WART…`, { id: 'pool' });
+      await liveDeposit();
+      justDeposited = true;
     } else {
+      toast.loading('1-click: using your unused deposit…', { id: 'pool' });
+    }
+
+    toast.loading(
+      justDeposited
+        ? '1-click: waiting for Your deposit on inspect…'
+        : '1-click: checking unused deposit…',
+      { id: 'pool' },
+    );
+    insp =
+      (await waitForPoolState(
+        owner,
+        (s) =>
+          ownerUnminted18(s) > 0n ||
+          userBn(s, 'portable18') >= stillWant ||
+          (!justDeposited && ownerUnminted18(s) >= stillWant),
+        { timeoutMs: justDeposited ? 60000 : 8000, intervalMs: 1500 },
+      )) ||
+      (await fetchPoolInspect(owner).catch(() => null)) ||
+      {};
+    portable = userBn(insp, 'portable18');
+    claim = userBn(insp, 'claim18');
+    userDep18 = userBn(insp, 'depositedE8') * 10n ** 10n;
+    const unmintedNow = ownerUnminted18(insp);
+
+    // Mint only this owner's unused deposit. Do not spend another user's credit.
+    // A just-credited deposit must proceed to mint even if inspect is still 0.
+    if (portable < stillWant && (unmintedNow > 0n || justDeposited)) {
       toast.loading('1-click: mint claim…', { id: 'pool' });
-      await liveMint();
+      const minted = await liveMint();
+      if (minted?.skipped) {
+        toast.loading('1-click: mint skipped — withdrawing portable…', { id: 'pool' });
+      }
       insp = (await fetchPoolInspect(owner).catch(() => null)) || {};
-      claim = userBn(insp, 'claim18');
       portable = userBn(insp, 'portable18');
+    } else if (portable < stillWant && unmintedNow <= 0n) {
+      throw new Error(
+        leftover.count || delivered > 0n
+          ? `Finished leftover pipeline (${humanFrom18(delivered)} wWART). Your deposit is fully minted — deposit more to swap another ${humanFrom18(stillWant)}.`
+          : `Nothing left in the pipeline to swap. Your deposit is fully minted. Deposit more WART before swapping again.`,
+      );
+    }
+
+    if (portable <= 0n) {
+      if (delivered > 0n) {
+        advanceFlowForOwner(owner, 'wwart_on_l1', { amountHuman: humanFrom18(delivered) });
+        refreshFlows();
+        toast.success(`Pipeline cleared — ${humanFrom18(delivered)} wWART on MetaMask`, {
+          id: 'pool',
+          duration: 10000,
+        });
+        return;
+      }
+      throw new Error('Nothing portable to withdraw after mint — refresh and retry');
     }
 
     const minInputIndex = await maxOwnerVoucherInputIndex(owner);
@@ -2168,7 +2465,6 @@ export default function FungiblePool({
       );
       onRefreshMmWwart?.();
     } catch (e) {
-      // Deposit/mint/withdraw already done — never ask user to re-deposit
       advanceFlowForOwner(owner, 'voucher_ready', { amountHuman: amt });
       refreshFlows();
       throw new Error(
@@ -2250,6 +2546,10 @@ export default function FungiblePool({
     }
   };
 
+  /**
+   * Atomic wWART → WART: portal the entered MetaMask wWART, burn, 3P pay native WART.
+   * Fresh cycle — does not resume a leftover redeem ticket.
+   */
   /**
    * Atomic wWART → WART: portal the entered MetaMask wWART, burn, 3P pay native WART.
    * Fresh cycle — does not resume a leftover redeem ticket.
@@ -2477,8 +2777,9 @@ export default function FungiblePool({
     const before = (await fetchPoolInspect(owner).catch(() => null)) || {};
     const prevClaim = userBn(before, 'claim18');
     const prevDeposited = userBn(before, 'depositedE8');
-    const prevLocked = poolBn(before, 'lockedE8');
-    const prevGlobalClaim = poolBn(before, 'claimed18');
+    const prevLocked = poolBn(before, 'globalLockedE8') || poolBn(before, 'lockedE8');
+    const prevGlobalClaim =
+      poolBn(before, 'globalClaimed18') || poolBn(before, 'claimed18');
     const seen = await snapshotNoticePayloads();
 
     toast.loading(
@@ -2513,8 +2814,9 @@ export default function FungiblePool({
       (s) =>
         userBn(s, 'claim18') < prevClaim ||
         userBn(s, 'depositedE8') < prevDeposited ||
-        poolBn(s, 'lockedE8') < prevLocked ||
-        poolBn(s, 'claimed18') < prevGlobalClaim ||
+        (poolBn(s, 'globalLockedE8') || poolBn(s, 'lockedE8')) < prevLocked ||
+        (poolBn(s, 'globalClaimed18') || poolBn(s, 'claimed18')) <
+          prevGlobalClaim ||
         userBn(s, 'redeemedE8') > userBn(before, 'redeemedE8'),
       { timeoutMs: 20000, intervalMs: 700 },
     );
@@ -2523,14 +2825,16 @@ export default function FungiblePool({
       after &&
       (userBn(after, 'claim18') < prevClaim ||
         userBn(after, 'depositedE8') < prevDeposited ||
-        poolBn(after, 'lockedE8') < prevLocked ||
-        poolBn(after, 'claimed18') < prevGlobalClaim ||
+        (poolBn(after, 'globalLockedE8') || poolBn(after, 'lockedE8')) <
+          prevLocked ||
+        (poolBn(after, 'globalClaimed18') || poolBn(after, 'claimed18')) <
+          prevGlobalClaim ||
         userBn(after, 'redeemedE8') > userBn(before, 'redeemedE8'));
     if (!burned) {
       // Maybe reject notice
       await noticeP.catch(() => null);
       throw new Error(
-        'Burn not confirmed. Deposit MetaMask wWART via portal first (Path A), then Burn. Holders: open pool claims must exist to redeem against. Refresh inspect.',
+        'Burn not confirmed. Portal-deposit your MetaMask wWART first, then Burn. Anyone holding completed wWART can redeem; unfinished mint/withdraw stays with the depositor.',
       );
     }
 
@@ -2568,19 +2872,18 @@ export default function FungiblePool({
     if (ticket?.ticketId && to) {
       advanceFlowForOwner(owner, 'payout_pending', { ticketId: ticket.ticketId });
       refreshFlows();
-      await payoutTicket(ticket, to, humanFromE8(ticket.amountE8) || amt);
+      const paid = await payoutTicket(ticket, to, humanFromE8(ticket.amountE8) || amt);
       advanceFlowForOwner(owner, 'complete', {
         ticketId: ticket.ticketId,
         note: 'WART payout submitted',
       });
-      // Mark complete
       listOpenFlows(owner).forEach((f) => {
         if (f.step === 'complete' || f.ticketId === ticket.ticketId) {
-          completeFlow(f.id, { payoutTxHash: null });
+          completeFlow(f.id, { payoutTxHash: paid?.txHash || null });
         }
       });
       refreshFlows();
-      return;
+      return paid;
     }
     if (ticket?.ticketId) {
       setLastTicket(ticket);
@@ -2657,7 +2960,7 @@ export default function FungiblePool({
     if (!ok) {
       await ticketP.catch(() => null);
       throw new Error(
-        'Redeem not confirmed. Need portable claim or freeable deposit. Check Your freeable / claim rows.',
+        'Redeem not confirmed. That step is only for your unfinished mint (portable / unused deposit). If you already hold wWART, use wWART → WART (portal + burn) — completed tokens are unbound.',
       );
     }
 
@@ -2870,7 +3173,8 @@ export default function FungiblePool({
       </header>
 
       <p className="fp-status-line">
-        1:1 pool swap. Native WART in → MetaMask wWART out, or the reverse via 3P payout.
+        1:1 reserved mint path. Until you hold wWART, only you can mint/withdraw your deposit.
+        After you have wWART it is unbound — anyone you send it to can redeem WART from the pool.
         {pool3pSt?.configured ? (
           <>
             {' '}
@@ -2889,24 +3193,24 @@ export default function FungiblePool({
           >
             <div className="wi-stat wi-stat--liquid">
               <Layers size={16} className="wi-stat-icon" />
-              <span className="wi-stat-k">Pool available</span>
+              <span className="wi-stat-k">Available</span>
               <span className="wi-stat-v">{snap?.availableHuman ?? '…'}</span>
-              <span className="wi-stat-hint">mint headroom</span>
+              <span className="wi-stat-hint">your unused deposit</span>
             </div>
             <div className="wi-stat">
               <span className="wi-stat-k">Locked</span>
               <span className="wi-stat-v">{snap?.lockedHuman ?? '…'}</span>
-              <span className="wi-stat-hint">WART in pool</span>
+              <span className="wi-stat-hint">your WART credited</span>
             </div>
             <div className="wi-stat">
               <span className="wi-stat-k">Used</span>
               <span className="wi-stat-v">{snap?.claimedHuman ?? '…'}</span>
-              <span className="wi-stat-hint">open claims</span>
+              <span className="wi-stat-hint">your minted claim</span>
             </div>
             <div className="wi-stat wi-stat--spoof">
               <span className="wi-stat-k">MetaMask wWART</span>
               <span className="wi-stat-v">{mmWwartLabel}</span>
-              <span className="wi-stat-hint">L1 ERC-20 (after voucher)</span>
+              <span className="wi-stat-hint">your L1 token</span>
             </div>
           </div>
 
@@ -3212,7 +3516,7 @@ export default function FungiblePool({
                 bindBlocked
               }
               onClick={() => run('one_click_wwart')}
-              title="Legacy 1-click — may skip deposit/mint if inspect already shows credit"
+              title="Deposit (if needed) → mint → withdraw → execute. Uses your unused credit; will not skip mint after a successful deposit."
             >
               <Zap size={14} aria-hidden style={{ verticalAlign: -2 }} /> Get wWART (1-click)
             </button>

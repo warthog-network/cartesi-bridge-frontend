@@ -75,6 +75,17 @@ export function removePendingDeposit(txHash) {
   localStorage.setItem(KEY, JSON.stringify(list));
 }
 
+/** Drop all local pending rows for an L1 owner (browser only). */
+export function clearPendingForOwner(owner) {
+  const o = String(owner || '').toLowerCase();
+  if (!o || typeof localStorage === 'undefined') return 0;
+  const list = listPendingDeposits();
+  const next = list.filter((p) => String(p.owner || '').toLowerCase() !== o);
+  const removed = list.length - next.length;
+  localStorage.setItem(KEY, JSON.stringify(next));
+  return removed;
+}
+
 /** Statuses that still need rollup credit (not terminal). */
 export function isOpenPendingStatus(status) {
   return [

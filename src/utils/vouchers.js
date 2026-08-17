@@ -198,6 +198,42 @@ export function proofToEthers(proof) {
  * @param {import('ethers-v6').Signer} signer
  * @param {object} voucher from fetchVouchers
  */
+let _historyAddr = null;
+
+/** History.getClaim — GraphQL can show a proof before Authority submits the epoch. */
+export async function isVoucherClaimedOnL1(signerOrProvider, voucher) {
+  const ctx = voucher?.proof?.context;
+  if (!ctx) return false;
+  const dapp = getDappAddress();
+  const { Contract } = await import('ethers-v6');
+  try {
+    if (!_historyAddr) {
+      const app = new Contract(
+        dapp,
+        ['function getConsensus() view returns (address)'],
+        signerOrProvider,
+      );
+      const consensus = await app.getConsensus();
+      const cons = new Contract(
+        consensus,
+        ['function getHistory() view returns (address)'],
+        signerOrProvider,
+      );
+      _historyAddr = await cons.getHistory();
+    }
+    const hist = new Contract(
+      _historyAddr,
+      ['function getClaim(address,bytes) view returns (bytes32,uint256,uint256)'],
+      signerOrProvider,
+    );
+    const bytes = String(ctx).startsWith('0x') ? ctx : `0x${ctx}`;
+    await hist.getClaim(dapp, bytes);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function wasVoucherExecuted(signerOrProvider, voucher) {
   const dapp = getDappAddress();
   const { Contract } = await import('ethers-v6');
@@ -224,14 +260,25 @@ export function formatVoucherExecuteError(e) {
   if (/user rejected|user denied|ACTION_REJECTED|4001/i.test(s)) {
     return 'MetaMask rejected executeVoucher — open Vouchers → Execute and approve (do not re-deposit)';
   }
+  if (/could not coalesce|-32603|Error processing the transaction|UNKNOWN_ERROR/i.test(s)) {
+    return (
+      'Wallet rejected executeVoucher (Anvil 1559 / could not coalesce). ' +
+      'Hard-refresh, stay on Anvil 31337, then Execute the newest ready row — do not re-deposit.'
+    );
+  }
   if (/Already executed/i.test(s)) {
     return 'That voucher was already executed — check MetaMask wWART balance';
   }
+  if (/L1_CLAIM_PENDING|InvalidClaimIndex/i.test(s)) {
+    return (
+      'L1 has not claimed this epoch yet (GraphQL shows the proof early). ' +
+      'Wait, hit Refresh, then Execute the 1 wWART row — do not re-deposit.'
+    );
+  }
   if (/missing revert data|estimateGas|CALL_EXCEPTION/i.test(s)) {
     return (
-      'executeVoucher gas estimate failed (often an already-used voucher or MetaMask estimateGas flake). ' +
-      'Refresh Vouchers, pick the newest ready row for your amount, or retry — do not re-deposit. ' +
-      'Wallet RPC must be https://cartesi-bridge.duckdns.org/rpc (Anvil 31337).'
+      'executeVoucher gas estimate failed (often an already-used voucher or a flaky estimate). ' +
+      'Refresh Vouchers, pick the newest ready row for your amount, or retry — do not re-deposit.'
     );
   }
   if (/Proof not ready|no proof|sibling/i.test(s)) {
@@ -240,8 +287,15 @@ export function formatVoucherExecuteError(e) {
   if (/network|chainId|chain id/i.test(s)) {
     return `Wrong network for executeVoucher — switch MetaMask to Anvil (31337). ${s}`;
   }
-  if (/NotMinter|not minter|execution reverted/i.test(s)) {
-    return `executeVoucher reverted (often minter/dApp mismatch or bad proof): ${s}`;
+  if (/NotMinter|not minter/i.test(s)) {
+    return `executeVoucher reverted (minter/dApp mismatch): ${s}`;
+  }
+  if (/execution reverted/i.test(s)) {
+    return (
+      'executeVoucher reverted — usually the L1 claim is still catching up after the rollup hitch. ' +
+      'Refresh and retry the 1 wWART row; do not re-deposit. ' +
+      s
+    );
   }
   return s.length > 220 ? `${s.slice(0, 220)}…` : s;
 }
@@ -257,6 +311,12 @@ export function formatVoucherExecuteError(e) {
  */
 export async function executeVoucherOnL1(signer, voucher) {
   if (!voucher?.hasProof) throw new Error('Proof not ready — wait a few blocks/epochs, then refresh');
+  const claimed = await isVoucherClaimedOnL1(signer, voucher);
+  if (!claimed) {
+    throw new Error(
+      'L1_CLAIM_PENDING: GraphQL proof is ready but Anvil History has not claimed this epoch yet',
+    );
+  }
   const dapp = getDappAddress();
   if (!dapp || /^0x0{40}$/i.test(dapp)) {
     throw new Error('dApp address not configured — cannot execute voucher');
@@ -299,8 +359,14 @@ export async function executeVoucherOnL1(signer, voucher) {
     throw err;
   }
 
-  // Explicit gas: skip MetaMask estimateGas (source of "missing revert data" on this stack)
-  const gasOverrides = { gasLimit: 1_500_000n };
+  // Cartesi Anvil 0.2.0 uses a ~7 wei 1559 base fee. MetaMask type-2 txs
+  // come back as ethers "could not coalesce" / -32603. Same legacy type-0
+  // + 1 gwei that InputBox.addInput already uses.
+  const gasOverrides = {
+    gasLimit: 1_500_000n,
+    type: 0,
+    gasPrice: 1_000_000_007n,
+  };
   try {
     // Optional: tighten gas if node estimate works; ignore failures
     const est = await app.executeVoucher.estimateGas(...args);

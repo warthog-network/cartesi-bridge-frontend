@@ -15,8 +15,10 @@ const QUEUE_PATH =
 const EMPTY = {
   version: 1,
   items: [],
-  /** warthogAddress(hex lower) → last known L1 owner */
+  /** warthogAddress(hex lower) → L1 owner. Written only by persistOwnerBind. */
   ownerByWart: {},
+  /** warthogAddress → { owner, method, issuedAt, registeredAt } */
+  bindMeta: {},
   updatedAt: null,
 };
 
@@ -33,9 +35,10 @@ async function readQueue() {
       ...j,
       items: Array.isArray(j.items) ? j.items : [],
       ownerByWart: j.ownerByWart && typeof j.ownerByWart === 'object' ? j.ownerByWart : {},
+      bindMeta: j.bindMeta && typeof j.bindMeta === 'object' ? j.bindMeta : {},
     };
   } catch (e) {
-    if (e?.code === 'ENOENT') return { ...EMPTY, items: [], ownerByWart: {} };
+    if (e?.code === 'ENOENT') return { ...EMPTY };
     throw e;
   }
 }
@@ -65,9 +68,68 @@ function normAddr(a) {
     .toLowerCase();
 }
 
+function shortL1(a) {
+  const s = String(a || '').toLowerCase();
+  if (!s.startsWith('0x')) return s.slice(0, 12);
+  return `${s.slice(0, 10)}…`;
+}
+
 /**
- * Enqueue or refresh a credit request after Warthog send.
- * Owner binding: first L1 owner wins for a given Warthog fromAddress.
+ * Create / refresh a dual-sig (or confirmed) WART → L1 bind.
+ * Never overwrites a different owner. This is the only writer of ownerByWart.
+ */
+export async function persistOwnerBind({
+  fromAddress,
+  owner,
+  issuedAt,
+  wartSig,
+  ownerSig,
+  method = 'dual-sig',
+}) {
+  const from = normAddr(fromAddress);
+  const own = String(owner || '').toLowerCase();
+  if (!from || from.length < 40) throw new Error('fromAddress required');
+  if (!own.startsWith('0x') || own.length !== 42) {
+    throw new Error('owner must be 0x + 40 hex');
+  }
+  const q = await readQueue();
+  q.ownerByWart = q.ownerByWart || {};
+  q.bindMeta = q.bindMeta || {};
+  const prev = q.ownerByWart[from] ? String(q.ownerByWart[from]).toLowerCase() : null;
+  if (prev && prev !== own) {
+    throw new Error(
+      `Warthog ${from.slice(0, 12)}… already bound to L1 ${prev.slice(0, 10)}…`,
+    );
+  }
+  const already = prev === own;
+  q.ownerByWart[from] = own;
+  q.bindMeta[from] = {
+    owner: own,
+    method,
+    issuedAt: issuedAt != null ? Number(issuedAt) : null,
+    registeredAt: already && q.bindMeta[from]?.registeredAt
+      ? q.bindMeta[from].registeredAt
+      : new Date().toISOString(),
+    wartSig: wartSig || q.bindMeta[from]?.wartSig || null,
+    ownerSig: ownerSig || q.bindMeta[from]?.ownerSig || null,
+  };
+  await writeQueue(q);
+  return {
+    ok: true,
+    already,
+    fromAddress: from,
+    owner: own,
+    boundOwner: own,
+    method,
+    status: 'match',
+    conflict: false,
+    needsRegister: false,
+  };
+}
+
+/**
+ * Enqueue a credit. Requires an existing WART → L1 bind (dual-sig or legacy).
+ * Does NOT create binds — that was the first-writer race.
  */
 export async function requestPoolCredit({
   txHash,
@@ -95,17 +157,22 @@ export async function requestPoolCredit({
   const q = await readQueue();
   const from = fromAddress ? normAddr(fromAddress) : null;
 
-  // First-writer-wins: Warthog deposit address binds to one L1 owner
   if (from) {
-    const bound = q.ownerByWart[from];
-    if (bound && bound !== own) {
+    const bound = q.ownerByWart[from]
+      ? String(q.ownerByWart[from]).toLowerCase()
+      : null;
+    if (!bound) {
+      throw new Error(
+        `Warthog ${from.slice(0, 12)}… is not bound to an L1 owner — register bind (Warthog + MetaMask signatures) before credit`,
+      );
+    }
+    if (bound !== own) {
       throw new Error(
         `Warthog ${from.slice(0, 12)}… already bound to L1 ${bound.slice(0, 10)}… — cannot credit ${own.slice(0, 10)}…`,
       );
     }
-    if (!bound) {
-      q.ownerByWart[from] = own;
-    }
+  } else {
+    throw new Error('fromAddress required — cannot credit without a bound Warthog sender');
   }
 
   const existing = q.items.find((i) => normHash(i.txHash) === hash);
@@ -217,4 +284,4 @@ export async function loadCreditQueueRaw() {
   return readQueue();
 }
 
-export { QUEUE_PATH, normHash, normAddr };
+export { QUEUE_PATH, normHash, normAddr, shortL1 };
