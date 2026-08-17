@@ -474,6 +474,7 @@ export default function WalletIsland() {
             `Auto-connected (${describeProvider(eth)}): ${addr.slice(0, 6)}...${addr.slice(-4)}`,
           );
           refreshVault(addr);
+          importWwartToken({ silent: true }).catch(() => {});
         }
       } catch (err) {
         console.log('No auto-connect');
@@ -828,6 +829,81 @@ export default function WalletIsland() {
   };
 
   /**
+   * wallet_watchAsset for the live Anvil wWART. Switch to 31337 first so the
+   * token is not added on Ethereum mainnet. Checksum address — some wallets
+   * reject lowercase. Object params first, then array (WalletConnect).
+   */
+  const importWwartToken = async ({ silent = false } = {}) => {
+    const raw = WWART_ADDRESS || LOCAL_WWART?.address || '';
+    if (!raw) {
+      if (!silent) toast.error('wWART token not configured');
+      return false;
+    }
+    let addr = raw;
+    try {
+      addr = ethers.getAddress(raw);
+    } catch {
+      /* keep raw */
+    }
+    const symbol = LOCAL_WWART?.symbol || 'wWART';
+    const decimals = LOCAL_WWART?.decimals ?? 18;
+    const eth = getEip1193() || (await resolveProviderForConnect());
+    if (!eth) {
+      if (!silent) toast.error('No browser wallet found');
+      return false;
+    }
+    try {
+      await ensureCartesiNetwork({ silent: true });
+    } catch {
+      /* still try watchAsset */
+    }
+    const payload = {
+      type: 'ERC20',
+      options: { address: addr, symbol, decimals },
+    };
+    try {
+      let added;
+      try {
+        added = await eth.request({
+          method: 'wallet_watchAsset',
+          params: payload,
+        });
+      } catch {
+        added = await eth.request({
+          method: 'wallet_watchAsset',
+          params: [payload],
+        });
+      }
+      if (added) {
+        if (!silent) toast.success(`${symbol} added · ${addr.slice(0, 8)}…`);
+        return true;
+      }
+      if (!silent) {
+        try {
+          await navigator.clipboard?.writeText(addr);
+          toast('Import cancelled — address copied', { duration: 4000 });
+        } catch {
+          toast('Import cancelled');
+        }
+      }
+      return false;
+    } catch (e) {
+      if (!silent) {
+        try {
+          await navigator.clipboard?.writeText(addr);
+          toast.error(
+            `Auto-import failed (${e?.message || e}). Address copied.`,
+            { duration: 7000 },
+          );
+        } catch {
+          toast.error(`Auto-import failed: ${e?.message || e}`);
+        }
+      }
+      return false;
+    }
+  };
+
+  /**
    * Prove L1 is usable for InputBox: VPS Anvil up + MetaMask on chainId with a live RPC.
    * Rebinds provider/signer after network switch.
    */
@@ -1071,6 +1147,8 @@ export default function WalletIsland() {
       hydrateVaultFromCache(addr);
       toast.success(`Connected (${label}): ${addr.slice(0, 6)}...${addr.slice(-4)}`);
       refreshVault(addr);
+      // Add live wWART on this chain (no-op if the wallet already has it).
+      importWwartToken({ silent: true }).catch(() => {});
 
       // Keep session in sync for WC disconnects
       if (isWalletConnectProvider(eth) && eth.on) {
@@ -2789,38 +2867,8 @@ export default function WalletIsland() {
               <button
                 type="button"
                 className="wi-token-copy"
-                title={`Import ${LOCAL_WWART?.symbol || 'wWART'} into MetaMask`}
-                onClick={async () => {
-                  const addr = WWART_ADDRESS;
-                  const symbol = LOCAL_WWART?.symbol || 'wWART';
-                  const decimals = LOCAL_WWART?.decimals ?? 18;
-                  try {
-                    const eth = getEip1193() || (await resolveProviderForConnect());
-                    if (!eth) throw new Error('No browser wallet found');
-                    const added = await eth.request({
-                      method: 'wallet_watchAsset',
-                      params: {
-                        type: 'ERC20',
-                        options: { address: addr, symbol, decimals },
-                      },
-                    });
-                    if (added) toast.success(`${symbol} added to ${describeProvider(eth)}`);
-                    else {
-                      await navigator.clipboard?.writeText(addr);
-                      toast('Import cancelled — address copied', { duration: 4000 });
-                    }
-                  } catch (e) {
-                    try {
-                      await navigator.clipboard?.writeText(addr);
-                      toast.error(
-                        `Auto-import failed (${e?.message || e}). Address copied.`,
-                        { duration: 7000 },
-                      );
-                    } catch {
-                      toast.error(`Auto-import failed: ${e?.message || e}`);
-                    }
-                  }
-                }}
+                title={`Import ${LOCAL_WWART?.symbol || 'wWART'} into the connected wallet`}
+                onClick={() => importWwartToken({ silent: false })}
               >
                 Import token · {WWART_ADDRESS.slice(0, 8)}…{WWART_ADDRESS.slice(-6)}
               </button>

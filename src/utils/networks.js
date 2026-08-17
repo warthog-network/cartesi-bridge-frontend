@@ -42,7 +42,7 @@ export const ANVIL = {
      * Product-shaped minter-only token (MinterWWART).
      * Updated by deploy-minter-wwart.mjs; zero means not deployed yet.
      */
-    minterWwart: '0x663F3ad617193148711d28f5334eE4Ed07016602',
+    minterWwart: '0xBc174Ba3265e5E0FbdEFa2A8c9FDa5F334471287',
   },
   tokens: {
     wwart: {
