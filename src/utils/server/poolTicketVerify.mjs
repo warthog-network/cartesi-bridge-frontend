@@ -40,7 +40,7 @@ export async function findReleaseTicketNotice(ticketId, { last = 400 } = {}) {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      query: `{ notices(last: ${Math.min(500, Number(last) || 400)}) { edges { node { index payload } } } }`,
+      query: `{ notices(last: ${Math.min(500, Number(last) || 400)}) { edges { node { index payload input { index } proof { context validity { inputIndexWithinEpoch outputIndexWithinInput outputHashesRootHash vouchersEpochRootHash noticesEpochRootHash machineStateHash outputHashInOutputHashesSiblings outputHashesInEpochSiblings } } } } } }`,
     }),
   });
   if (!res.ok) {
@@ -56,8 +56,24 @@ export async function findReleaseTicketNotice(ticketId, { last = 400 } = {}) {
     if (obj.type !== 'pool_release_ticket') continue;
     if (String(obj.ticketId || '') !== id) continue;
     const idx = Number(e?.node?.index ?? 0);
+    const proof = e?.node?.proof || null;
+    const v = proof?.validity;
+    const hasProof = !!(
+      v?.noticesEpochRootHash &&
+      Array.isArray(v?.outputHashInOutputHashesSiblings) &&
+      v.outputHashInOutputHashesSiblings.length > 0 &&
+      Array.isArray(v?.outputHashesInEpochSiblings) &&
+      v.outputHashesInEpochSiblings.length > 0
+    );
     if (!best || idx >= best._index) {
-      best = { ...obj, _index: idx };
+      best = {
+        ...obj,
+        _index: idx,
+        _inputIndex: e?.node?.input?.index ?? null,
+        _payloadHex: e?.node?.payload || null,
+        _proof: proof,
+        _hasProof: hasProof,
+      };
     }
   }
   return best;
@@ -126,5 +142,103 @@ export async function assertPayoutMatchesTicket(args) {
     owner: notice.owner || args.owner || null,
     phase: notice.phase || null,
     reason: notice.reason || null,
+  };
+}
+
+const L1_RPC =
+  process.env.CARTESI_RPC_URL ||
+  process.env.PUBLIC_L1_RPC ||
+  'http://127.0.0.1:8545';
+const DAPP =
+  process.env.CARTESI_DAPP || '0xab7528bb862fB57E8A2BCd567a2e929a0Be56a5e';
+
+const VALIDATE_NOTICE_ABI = [
+  'function validateNotice(bytes notice, tuple(tuple(uint64 inputIndexWithinEpoch, uint64 outputIndexWithinInput, bytes32 outputHashesRootHash, bytes32 vouchersEpochRootHash, bytes32 noticesEpochRootHash, bytes32 machineStateHash, bytes32[] outputHashInOutputHashesSiblings, bytes32[] outputHashesInEpochSiblings) validity, bytes context) proof) view returns (bool)',
+];
+
+export function ticketNeedsNoticeProof(ticketId) {
+  const id = String(ticketId || '');
+  if (!id) return false;
+  if (/^lab-demo-/.test(id)) return false;
+  if (/^wart-pool-rotate-/.test(id)) return false;
+  return true;
+}
+
+/**
+ * L1 Application.validateNotice for a release ticket.
+ * Signers must pass this before r1/d2; coordinator re-checks.
+ */
+export async function assertReleaseNoticeProof(ticketId, extra = {}) {
+  const id = String(ticketId || '').trim();
+  if (!ticketNeedsNoticeProof(id)) {
+    return { ok: true, skipped: true, ticketId: id };
+  }
+  const notice = await findReleaseTicketNotice(id);
+  if (!notice) {
+    const err = new Error(
+      `No pool_release_ticket notice for ${id} — burn/redeem on rollup first`,
+    );
+    err.code = 'NOTICE_PROOF';
+    err.waiting = false;
+    throw err;
+  }
+  if (extra.amountE8 != null && String(extra.amountE8) !== '' &&
+      String(notice.amountE8) !== String(extra.amountE8)) {
+    throw new Error(`amountE8 mismatch ticket=${notice.amountE8}`);
+  }
+  if (extra.toAddress && notice.toAddress) {
+    const a = normAddr(extra.toAddress);
+    const b = normAddr(notice.toAddress);
+    const a40 = a.length >= 40 ? a.slice(-40) : a;
+    const b40 = b.length >= 40 ? b.slice(-40) : b;
+    if (a !== b && a40 !== b40) {
+      throw new Error('toAddress mismatch vs release notice');
+    }
+  }
+  if (!notice._hasProof || !notice._proof?.validity || !notice._payloadHex) {
+    const err = new Error('waiting for Cartesi notice proof (epoch not claimed)');
+    err.code = 'NOTICE_PROOF';
+    err.waiting = true;
+    throw err;
+  }
+  const { JsonRpcProvider, Contract } = await import('ethers-v6');
+  const provider = new JsonRpcProvider(L1_RPC);
+  const app = new Contract(DAPP, VALIDATE_NOTICE_ABI, provider);
+  const v = notice._proof.validity;
+  const proof = {
+    validity: {
+      inputIndexWithinEpoch: BigInt(v.inputIndexWithinEpoch),
+      outputIndexWithinInput: BigInt(v.outputIndexWithinInput),
+      outputHashesRootHash: v.outputHashesRootHash,
+      vouchersEpochRootHash: v.vouchersEpochRootHash,
+      noticesEpochRootHash: v.noticesEpochRootHash,
+      machineStateHash: v.machineStateHash,
+      outputHashInOutputHashesSiblings: v.outputHashInOutputHashesSiblings,
+      outputHashesInEpochSiblings: v.outputHashesInEpochSiblings,
+    },
+    context: String(notice._proof.context || '').startsWith('0x')
+      ? notice._proof.context
+      : `0x${notice._proof.context || ''}`,
+  };
+  let ok = false;
+  try {
+    ok = await app.validateNotice(notice._payloadHex, proof);
+  } catch (e) {
+    const err = new Error(`validateNotice failed: ${e.shortMessage || e.message}`);
+    err.code = 'NOTICE_PROOF';
+    throw err;
+  }
+  if (!ok) {
+    const err = new Error('validateNotice returned false');
+    err.code = 'NOTICE_PROOF';
+    throw err;
+  }
+  return {
+    ok: true,
+    ticketId: id,
+    noticeIndex: notice._index,
+    inputIndex: notice._inputIndex,
+    amountE8: String(notice.amountE8),
+    toAddress: notice.toAddress,
   };
 }

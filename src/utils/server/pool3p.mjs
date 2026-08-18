@@ -23,6 +23,10 @@ import {
   cosignerSignStep,
 } from '../twoPartyEcdsa.js';
 import { secp256k1 } from '@noble/curves/secp256k1';
+import {
+  assertReleaseNoticeProof,
+  ticketNeedsNoticeProof,
+} from './poolTicketVerify.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FE_ROOT = path.join(__dirname, '../../..');
@@ -725,6 +729,51 @@ export function paidRecordFor(ticketId, extra = {}) {
 export function ticketIsPaid(ticketId, extra = {}) {
   return !!paidRecordFor(ticketId, extra);
 }
+
+/** Paid-log hit for status/expire. Prefer amount+dest; fall back to ticketId. */
+function paidLogHit(ticketId, sess) {
+  const id = String(ticketId || '').trim();
+  if (!id) return null;
+  const extra = {
+    amountE8: sess?.amountE8 || sess?.prep?.amountE8,
+    toAddress: sess?.toAddress || sess?.prep?.toAddress,
+  };
+  const hit = paidRecordFor(id, extra);
+  if (hit) return hit;
+  const loose = (loadPaidLog().pays || []).find((p) => String(p.ticketId || '') === id);
+  if (!loose) return null;
+  if (extra.amountE8 && !samePaidAmount(loose, extra.amountE8)) return null;
+  if (extra.toAddress && !samePaidDest(loose, extra.toAddress)) return null;
+  return { ...loose, status: 'paid', scheme: loose.scheme || POOL3P_SCHEME };
+}
+
+function paidStatusView(paid, sess) {
+  const txHash = paid?.txHash || sess?.payout?.txHash || null;
+  const base = sess
+    ? roomView({
+        ...sess,
+        status: 'paid',
+        haveR1: false,
+        haveD2: false,
+        payout: {
+          ...(sess.payout || {}),
+          ok: true,
+          txHash,
+          at: paid?.at || sess.payout?.at || null,
+        },
+      })
+    : { ok: true };
+  return {
+    ...base,
+    ok: true,
+    status: 'paid',
+    txHash,
+    payout: { ok: true, txHash, at: paid?.at || base.payout?.at || null },
+    alreadyPaid: true,
+    waitingOn: [],
+  };
+}
+
 
 function fillRoomMeta(ticket, extra = {}) {
   const t = ticket || {};
@@ -1702,6 +1751,19 @@ export async function pool3pOfferR1({
     throw new Error('R1Hex + hashHex required');
   }
   const id = String(ticketId);
+  if (ticketNeedsNoticeProof(id)) {
+    try {
+      await assertReleaseNoticeProof(id, { amountE8, toAddress });
+    } catch (e) {
+      return {
+        ok: false,
+        ticketId: id,
+        waiting: !!e.waiting,
+        waitingOn: e.waiting ? 'notice-proof' : undefined,
+        error: e.message,
+      };
+    }
+  }
   const paid = paidRecordFor(id);
   if (paid) {
     return { ok: false, alreadyPaid: true, error: 'ticket already paid', ticketId: id, ...paid };
@@ -1718,6 +1780,7 @@ export async function pool3pOfferR1({
         R1Hex,
         hashHex: String(hashHex).replace(/^0x/i, ''),
         haveR1: true,
+        noticeProofOk: ticketNeedsNoticeProof(id) ? true : prev.noticeProofOk,
         status: prev.haveD2 ? 'ready' : 'wait_d2',
         updatedAt: Date.now(),
         room: true,
@@ -1748,6 +1811,20 @@ export async function pool3pOfferD2({ ticketId, signerId, d2Hex, amountE8, toAdd
     };
   }
   hexToScalar(d2Hex);
+  const ticketIdNorm = String(ticketId);
+  if (ticketNeedsNoticeProof(ticketIdNorm)) {
+    try {
+      await assertReleaseNoticeProof(ticketIdNorm, { amountE8, toAddress });
+    } catch (e) {
+      return {
+        ok: false,
+        ticketId: ticketIdNorm,
+        waiting: !!e.waiting,
+        waitingOn: e.waiting ? 'notice-proof' : undefined,
+        error: e.message,
+      };
+    }
+  }
   const wantP2 = String(dapp.seats?.['2']?.P || dapp.seal?.P2 || '')
     .replace(/^0x/i, '')
     .toLowerCase();
@@ -1781,6 +1858,7 @@ export async function pool3pOfferD2({ ticketId, signerId, d2Hex, amountE8, toAdd
         ticketId: id,
         haveD2: true,
         d2Hex: incoming,
+        noticeProofOk: ticketNeedsNoticeProof(id) ? true : prev.noticeProofOk,
         status: prev.haveR1 ? 'ready' : 'wait_r1',
         updatedAt: Date.now(),
         room: true,
@@ -1936,6 +2014,7 @@ export function listOpenPool3pTickets() {
     if (!amountE8 || !toAddress) return;
     seen.add(id);
     const waitingOn = [];
+    if (ticketNeedsNoticeProof(id) && !t.noticeProofOk) waitingOn.push('notice-proof');
     if (!t.haveR1) waitingOn.push('d1');
     if (!t.haveD2) waitingOn.push('d2');
     if (t.haveR1 && t.haveD2 && !t.ciphertext && !t.payout?.txHash) waitingOn.push('lindell');
@@ -2013,6 +2092,20 @@ export async function closePool3pRoom(ticketId, reason = 'reset') {
     if (sessionLooksPaid(t)) {
       return { ok: true, ticketId: id, skipped: true, paid: true };
     }
+    const paid = paidLogHit(id, t);
+    if (paid) {
+      t.status = 'paid';
+      t.room = false;
+      t.payout = {
+        ...(t.payout || {}),
+        ok: true,
+        txHash: paid.txHash || t.payout?.txHash || null,
+        at: paid.at || Date.now(),
+      };
+      wipeRoomSecrets(t);
+      t.updatedAt = Date.now();
+      return { ok: true, ticketId: id, skipped: true, paid: true, restored: true };
+    }
     wipeRoomSecrets(t);
     t.status = 'abandoned';
     t.abandonedAt = Date.now();
@@ -2034,7 +2127,7 @@ export async function expireStaleUserRooms(now = Date.now()) {
   for (const t of Object.values(s.tickets || {})) {
     const id = String(t?.ticketId || '');
     if (!id || isRotateTicketId(id)) continue;
-    if (sessionLooksPaid(t) || sessionAbandoned(t)) continue;
+    if (sessionLooksPaid(t) || sessionAbandoned(t) || paidLogHit(id, t)) continue;
     const updated = Number(t.updatedAt || 0);
     const partialAt = Number(t.partialAt || 0);
     const idle = updated ? now - updated : 0;
@@ -2124,6 +2217,9 @@ export function listPaidPool3pTickets(limit = 16) {
 export function roomView(sess) {
   const sum = summarizeSess(sess);
   const waitingOn = [];
+  if (ticketNeedsNoticeProof(sess?.ticketId) && !sess?.noticeProofOk) {
+    waitingOn.push('notice-proof');
+  }
   if (!sum.haveR1) waitingOn.push('d1');
   if (!sum.haveD2) waitingOn.push('d2');
   if (sum.haveR1 && sum.haveD2 && !sum.hasPartial && sum.status !== 'paid') {
@@ -2152,8 +2248,11 @@ export async function pool3pGetPrep(ticketId) {
 }
 
 export async function pool3pStatusTicket(ticketId) {
+  const id = String(ticketId || '').trim();
   const s = await loadSessions();
-  const t = s.tickets[String(ticketId)];
+  const t = id ? s.tickets[id] : null;
+  const paid = paidLogHit(id, t);
+  if (paid) return paidStatusView(paid, t);
   if (!t) return { ok: false };
   return roomView(t);
 }

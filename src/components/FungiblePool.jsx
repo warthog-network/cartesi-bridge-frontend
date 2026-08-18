@@ -259,6 +259,69 @@ async function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+const WART_TX_HASH_RE = /^[0-9a-f]{64}$/i;
+
+function shortTx(hash) {
+  const h = String(hash || '').replace(/^0x/i, '');
+  return h ? `${h.slice(0, 12)}…` : '';
+}
+
+/** Mempool / broadcast accepted — yellow until the first Warthog confirmation. */
+function toastWartSent(msg) {
+  return toast(msg, {
+    id: 'pool',
+    duration: Infinity,
+    icon: '🟡',
+    style: {
+      background: '#f5c518',
+      color: '#111',
+      border: '1px solid #c9a20a',
+      fontWeight: 650,
+    },
+  });
+}
+
+function toastWartConfirmed(msg) {
+  return toast.success(msg, { id: 'pool', duration: 12000 });
+}
+
+/**
+ * Broadcast tx hash only. On Warthog the signed hashHex equals the txid, but
+ * prep.hashHex exists before submit — do not treat that as a send by itself.
+ */
+function extractBroadcastTx(st) {
+  if (!st) return null;
+  const status = String(st.status || '').toLowerCase();
+  const paid =
+    status === 'paid' ||
+    st.alreadyPaid === true ||
+    st.paid === true ||
+    st.payout?.ok === true;
+  const raw = st.txHash || st.payout?.txHash || null;
+  const hex = raw ? String(raw).replace(/^0x/i, '').toLowerCase() : '';
+  if (WART_TX_HASH_RE.test(hex) && (paid || st.payout?.txHash)) return hex;
+  return null;
+}
+
+async function lookupPayoutTx(txHash) {
+  const h = String(txHash || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (!WART_TX_HASH_RE.test(h)) return null;
+  const res = await fetch(`/api/pool?lookup=${encodeURIComponent(h)}`, {
+    cache: 'no-store',
+    headers: { Accept: 'application/json' },
+  });
+  const data = await res.json().catch(() => ({}));
+  const tx = data.tx || null;
+  if (!tx) return null;
+  return {
+    txHash: tx.txHash || h,
+    confirmations: Number(tx.confirmations ?? 0),
+    blockHeight: tx.blockHeight ?? null,
+  };
+}
+
 /** fetch with hard timeout so GraphQL never blocks deposit forever. */
 async function fetchWithTimeout(url, init = {}, timeoutMs = 12000) {
   const ctrl = new AbortController();
@@ -1258,6 +1321,61 @@ export default function FungiblePool({
       await sleep(3000);
     }
     return last || wartBridgeApi.getWartTxProof(txHash);
+  };
+
+  const pollPayoutConfirm = async (txHash, { timeoutMs = 180000 } = {}) => {
+    const deadline = Date.now() + timeoutMs;
+    let last = null;
+    while (Date.now() < deadline) {
+      try {
+        if (wartBridgeApi?.getWartTxProof) {
+          const proof = slimDepositProof(await wartBridgeApi.getWartTxProof(txHash));
+          last = {
+            txHash,
+            confirmations: Number(
+              proof?.confirmations ?? proof?.transaction?.confirmations ?? 0,
+            ),
+            blockHeight: proof?.transaction?.blockHeight ?? null,
+          };
+        } else {
+          last = await lookupPayoutTx(txHash);
+        }
+        if (Number(last?.confirmations || 0) >= 1) return last;
+      } catch {
+        try {
+          last = await lookupPayoutTx(txHash);
+          if (Number(last?.confirmations || 0) >= 1) return last;
+        } catch {
+          /* retry */
+        }
+      }
+      await sleep(3000);
+    }
+    if (Number(last?.confirmations || 0) < 1) {
+      last = (await lookupPayoutTx(txHash).catch(() => null)) || last;
+    }
+    return last;
+  };
+
+  const finishPayoutToast = async (txHash, label) => {
+    const amt = label ? `${label} ` : '';
+    const hash = WART_TX_HASH_RE.test(String(txHash || '').replace(/^0x/i, ''))
+      ? String(txHash).replace(/^0x/i, '').toLowerCase()
+      : null;
+    if (!hash) {
+      toastWartConfirmed(`Released ${amt}WART`);
+      return;
+    }
+    toastWartSent(`Sent ${amt}WART · ${shortTx(hash)} — waiting for block…`);
+    const proof = await pollPayoutConfirm(hash);
+    const conf = Number(proof?.confirmations || 0);
+    if (conf >= 1) {
+      toastWartConfirmed(`Confirmed ${amt}WART · ${shortTx(hash)} · ${conf} conf`);
+    } else {
+      toastWartSent(
+        `Sent ${amt}WART · ${shortTx(hash)} — still unconfirmed. Do not retry.`,
+      );
+    }
   };
 
   /** Enqueue server credit + local pending (relayer posts InputBox). */
@@ -2635,14 +2753,17 @@ export default function FungiblePool({
 
     // Immediate single-key (toggle OFF) or already paid
     if (pay.txHash || pay.alreadyPaid || pay.skipped || pay.mode === 'hot-wallet') {
-      toast.success(
-        pay.alreadyPaid
-          ? `Already paid ${pay.amountHuman || amtLabel || ''} WART`
-          : pay.skipped
-            ? `Payout skipped: ${pay.skipReason || 'policy'}`
-            : `Paid ${pay.amountHuman || amtLabel || ''} WART · hot wallet · tx ${String(pay.txHash || '').slice(0, 12)}…`,
-        { id: 'pool', duration: 10000 },
-      );
+      if (pay.skipped) {
+        toast.success(`Payout skipped: ${pay.skipReason || 'policy'}`, {
+          id: 'pool',
+          duration: 10000,
+        });
+      } else {
+        await finishPayoutToast(
+          pay.txHash || pay.payout?.txHash,
+          pay.amountHuman || amtLabel,
+        );
+      }
       await refresh();
       return pay;
     }
@@ -2666,26 +2787,23 @@ export default function FungiblePool({
           continue;
         }
         const status = String(st.status || '');
-        const rawTx = st.txHash || st.payout?.txHash;
-        const sighash = st.hashHex || st.prep?.hashHex;
-        const realTx =
-          rawTx && String(rawTx).toLowerCase() !== String(sighash || '').toLowerCase()
-            ? rawTx
-            : null;
-        if (realTx || status === 'paid' || st.payout?.ok) {
-          toast.success(
-            `Released ${amtLabel || humanFromE8(ticket.amountE8) || ''} WART via 3P Lindell` +
-              (realTx ? ` · ${realTx}` : ''),
-            { id: 'pool', duration: 14000 },
+        const realTx = extractBroadcastTx(st);
+        if (realTx || status === 'paid' || st.payout?.ok || st.alreadyPaid) {
+          const hash = realTx || st.txHash || st.payout?.txHash || null;
+          await finishPayoutToast(
+            hash,
+            amtLabel || humanFromE8(ticket.amountE8),
           );
           await refresh();
-          return { ok: true, ticketId, mode: 'pool-3p', txHash: realTx, ...st };
+          return { ok: true, ticketId, mode: 'pool-3p', txHash: hash, ...st };
         }
         const wait = (st.waitingOn || []).join('+') || (status || 'signing');
-        toast.loading(
-          `3P Lindell · ${wait} · d1 ${st.haveR1 ? 'in' : '…'} · d2 ${st.haveD2 ? 'in' : '…'}`,
-          { id: 'pool' },
-        );
+        const line = `3P Lindell · ${wait} · d1 ${st.haveR1 ? 'in' : '…'} · d2 ${st.haveD2 ? 'in' : '…'}`;
+        if ((st.waitingOn || []).includes('notice-proof')) {
+          toastWartSent(`${line} — waiting for Cartesi notice proof`);
+        } else {
+          toast.loading(line, { id: 'pool' });
+        }
       }
       throw new Error(
         `3P payout timeout for ${ticketId} — keep both browser d1 and d2 tabs signed in`,
@@ -2731,11 +2849,7 @@ export default function FungiblePool({
       }
       if (st.status === 'paid' || st.paid?.txHash) {
         const tx = st.paid?.txHash || st.payout?.txHash;
-        toast.success(
-          `Released ${amtLabel || humanFromE8(ticket.amountE8) || ''} WART via 3-of-4` +
-            (tx ? ` · tx ${String(tx).slice(0, 12)}…` : ''),
-          { id: 'pool', duration: 12000 },
-        );
+        await finishPayoutToast(tx, amtLabel || humanFromE8(ticket.amountE8));
         await refresh();
         return { ok: true, ...st.paid, ticketId, mode: 'threshold-3of4', txHash: tx };
       }
