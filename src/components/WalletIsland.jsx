@@ -13,7 +13,7 @@ import EthSubWallets from './EthSubWallets.jsx';
 import VoucherExecutor from './VoucherExecutor.jsx';
 import AnvilTestKeys from './AnvilTestKeys.jsx';
 import FungiblePool from './FungiblePool.jsx';
-import EthFungiblePool from './EthFungiblePool.jsx';
+
 import { useMmTxConfirm } from './MmTxConfirm.jsx';
 import '../styles/global.css'; // Assuming global styles (including new Warthog CSS) in Astro
 import '../styles/warthog.css';
@@ -2484,13 +2484,6 @@ export default function WalletIsland() {
         onRefreshL1Vault={() => refreshVault(address)}
         mmWwartBal={mmWwartBal}
         onRefreshMmWwart={() => refreshMmWwart(address)}
-      />
-
-      <EthFungiblePool
-        ownerAddress={address}
-        signer={signer}
-        wartBridgeApi={wartBridgeApi}
-        wartAddress={wartSession?.address || null}
       />
 
       {/* ── 1) Warthog first (Path B personal vaults / subs live here) ── */}

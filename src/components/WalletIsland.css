@@ -1352,6 +1352,11 @@ button.eth-section-btn:hover {
   color: #FDB913;
   border-color: rgba(253, 185, 19, 0.4);
 }
+.fungible-pool .fp-swap-asset.is-eth {
+  background: rgba(88, 166, 255, 0.16);
+  color: #58a6ff;
+  border-color: rgba(88, 166, 255, 0.4);
+}
 .fungible-pool .fp-swap-flip {
   display: flex;
   justify-content: center;

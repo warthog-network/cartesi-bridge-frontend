@@ -60,6 +60,10 @@ import {
   flowProgress,
 } from '../utils/poolFlowTracker.js';
 import { buildPoolBindMessage } from '../utils/poolBindMessage.js';
+import {
+  createWarthogEthAsset,
+  normalizeEthSupplyAmount,
+} from '../utils/mintEthWarthogAsset.js';
 
 function humanFrom18(raw) {
   try {
@@ -1013,6 +1017,9 @@ export default function FungiblePool({
 }) {
   const [open, setOpen] = useState(true);
   const [swapDir, setSwapDir] = useState('to_wwart'); // to_wwart | to_wart
+  const [swapAsset, setSwapAsset] = useState('WART'); // WART | ETH
+  const [eth3pSt, setEth3pSt] = useState(null);
+  const [mmEthBal, setMmEthBal] = useState(null);
   const [swapFlipTick, setSwapFlipTick] = useState(0);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
@@ -1237,6 +1244,23 @@ export default function FungiblePool({
     } catch {
       /* optional */
     }
+    try {
+      const e3 = await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'eth3p_status' }),
+      });
+      if (e3?.ok) setEth3pSt(e3);
+    } catch {
+      /* optional */
+    }
+    try {
+      if (signer?.provider && owner) {
+        const wei = await signer.provider.getBalance(owner);
+        setMmEthBal(ethers.formatEther(wei));
+      }
+    } catch {
+      /* optional */
+    }
     // Prefer rollup inspect
     try {
       const base = getInspectUrl().replace(/\/$/, '');
@@ -1333,7 +1357,7 @@ export default function FungiblePool({
     } catch (e) {
       console.warn('[FungiblePool] api', e?.message || e);
     }
-  }, [owner]);
+  }, [owner, signer]);
 
   useEffect(() => {
     refresh();
@@ -2799,6 +2823,100 @@ export default function FungiblePool({
     onRefreshMmWwart?.();
   };
 
+  const liveAtomicToWeth = async () => {
+    if (!owner) throw new Error('Connect L1 wallet');
+    if (!signer) throw new Error('Connect MetaMask to send Anvil ETH');
+    const q = eth3pSt?.address;
+    if (!q) throw new Error('ETH 3P Q not sealed — turn e1 and e2 Signing ON');
+    if (!wartFrom) throw new Error('Unlock Warthog wallet to mint the receipt');
+    const amt = String(amount || '').trim();
+    if (!amt) throw new Error('Enter amount');
+    const wei = ethers.parseEther(amt);
+    if (wei <= 0n) throw new Error('Amount must be > 0');
+
+    setActionStatus({ kind: 'info', text: `ETH → wETH ${amt}…` });
+    toast.loading(`Sending ${amt} ETH to ETH 3P…`, { id: 'pool', duration: Infinity });
+    const tx = await signer.sendTransaction({ to: q, value: wei });
+    await tx.wait();
+    await poolApi('/api/pool', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'eth3p_credit',
+        ethTxHash: tx.hash,
+        amountWei: wei.toString(),
+        wartAddress: wartFrom,
+        fromEth: owner,
+      }),
+    });
+    await poolApi('/api/pool', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'eth3p_bind',
+        wartAddress: wartFrom,
+        ethAddress: owner,
+      }),
+    }).catch(() => null);
+
+    toast.loading('Minting Warthog WETH receipt…', { id: 'pool', duration: Infinity });
+    const supply = normalizeEthSupplyAmount(amt);
+    const minted = await createWarthogEthAsset({
+      amount: supply,
+      wartAddress: wartFrom,
+      ownerL1: owner,
+    });
+    const hash = minted?.assetHash || minted?.hash;
+    if (!hash) throw new Error('createAssets returned no assetHash');
+    const [w, f = ''] = String(supply).split('.');
+    const e8 = BigInt(w || '0') * 10n ** 8n + BigInt((f + '00000000').slice(0, 8));
+    await poolApi('/api/pool', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'eth3p_register_wrap',
+        assetHash: hash,
+        supplyE8: e8.toString(),
+        issuerWart: wartFrom,
+        assetTxHash: minted?.txHash,
+        assetName: 'WETH',
+      }),
+    });
+    setActionStatus({
+      kind: 'ok',
+      text: `ETH → wETH ${amt}. Receipt ${String(hash).slice(0, 12)}… on Warthog.`,
+    });
+    toast.success(`ETH → wETH ${amt}`, { id: 'pool', duration: 10000 });
+  };
+
+  const liveAtomicToEth = async () => {
+    if (!wartFrom) throw new Error('Unlock Warthog (burner of the receipt)');
+    const amt = String(amount || '').trim();
+    if (!amt) throw new Error('Enter amount');
+    const wraps = eth3pSt?.wraps || [];
+    const mine = [...wraps].reverse().find((w) => BigInt(w.outstandingE8 || '0') > 0n);
+    if (!mine?.assetHash) {
+      throw new Error('No outstanding wETH receipt to unwrap — swap ETH → wETH first');
+    }
+    const supply = normalizeEthSupplyAmount(amt);
+    const [w, f = ''] = String(supply).split('.');
+    const e8 = BigInt(w || '0') * 10n ** 8n + BigInt((f + '00000000').slice(0, 8));
+    const rec = await poolApi('/api/pool', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'eth3p_burn',
+        assetHash: mine.assetHash,
+        amountE8: e8.toString(),
+        burnerWart: wartFrom,
+      }),
+    });
+    setActionStatus({
+      kind: rec?.burn?.status === 'ready' ? 'ok' : 'info',
+      text:
+        rec?.burn?.status === 'need-bind'
+          ? 'Unwrap recorded — bind this Warthog addr to MetaMask to receive ETH.'
+          : `Unwrap recorded for ${amt} ETH. 3P ETH payout from the bin is next.`,
+    });
+    toast.success(`wETH burn recorded (${amt} ETH)`, { id: 'pool', duration: 10000 });
+  };
+
   /**
    * Release-ticket payout: under Path A3 opens 3-of-4 threshold request, then
    * waits for faux/browser signers to assemble a real Warthog transfer.
@@ -3258,12 +3376,14 @@ export default function FungiblePool({
           action === 'atomic_to_wwart' ||
           action === 'atomic_to_wart'
         ) {
-          throw new Error('Swap is live-only (WART ↔ wWART)');
+          throw new Error('Swap is live-only');
         }
         await labAction(action);
       } else if (action === 'one_click_wwart') await liveOneClickToWwart();
       else if (action === 'atomic_to_wwart') await liveAtomicToWwart();
       else if (action === 'atomic_to_wart') await liveAtomicToWart();
+      else if (action === 'atomic_to_weth') await liveAtomicToWeth();
+      else if (action === 'atomic_to_eth') await liveAtomicToEth();
       else if (action === 'bind') {
         if (!wartFrom) throw new Error('Unlock Warthog first');
         if (!owner) throw new Error('Connect MetaMask first');
@@ -3335,9 +3455,38 @@ export default function FungiblePool({
     setTimeout(() => setCopiedKey((k) => (k === key ? '' : k)), 1600);
   };
   const maxPay =
-    swapDir === 'to_wart' && mmWwartBal != null && Number(mmWwartBal) > 0
-      ? String(mmWwartBal).trim()
-      : '';
+    swapAsset === 'ETH'
+      ? swapDir === 'to_wwart' && mmEthBal != null && Number(mmEthBal) > 0
+        ? String(mmEthBal).trim()
+        : ''
+      : swapDir === 'to_wart' && mmWwartBal != null && Number(mmWwartBal) > 0
+        ? String(mmWwartBal).trim()
+        : '';
+  const payAsset =
+    swapAsset === 'ETH'
+      ? swapDir === 'to_wwart'
+        ? 'ETH'
+        : 'wETH'
+      : swapDir === 'to_wwart'
+        ? 'WART'
+        : 'wWART';
+  const recvAsset =
+    swapAsset === 'ETH'
+      ? swapDir === 'to_wwart'
+        ? 'wETH'
+        : 'ETH'
+      : swapDir === 'to_wwart'
+        ? 'wWART'
+        : 'WART';
+  const swapTitle =
+    swapAsset === 'ETH'
+      ? swapDir === 'to_wwart'
+        ? 'ETH → wETH'
+        : 'wETH → ETH'
+      : swapDir === 'to_wwart'
+        ? 'WART → wWART'
+        : 'wWART → WART';
+  const ethQ = eth3pSt?.address || '';
   const ageLabel = (() => {
     if (!refreshedAt) return null;
     const sec = Math.max(0, Math.round((Date.now() - refreshedAt) / 1000));
@@ -3382,20 +3531,41 @@ export default function FungiblePool({
               fontWeight: 700,
             }}
           >
-            Path A · real WART
+            Path A · {swapAsset === 'ETH' ? 'ETH 3P' : 'real WART'}
           </span>
           <span
-            title="Release needs d_dapp + browser d1 + browser d2 (3P ECDSA). Hot key retired."
+            title={
+              swapAsset === 'ETH'
+                ? 'ETH lock needs d_dapp + e1 + e2. Receipt is Warthog WETH you mint.'
+                : 'Release needs d_dapp + browser d1 + browser d2 (3P ECDSA). Hot key retired.'
+            }
             style={{
               fontSize: '0.68rem',
               padding: '0.12rem 0.4rem',
               borderRadius: 6,
-              background: 'rgba(253,185,19,0.22)',
-              color: '#FDB913',
+              background:
+                swapAsset === 'ETH'
+                  ? 'rgba(88,166,255,0.22)'
+                  : 'rgba(253,185,19,0.22)',
+              color: swapAsset === 'ETH' ? '#58a6ff' : '#FDB913',
               fontWeight: 700,
             }}
           >
-            3P pool · d_dapp + d1 + d2
+            {swapAsset === 'ETH' ? '3P pool · e1 + e2' : '3P pool · d_dapp + d1 + d2'}
+          </span>
+          <span style={{ display: 'inline-flex', gap: 4, marginLeft: 4 }}>
+            {['WART', 'ETH'].map((a) => (
+              <button
+                key={a}
+                type="button"
+                className={`fp-amt${swapAsset === a ? ' is-on' : ''}`}
+                disabled={busy}
+                onClick={() => setSwapAsset(a)}
+                title={a === 'ETH' ? 'Swap Anvil ETH ↔ Warthog wETH receipt' : 'Swap WART ↔ wWART'}
+              >
+                {a}
+              </button>
+            ))}
           </span>
         </div>
         <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }}>
@@ -3435,20 +3605,28 @@ export default function FungiblePool({
       </header>
 
       <p className="fp-status-line">
-        1:1 reserved mint. Until you hold wWART, only you can mint or withdraw your deposit.
-        After that, anyone holding the token can redeem WART.
+        {swapAsset === 'ETH'
+          ? '1:1 ETH lock in the e1/e2 3P. You mint the Warthog wETH receipt; anyone holding it can redeem ETH.'
+          : '1:1 reserved mint. Until you hold wWART, only you can mint or withdraw your deposit. After that, anyone holding the token can redeem WART.'}
         {ageLabel ? <span className="fp-status-age"> · pool {ageLabel}</span> : null}
       </p>
       <div className="fp-chip-row" aria-label="Pool status">
         <button
           type="button"
           className="fp-chip fp-chip-q"
-          title={poolAddr || 'pool address'}
-          disabled={!poolAddr}
-          onClick={() => flashCopy('q', poolAddr)}
+          title={(swapAsset === 'ETH' ? ethQ : poolAddr) || 'pool address'}
+          disabled={!(swapAsset === 'ETH' ? ethQ : poolAddr)}
+          onClick={() => flashCopy('q', swapAsset === 'ETH' ? ethQ : poolAddr)}
         >
           {copiedKey === 'q' ? <Check size={12} /> : <Copy size={12} />}
-          Q {poolAddr ? shortHex(poolAddr, 6, 4) : '…'}
+          Q{' '}
+          {swapAsset === 'ETH'
+            ? ethQ
+              ? shortHex(ethQ, 6, 4)
+              : 'unsealed'
+            : poolAddr
+              ? shortHex(poolAddr, 6, 4)
+              : '…'}
         </button>
         <span
           className={`fp-chip${wartBind?.status === 'match' ? ' is-ok' : bindBlocked ? ' is-bad' : ' is-wait'}`}
@@ -3492,23 +3670,65 @@ export default function FungiblePool({
           >
             <div className="wi-stat wi-stat--liquid">
               <Layers size={16} className="wi-stat-icon" />
-              <span className="wi-stat-k">Available</span>
-              <span className="wi-stat-v">{snap?.availableHuman ?? '…'}</span>
-              <span className="wi-stat-hint">your unused deposit</span>
+              <span className="wi-stat-k">
+                {swapAsset === 'ETH' ? 'e1' : 'Available'}
+              </span>
+              <span className="wi-stat-v">
+                {swapAsset === 'ETH'
+                  ? eth3pSt?.e1Live
+                    ? 'live'
+                    : eth3pSt?.holder1
+                      ? 'assigned'
+                      : 'vacant'
+                  : (snap?.availableHuman ?? '…')}
+              </span>
+              <span className="wi-stat-hint">
+                {swapAsset === 'ETH' ? 'ETH 3P dealer' : 'your unused deposit'}
+              </span>
             </div>
             <div className="wi-stat">
-              <span className="wi-stat-k">Locked</span>
-              <span className="wi-stat-v">{snap?.lockedHuman ?? '…'}</span>
-              <span className="wi-stat-hint">your WART credited</span>
+              <span className="wi-stat-k">
+                {swapAsset === 'ETH' ? 'e2' : 'Locked'}
+              </span>
+              <span className="wi-stat-v">
+                {swapAsset === 'ETH'
+                  ? eth3pSt?.e2Live
+                    ? 'live'
+                    : eth3pSt?.holder2
+                      ? 'assigned'
+                      : 'vacant'
+                  : (snap?.lockedHuman ?? '…')}
+              </span>
+              <span className="wi-stat-hint">
+                {swapAsset === 'ETH' ? 'ETH 3P dealer' : 'your WART credited'}
+              </span>
             </div>
             <div className="wi-stat">
-              <span className="wi-stat-k">Used</span>
-              <span className="wi-stat-v">{snap?.claimedHuman ?? '…'}</span>
-              <span className="wi-stat-hint">your minted claim</span>
+              <span className="wi-stat-k">
+                {swapAsset === 'ETH' ? 'Wraps' : 'Used'}
+              </span>
+              <span className="wi-stat-v">
+                {swapAsset === 'ETH'
+                  ? String((eth3pSt?.wraps || []).length)
+                  : (snap?.claimedHuman ?? '…')}
+              </span>
+              <span className="wi-stat-hint">
+                {swapAsset === 'ETH' ? 'receipts on Warthog' : 'your minted claim'}
+              </span>
             </div>
             <div className="wi-stat wi-stat--spoof">
-              <span className="wi-stat-k">MetaMask wWART</span>
-              <span className="wi-stat-v">{mmWwartLabel}</span>
+              <span className="wi-stat-k">
+                {swapAsset === 'ETH' ? 'MetaMask ETH' : 'MetaMask wWART'}
+              </span>
+              <span className="wi-stat-v">
+                {swapAsset === 'ETH'
+                  ? mmEthBal != null
+                    ? Number(mmEthBal).toLocaleString(undefined, {
+                        maximumFractionDigits: 4,
+                      })
+                    : '—'
+                  : mmWwartLabel}
+              </span>
               <span className="wi-stat-hint">your L1 token</span>
             </div>
           </div>
@@ -3516,20 +3736,24 @@ export default function FungiblePool({
           {mode === 'live' && (
             <div className={`fp-swap${swapFlipTick ? ' is-flipping' : ''}`}>
               <div className="fp-swap-head">
-                <span className="fp-swap-title">
-                  {swapDir === 'to_wwart' ? 'WART → wWART' : 'wWART → WART'}
-                </span>
+                <span className="fp-swap-title">{swapTitle}</span>
                 <span className="fp-swap-peg">1 = 1</span>
               </div>
               <div className="fp-swap-leg">
                 <div className="fp-swap-leg-top">
                   <span>You pay</span>
                   <span className="fp-swap-leg-meta">
-                    {swapDir === 'to_wwart'
-                      ? 'from Warthog'
-                      : mmWwartLabel
-                        ? `wallet ${mmWwartLabel}`
-                        : 'from MetaMask'}
+                    {swapAsset === 'ETH'
+                      ? swapDir === 'to_wwart'
+                        ? mmEthBal
+                          ? `wallet ${Number(mmEthBal).toLocaleString(undefined, { maximumFractionDigits: 4 })} ETH`
+                          : 'from MetaMask'
+                        : 'from Warthog receipt'
+                      : swapDir === 'to_wwart'
+                        ? 'from Warthog'
+                        : mmWwartLabel
+                          ? `wallet ${mmWwartLabel}`
+                          : 'from MetaMask'}
                     {maxPay ? (
                       <button
                         type="button"
@@ -3552,7 +3776,15 @@ export default function FungiblePool({
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && !busy && owner) {
                         e.preventDefault();
-                        run(swapDir === 'to_wwart' ? 'atomic_to_wwart' : 'atomic_to_wart');
+                        run(
+                          swapAsset === 'ETH'
+                            ? swapDir === 'to_wwart'
+                              ? 'atomic_to_weth'
+                              : 'atomic_to_eth'
+                            : swapDir === 'to_wwart'
+                              ? 'atomic_to_wwart'
+                              : 'atomic_to_wart',
+                        );
                       }
                     }}
                     placeholder="0.0"
@@ -3560,9 +3792,9 @@ export default function FungiblePool({
                     aria-label="Amount you pay"
                   />
                   <span
-                    className={`fp-swap-asset${swapDir === 'to_wwart' ? ' is-wart' : ''}`}
+                    className={`fp-swap-asset${payAsset === 'WART' || payAsset === 'ETH' ? (payAsset === 'ETH' ? ' is-eth' : ' is-wart') : ''}`}
                   >
-                    {swapDir === 'to_wwart' ? 'WART' : 'wWART'}
+                    {payAsset}
                   </span>
                 </div>
               </div>
@@ -3589,7 +3821,13 @@ export default function FungiblePool({
                 <div className="fp-swap-leg-top">
                   <span>You receive</span>
                   <span>
-                    {swapDir === 'to_wwart' ? 'to MetaMask' : 'to Warthog'}
+                    {swapAsset === 'ETH'
+                      ? swapDir === 'to_wwart'
+                        ? 'to Warthog'
+                        : 'to MetaMask'
+                      : swapDir === 'to_wwart'
+                        ? 'to MetaMask'
+                        : 'to Warthog'}
                   </span>
                 </div>
                 <div className="fp-swap-row">
@@ -3604,9 +3842,9 @@ export default function FungiblePool({
                     aria-label="Amount you receive"
                   />
                   <span
-                    className={`fp-swap-asset${swapDir === 'to_wart' ? ' is-wart' : ''}`}
+                    className={`fp-swap-asset${recvAsset === 'WART' || recvAsset === 'ETH' ? (recvAsset === 'ETH' ? ' is-eth' : ' is-wart') : ''}`}
                   >
-                    {swapDir === 'to_wwart' ? 'wWART' : 'WART'}
+                    {recvAsset}
                   </span>
                 </div>
               </div>
@@ -3615,12 +3853,21 @@ export default function FungiblePool({
                   <input
                     type="text"
                     className="fp-swap-to"
-                    value={toAddress}
-                    onChange={(e) => setToAddress(e.target.value)}
+                    value={
+                      swapAsset === 'ETH'
+                        ? eth3pSt?.burnBin || ''
+                        : toAddress
+                    }
+                    onChange={(e) => {
+                      if (swapAsset !== 'ETH') setToAddress(e.target.value);
+                    }}
+                    readOnly={swapAsset === 'ETH'}
                     placeholder={
-                      wartBridgeApi?.address
-                        ? `WART pays to ${shortHex(wartBridgeApi.address, 10, 6)} (or paste another)`
-                        : 'Warthog address to receive WART'
+                      swapAsset === 'ETH'
+                        ? 'Burn bin (Warthog, no key) — send the receipt here to redeem ETH'
+                        : wartBridgeApi?.address
+                          ? `WART pays to ${shortHex(wartBridgeApi.address, 10, 6)} (or paste another)`
+                          : 'Warthog address to receive WART'
                     }
                     disabled={busy || !owner}
                     aria-label="Warthog address for WART payout"
@@ -3682,12 +3929,22 @@ export default function FungiblePool({
                   busy ||
                   !owner ||
                   !signer ||
-                  (swapDir === 'to_wwart'
-                    ? !wartBridgeApi?.sendTransaction || bindBlocked
-                    : !(toAddress || wartBridgeApi?.address))
+                  (swapAsset === 'ETH'
+                    ? !wartFrom || (swapDir === 'to_wwart' && !ethQ)
+                    : swapDir === 'to_wwart'
+                      ? !wartBridgeApi?.sendTransaction || bindBlocked
+                      : !(toAddress || wartBridgeApi?.address))
                 }
                 onClick={() =>
-                  run(swapDir === 'to_wwart' ? 'atomic_to_wwart' : 'atomic_to_wart')
+                  run(
+                    swapAsset === 'ETH'
+                      ? swapDir === 'to_wwart'
+                        ? 'atomic_to_weth'
+                        : 'atomic_to_eth'
+                      : swapDir === 'to_wwart'
+                        ? 'atomic_to_wwart'
+                        : 'atomic_to_wart',
+                  )
                 }
                 title={
                   bindBlocked && swapDir === 'to_wwart'
