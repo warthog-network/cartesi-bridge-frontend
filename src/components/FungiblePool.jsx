@@ -63,6 +63,7 @@ import { buildPoolBindMessage } from '../utils/poolBindMessage.js';
 import {
   createWarthogEthAsset,
   normalizeEthSupplyAmount,
+  fetchWartAssetHoldings,
 } from '../utils/mintEthWarthogAsset.js';
 
 function humanFrom18(raw) {
@@ -1020,6 +1021,7 @@ export default function FungiblePool({
   const [swapAsset, setSwapAsset] = useState('WART'); // WART | ETH
   const [eth3pSt, setEth3pSt] = useState(null);
   const [mmEthBal, setMmEthBal] = useState(null);
+  const [ethWartL1E8, setEthWartL1E8] = useState(null);
   const [swapFlipTick, setSwapFlipTick] = useState(0);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
@@ -1244,8 +1246,9 @@ export default function FungiblePool({
     } catch {
       /* optional */
     }
+    let e3 = null;
     try {
-      const e3 = await poolApi('/api/pool', {
+      e3 = await poolApi('/api/pool', {
         method: 'POST',
         body: JSON.stringify({ action: 'eth3p_status' }),
       });
@@ -1257,6 +1260,29 @@ export default function FungiblePool({
       if (signer?.provider && owner) {
         const wei = await signer.provider.getBalance(owner);
         setMmEthBal(ethers.formatEther(wei));
+      }
+    } catch {
+      /* optional */
+    }
+    try {
+      const wart = String(wartBridgeApi?.address || '')
+        .replace(/^0x/i, '')
+        .toLowerCase();
+      if (wart) {
+        const extra = (e3?.wraps || []).map((w) => w.assetHash);
+        const hold = await fetchWartAssetHoldings(
+          wart,
+          extra,
+          wartBridgeApi?.selectedNode,
+        );
+        let sum = 0n;
+        for (const h of hold) {
+          const name = String(h.name || '').toUpperCase();
+          if (name === 'WETH' || extra.includes(h.hash)) sum += BigInt(h.e8 || 0);
+        }
+        setEthWartL1E8(sum.toString());
+      } else {
+        setEthWartL1E8(null);
       }
     } catch {
       /* optional */
@@ -1357,7 +1383,7 @@ export default function FungiblePool({
     } catch (e) {
       console.warn('[FungiblePool] api', e?.message || e);
     }
-  }, [owner, signer]);
+  }, [owner, signer, wartBridgeApi?.address, wartBridgeApi?.selectedNode]);
 
   useEffect(() => {
     refresh();
@@ -3521,6 +3547,13 @@ export default function FungiblePool({
     }
     let wartL1 = 0n;
     for (const w of wraps) wartL1 += BigInt(w.outstandingE8 || 0);
+    if (ethWartL1E8 != null && ethWartL1E8 !== '') {
+      try {
+        wartL1 = BigInt(ethWartL1E8);
+      } catch {
+        /* keep wrap sum */
+      }
+    }
     const used = locked > available ? locked - available : 0n;
     return {
       availableHuman: humanFromE8(available),

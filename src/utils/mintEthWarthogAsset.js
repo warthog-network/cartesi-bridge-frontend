@@ -417,9 +417,99 @@ export async function createWarthogEthAsset({
     source: 'local',
   };
   if (ownerL1) saveLocalLink(ownerL1, entry);
-  else addWethWatch(wartAddress, entry);
+  addWethWatch(wartAddress, entry);
 
   return entry;
+}
+
+function e8FromBalance(bal) {
+  const e8 = bal?.total?.E8 ?? bal?.available?.E8;
+  if (e8 != null && e8 !== '') {
+    try {
+      return BigInt(String(e8));
+    } catch {
+      /* */
+    }
+  }
+  const str = String(bal?.total?.str ?? bal?.available?.str ?? '0');
+  const [w, f = ''] = str.split('.');
+  try {
+    return BigInt(w || '0') * 10n ** 8n + BigInt((f + '00000000').slice(0, 8));
+  } catch {
+    return 0n;
+  }
+}
+
+function collectHistoryAssetHashes(histPayload) {
+  const out = [];
+  const rows =
+    histPayload?.history ||
+    histPayload?.transactions ||
+    histPayload?.txs ||
+    (Array.isArray(histPayload) ? histPayload : []);
+  for (const tx of rows) {
+    const type = String(tx?.type || tx?.txType || tx?.kind || '').toLowerCase();
+    const name = String(tx?.assetName || tx?.tokenName || tx?.asset || '').toUpperCase();
+    let h = tx?.assetHash || tx?.tokenHash || tx?.asset_id || tx?.token?.hash;
+    if (!h && (type.includes('asset') || name === 'WETH')) {
+      h = tx?.txHash || tx?.hash;
+    }
+    const n = normHash(h);
+    if (n) out.push(n);
+  }
+  return out;
+}
+
+/**
+ * Live Warthog L1 asset holdings for an address (WETH and any extra hashes).
+ * Combines local watch, wrap registry hashes, and account history.
+ */
+export async function fetchWartAssetHoldings(wartAddress, extraHashes = [], nodeUrl) {
+  const addr = String(wartAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (!/^[0-9a-f]{48}$/.test(addr)) return [];
+  const api = await createWarthogApi(nodeUrl || DEFAULT_NODE_URL);
+  const hashes = new Set();
+  for (const h of extraHashes || []) {
+    const n = normHash(h);
+    if (n) hashes.add(n);
+  }
+  for (const it of listWethWatch(addr)) {
+    if (it.assetHash) hashes.add(it.assetHash);
+  }
+  try {
+    const hist = await api.getAccountHistory(addr);
+    if (hist.success) {
+      for (const h of collectHistoryAssetHashes(hist.data)) hashes.add(h);
+    }
+  } catch {
+    /* optional */
+  }
+  const holdings = [];
+  for (const hash of hashes) {
+    try {
+      const res = await api.getAccountAssetBalance(addr, hash);
+      if (!res.success) continue;
+      const bal = res.data?.balance;
+      const e8 = e8FromBalance(bal);
+      if (e8 <= 0n) continue;
+      const token = res.data?.token || {};
+      holdings.push({
+        hash,
+        name: String(token.name || 'WETH')
+          .toUpperCase()
+          .slice(0, 8),
+        available: bal?.available?.str ?? bal?.total?.str ?? '0',
+        total: bal?.total?.str ?? '0',
+        locked: bal?.locked?.str ?? '0',
+        e8: e8.toString(),
+      });
+    } catch {
+      /* skip */
+    }
+  }
+  return holdings;
 }
 
 /** Payload fields to attach on mint_weth_claim for rollup link. */

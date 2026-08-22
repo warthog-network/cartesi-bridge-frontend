@@ -19,6 +19,7 @@ import {
   addWethWatch,
   mergeEthWartAssetLinks,
   listLocalEthWartAssets,
+  fetchWartAssetHoldings,
 } from '../utils/mintEthWarthogAsset.js';
 import { getInspectUrl } from '../utils/bridgeConfig.js';
 
@@ -35,9 +36,10 @@ function decodeInspectPayloadLocal(payload) {
   }
 }
 
-/** Bridge-minted WETH assets watched for this Warthog address (linked to rollup claims). */
+/** Warthog L1 assets (WETH receipts) — same idea as wartbunker Overview tokens. */
 function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Vault }) {
   const [items, setItems] = useState([]);
+  const [holdings, setHoldings] = useState([]);
   const [balances, setBalances] = useState({});
   const [refreshing, setRefreshing] = useState(false);
 
@@ -137,6 +139,13 @@ function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Va
 
       const list = loadItems();
       await loadBalances(list);
+      try {
+        const extra = list.map((x) => x.assetHash);
+        const live = await fetchWartAssetHoldings(wartAddress, extra, selectedNode);
+        setHoldings(live);
+      } catch {
+        setHoldings([]);
+      }
       if (typeof onRefreshL1Vault === 'function') {
         try {
           await onRefreshL1Vault();
@@ -192,7 +201,32 @@ function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Va
     };
   }, [wartAddress, items, selectedNode]);
 
-  if (!items.length) return null;
+  useEffect(() => {
+    if (!wartAddress || !selectedNode) return undefined;
+    let stop = false;
+    (async () => {
+      try {
+        const extra = listWethWatch(wartAddress).map((x) => x.assetHash);
+        const live = await fetchWartAssetHoldings(wartAddress, extra, selectedNode);
+        if (!stop) setHoldings(live);
+      } catch {
+        if (!stop) setHoldings([]);
+      }
+    })();
+    return () => {
+      stop = true;
+    };
+  }, [wartAddress, selectedNode, items]);
+
+  const rows =
+    holdings.length > 0
+      ? holdings
+      : items.map((it) => ({
+          hash: it.assetHash,
+          name: it.assetName || 'WETH',
+          available: balances[it.assetHash] ?? it.amount,
+          total: balances[it.assetHash] ?? it.amount,
+        }));
 
   return (
     <div style={{ marginTop: '0.85rem' }}>
@@ -207,7 +241,7 @@ function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Va
         }}
       >
         <p className="wh-hint" style={{ margin: 0 }}>
-          <strong>Bridge WETH</strong> (linked to ETH capacity claims)
+          <strong>Assets</strong> on this Warthog address (WETH receipts)
         </p>
         <button
           type="button"
@@ -219,10 +253,15 @@ function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Va
           {refreshing ? 'Refreshing…' : 'Refresh'}
         </button>
       </div>
+      {!rows.length ? (
+        <p className="wh-hint" style={{ margin: 0 }}>
+          No assets on this address yet. ETH → wETH mint will show here.
+        </p>
+      ) : (
       <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {items.slice(0, 6).map((it) => (
+        {rows.slice(0, 8).map((it) => (
           <li
-            key={it.assetHash}
+            key={it.hash || it.assetHash}
             style={{
               fontSize: '0.78rem',
               border: '1px solid rgba(148,163,184,0.2)',
@@ -231,22 +270,20 @@ function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Va
             }}
           >
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-              <strong>{it.assetName || 'WETH'}</strong>
-              <span>{it.amount}</span>
-              {balances[it.assetHash] != null ? (
-                <span style={{ opacity: 0.85 }}>bal {balances[it.assetHash]}</span>
-              ) : null}
-              <span style={{ opacity: 0.75, textTransform: 'uppercase', fontSize: '0.7rem' }}>
-                {it.status || 'active'}
+              <strong>{it.name || it.assetName || 'WETH'}</strong>
+              <span style={{ fontFamily: 'ui-monospace, monospace' }}>
+                {it.available ?? it.total ?? it.amount ?? '—'}
               </span>
+              <span style={{ opacity: 0.7, fontSize: '0.7rem' }}>on Warthog L1</span>
               <button
                 type="button"
                 className="btn secondary small"
                 style={{ marginLeft: 'auto' }}
                 onClick={async () => {
                   try {
-                    await navigator.clipboard?.writeText(it.assetHash);
-                    toast.success('WETH hash copied');
+                    const h = it.hash || it.assetHash;
+                    await navigator.clipboard?.writeText(h);
+                    toast.success('Asset hash copied');
                   } catch {
                     toast.error('Copy failed');
                   }
@@ -256,11 +293,12 @@ function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Va
               </button>
             </div>
             <code className="mono" style={{ wordBreak: 'break-all', opacity: 0.85 }}>
-              {it.assetHash.slice(0, 20)}…
+              {String(it.hash || it.assetHash || '').slice(0, 20)}…
             </code>
           </li>
         ))}
       </ul>
+      )}
     </div>
   );
 }
@@ -1875,6 +1913,10 @@ const WarthogWallet = ({
         signMessage: (message) => signMessageInWorker(message),
         address: wallet.address,
         selectedNode,
+        getAccountAssetBalance: async (assetHash) => {
+          const api = await createWarthogApi(selectedNode);
+          return api.getAccountAssetBalance(wallet.address, assetHash);
+        },
       });
     } else {
       onBridgeApi(null);
