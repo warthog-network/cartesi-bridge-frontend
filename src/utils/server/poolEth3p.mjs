@@ -63,11 +63,15 @@ const ETH_SESS_PATH =
 const WART_NODE = env('WARTHOG_NODE_URL', 'http://127.0.0.1:3001');
 const ETH_RPC = env('CARTESI_RPC_URL', 'http://127.0.0.1:8545');
 
-/** Nothing-up-my-sleeve Warthog burn bin (no mnemonic). 48-hex. */
-export const ETH_BURN_BIN = createHash('sha256')
-  .update('cartesi-eth-3p-burn-bin-v1')
-  .digest('hex')
-  .slice(0, 48);
+/** Nothing-up-my-sleeve Warthog burn bin: SHA-256(seed)[0:20] + SHA-256 checksum (valid 48-hex). */
+export const ETH_BURN_BIN = (() => {
+  const payload = createHash('sha256')
+    .update('cartesi-eth-3p-burn-bin-v1')
+    .digest()
+    .subarray(0, 20);
+  const checksum = createHash('sha256').update(payload).digest().subarray(0, 4);
+  return Buffer.concat([Buffer.from(payload), Buffer.from(checksum)]).toString('hex');
+})();
 
 const ORBIT_LIVE_MS = Number(env('POOL_ETH3P_ORBIT_LIVE_MS', '20000')) || 20000;
 const SEAT_IDLE_MS = Number(env('POOL_ETH3P_SEAT_IDLE_MS', '35000')) || 35000;
