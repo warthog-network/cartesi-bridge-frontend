@@ -67,6 +67,20 @@ import {
   expireStaleUserRooms,
   reopenAbandonedAuthorizedTickets,
 } from '../../utils/server/pool3p.mjs';
+import {
+  eth3pOn,
+  publicEth3pStatus,
+  enrollEth3pSigner,
+  heartbeatEth3p,
+  birthEthSeat,
+  openEthSeatPdl,
+  finishEthSeatPdl,
+  creditEthLock,
+  registerEthWrap,
+  recordEthBurn,
+  bindEthOwner,
+  ETH_BURN_BIN,
+} from '../../utils/server/poolEth3p.mjs';
 import { preparePool3pTransfer, submitPool3pTransfer } from '../../utils/server/pool3pPay.mjs';
 import { allowLabMutation } from '../../utils/server/poolOpsAuth.mjs';
 import { assertPayoutMatchesTicket } from '../../utils/server/poolTicketVerify.mjs';
@@ -466,6 +480,95 @@ export async function POST({ request }) {
         /* */
       }
       return json(200, { ...pool3pPublicStatus(), orbit: orbitSnapshot(), rotation });
+    }
+
+    if (action === 'eth3p_status') {
+      if (!eth3pOn()) return json(200, { ok: false, configured: false, error: 'ETH 3P off' });
+      return json(200, await publicEth3pStatus());
+    }
+    if (action === 'eth3p_enroll') {
+      return json(200, await enrollEth3pSigner({ signerId: body.signerId }));
+    }
+    if (action === 'eth3p_heartbeat') {
+      return json(
+        200,
+        await heartbeatEth3p({ signerId: body.signerId, seatEpoch: body.seatEpoch }),
+      );
+    }
+    if (action === 'eth3p_birth') {
+      return json(
+        200,
+        await birthEthSeat({
+          signerId: body.signerId,
+          role: body.role,
+          P: body.P,
+          encD1: body.encD1,
+          paillierN: body.paillierN,
+          paillierG: body.paillierG,
+          pok: body.pok,
+          rangeProof: body.rangeProof,
+        }),
+      );
+    }
+    if (action === 'eth3p_pdl_commit') {
+      return json(200, openEthSeatPdl({ signerId: body.signerId, comQ: body.comQ }));
+    }
+    if (action === 'eth3p_pdl_finish') {
+      return json(
+        200,
+        await finishEthSeatPdl({
+          signerId: body.signerId,
+          Qhat: body.Qhat,
+          nonceQ: body.nonceQ,
+          comQ: body.comQ,
+        }),
+      );
+    }
+    if (action === 'eth3p_credit') {
+      return json(
+        200,
+        await creditEthLock({
+          ethTxHash: body.ethTxHash || body.txHash,
+          amountWei: body.amountWei,
+          wartAddress: body.wartAddress,
+          fromEth: body.fromEth,
+        }),
+      );
+    }
+    if (action === 'eth3p_register_wrap') {
+      return json(
+        200,
+        await registerEthWrap({
+          assetHash: body.assetHash,
+          supplyE8: body.supplyE8,
+          issuerWart: body.issuerWart || body.wartAddress,
+          assetTxHash: body.assetTxHash,
+          assetName: body.assetName,
+        }),
+      );
+    }
+    if (action === 'eth3p_burn') {
+      return json(
+        200,
+        await recordEthBurn({
+          assetHash: body.assetHash,
+          amountE8: body.amountE8,
+          burnerWart: body.burnerWart || body.wartAddress,
+          wartTxHash: body.wartTxHash,
+        }),
+      );
+    }
+    if (action === 'eth3p_bind') {
+      return json(
+        200,
+        await bindEthOwner({
+          wartAddress: body.wartAddress,
+          ethAddress: body.ethAddress,
+        }),
+      );
+    }
+    if (action === 'eth3p_burn_bin') {
+      return json(200, { ok: true, burnBin: ETH_BURN_BIN });
     }
     if (action === 'pool3p_birth_next') {
       const { birthNextSeat } = await import('../../utils/server/pool3pRotate.mjs');
