@@ -8,9 +8,8 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { randomBytes as nodeRandom } from 'crypto';
-import { PublicKey } from 'paillier-bigint';
 import { secp256k1 } from '@noble/curves/secp256k1';
+import { cosignerSignStep } from '../../utils/twoPartyEcdsa.js';
 
 export const prerender = false;
 
@@ -190,30 +189,6 @@ function modN(a) {
   if (x < 0n) x += CURVE_N;
   return x;
 }
-function modPow(base, exp, mod) {
-  let b = ((base % mod) + mod) % mod;
-  let e = exp;
-  let r = 1n;
-  while (e > 0n) {
-    if (e & 1n) r = (r * b) % mod;
-    b = (b * b) % mod;
-    e >>= 1n;
-  }
-  return r;
-}
-function invScalar(a) {
-  return modPow(modN(a), CURVE_N - 2n, CURVE_N);
-}
-function randomScalar() {
-  for (let i = 0; i < 32; i++) {
-    const bytes = nodeRandom(48);
-    let x = 0n;
-    for (const b of bytes) x = (x << 8n) | BigInt(b);
-    x = modN(x);
-    if (x > 0n) return x;
-  }
-  throw new Error('scalar sample failed');
-}
 function hexToScalar(hex) {
   const x = modN(BigInt('0x' + String(hex).replace(/^0x/i, '')));
   if (x === 0n) throw new Error('zero scalar');
@@ -384,48 +359,21 @@ async function verifyOutstanding({ vaultAddress, subAddress, owner }) {
   return { ok: false, error: 'Could not verify outstanding on Cartesi', details: errors };
 }
 
-function lindellSignStep({ R1Hex, hashHex, dappShareHex, ckeyStr, paillierN, paillierG }) {
-  const k2 = (() => {
-    for (let i = 0; i < 32; i++) {
-      const bytes = nodeRandom(48);
-      let x = 0n;
-      for (const b of bytes) x = (x << 8n) | BigInt(b);
-      x = modN(x);
-      if (x > 0n) return x;
-    }
-    throw new Error('k2 sample failed');
-  })();
-
-  const R1 = secp256k1.ProjectivePoint.fromHex(String(R1Hex).replace(/^0x/i, ''));
-  const R = R1.multiply(k2);
-  const r = modN(R.toAffine().x);
-  if (r === 0n) throw new Error('bad r');
-
-  const z = modN(BigInt('0x' + String(hashHex).replace(/^0x/i, '')));
-  const x2 = hexToScalar(dappShareHex);
-  const k2inv = invScalar(k2);
-
-  const pub = new PublicKey(BigInt(paillierN), BigInt(paillierG));
-  const ckey = BigInt(ckeyStr);
-  const termM = modN(k2inv * z);
-  const termX2 = modN(k2inv * r * x2);
-  const exp = modN(k2inv * r);
-
-  const rhoBytes = nodeRandom(32);
-  let rho = 0n;
-  for (const b of rhoBytes) rho = (rho << 8n) | BigInt(b);
-  rho = (rho % (pub.n - 1n)) + 1n;
-
-  let c = pub.encrypt(termM);
-  c = pub.addition(c, pub.encrypt(termX2));
-  c = pub.addition(c, pub.multiply(ckey, exp));
-  c = pub.addition(c, pub.encrypt(rho * CURVE_N));
-
-  return {
-    rHex: r.toString(16).padStart(64, '0'),
-    ciphertext: c.toString(),
-    RHex: Buffer.from(R.toRawBytes(true)).toString('hex'),
-  };
+function lindellSignStep({ R1Hex, hashHex, dappShareHex, ckeyStr, paillierN, paillierG, sid }) {
+  const x2 = BigInt('0x' + String(dappShareHex).replace(/^0x/i, ''));
+  const Q2Hex = Buffer.from(
+    secp256k1.ProjectivePoint.BASE.multiply(x2).toRawBytes(true),
+  ).toString('hex');
+  return cosignerSignStep({
+    R1Hex,
+    hashHex,
+    dappShareHex,
+    ckeyStr,
+    paillierN,
+    paillierG,
+    Q2Hex,
+    sid: sid || hashHex,
+  });
 }
 
 export async function OPTIONS() {
@@ -721,6 +669,7 @@ export async function POST({ request }) {
         ckeyStr: rec.ckey,
         paillierN: rec.paillierN,
         paillierG: rec.paillierG,
+        sid: vaultAddress,
       });
     } catch (e) {
       // Roll back budget if we reserved amount then signing failed
@@ -746,6 +695,11 @@ export async function POST({ request }) {
       rHex: step.rHex,
       ciphertext: step.ciphertext,
       RHex: step.RHex,
+      R2Hex: step.R2Hex,
+      Q2Hex: step.Q2Hex,
+      ckeyAdj: step.ckeyAdj,
+      pokR: step.pokR,
+      pokC: step.pokC,
       policy: policy || { source: 'force' },
       message: '2P-ECDSA partial — client finishes s; full d never existed',
     });

@@ -1,6 +1,7 @@
 /**
  * Build / submit a Warthog transfer signed by 3P-ECDSA (no private key on server).
  */
+import { readFileSync } from 'node:fs';
 import { buildWartTransferHash } from '../twoPartyEcdsa.js';
 import { serializeTransaction } from '../warthogTx.js';
 
@@ -61,6 +62,22 @@ async function nextOutgoingNonce(from) {
     /* */
   }
   return n;
+}
+
+/** True if this nonce was already broadcast from `from` (prep must be rebuilt). */
+export function nonceAlreadyUsed(fromAddress, nonceId) {
+  const addr = String(fromAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  const n = Number(nonceId);
+  if (!addr || !Number.isFinite(n)) return false;
+  try {
+    const file = JSON.parse(readFileSync(NONCE_PATH, 'utf8'));
+    const last = Number(file[addr]);
+    return Number.isFinite(last) && n <= last;
+  } catch {
+    return false;
+  }
 }
 
 export async function recordOutgoingNonce(from, nonceId) {
@@ -134,9 +151,6 @@ export async function preparePool3pTransfer({
     toAddrHex: toNorm,
     wartE8: amt,
   });
-
-  // Reserve the nonce as soon as a room prepares so a second room cannot reuse it.
-  await recordOutgoingNonce(from, nonceId);
 
   return {
     ok: true,

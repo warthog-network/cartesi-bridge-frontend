@@ -43,6 +43,8 @@ import {
   rememberInspectTickets,
   birthClientSeat,
   rekeyClientD1Paillier,
+  openClientSeatPdl,
+  finishClientSeatPdl,
   rebuildLindell,
   pool3pReuseOrPrepare,
   pool3pSubmitGuarded,
@@ -63,6 +65,7 @@ import {
   maybeAbandonStaleSeats,
   closePool3pRoom,
   expireStaleUserRooms,
+  reopenAbandonedAuthorizedTickets,
 } from '../../utils/server/pool3p.mjs';
 import { preparePool3pTransfer, submitPool3pTransfer } from '../../utils/server/pool3pPay.mjs';
 import { allowLabMutation } from '../../utils/server/poolOpsAuth.mjs';
@@ -118,6 +121,10 @@ function decodeInspectHex(payload) {
   }
 }
 
+/** Coalesce / TTL-cache inspect/pool. Concurrent inspect+advance kills the validator. */
+const INSPECT_TTL_MS = Number(process.env.POOL_INSPECT_TTL_MS || 1500) || 1500;
+const inspectCache = new Map();
+
 async function fetchRollupPoolInspect(owner) {
   const base = String(
     process.env.CARTESI_INSPECT_URL || 'http://127.0.0.1:8080/inspect',
@@ -125,16 +132,30 @@ async function fetchRollupPoolInspect(owner) {
   const path = owner
     ? `${base}/pool/${String(owner).replace(/^0x/i, '').toLowerCase()}`
     : `${base}/pool`;
-  const res = await fetch(path, { cache: 'no-store' });
-  if (!res.ok) {
-    throw new Error(`inspect HTTP ${res.status}`);
+  const now = Date.now();
+  const hit = inspectCache.get(path);
+  if (hit?.value && now - hit.at < INSPECT_TTL_MS) return hit.value;
+  if (hit?.inflight) return hit.inflight;
+  const inflight = (async () => {
+    const res = await fetch(path, { cache: 'no-store' });
+    if (!res.ok) {
+      throw new Error(`inspect HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    const decoded = decodeInspectHex(data?.reports?.[0]?.payload);
+    if (!decoded || decoded.error) {
+      throw new Error(decoded?.error || 'inspect returned no pool report');
+    }
+    inspectCache.set(path, { at: Date.now(), value: decoded });
+    return decoded;
+  })();
+  inspectCache.set(path, { ...(hit || {}), inflight });
+  try {
+    return await inflight;
+  } finally {
+    const cur = inspectCache.get(path);
+    if (cur?.inflight === inflight) delete cur.inflight;
   }
-  const data = await res.json();
-  const decoded = decodeInspectHex(data?.reports?.[0]?.payload);
-  if (!decoded || decoded.error) {
-    throw new Error(decoded?.error || 'inspect returned no pool report');
-  }
-  return decoded;
 }
 
 export async function GET({ request }) {
@@ -428,6 +449,14 @@ export async function POST({ request }) {
     }
     if (action === 'pool3p_status') {
       await expireStaleUserRooms().catch(() => ({ closed: [] }));
+      try {
+        const inspected = await fetchRollupPoolInspect('');
+        const recent = inspected?.recentTickets || [];
+        rememberInspectTickets(recent);
+        await reopenAbandonedAuthorizedTickets(recent);
+      } catch {
+        /* inspect optional — room list still comes from sessions */
+      }
       await maybeAbandonStaleSeats().catch(() => []);
       let rotation = null;
       try {
@@ -447,6 +476,8 @@ export async function POST({ request }) {
         encD1: body.encD1,
         paillierN: body.paillierN,
         paillierG: body.paillierG,
+        pok: body.pok,
+        rangeProof: body.rangeProof,
       }));
     }
     if (action === 'pool3p_announce_next') {
@@ -528,16 +559,34 @@ export async function POST({ request }) {
       return json(200, await claimBornSeat({
         signerId: body.signerId,
         role: body.role,
-        shareHex: body.shareHex || body.d1Hex || body.d2Hex,
+        shareHex: body.pok ? undefined : (body.shareHex || body.d1Hex || body.d2Hex),
+        pok: body.pok,
       }));
     }
     if (action === 'pool3p_rekey_d1' || action === 'rekey_d1') {
       return json(200, await rekeyClientD1Paillier({
         signerId: body.signerId,
-        d1Hex: body.d1Hex,
         encD1: body.encD1,
         paillierN: body.paillierN,
         paillierG: body.paillierG,
+        pok: body.pok,
+        rangeProof: body.rangeProof,
+      }));
+    }
+    if (action === 'pool3p_pdl_commit') {
+      return json(200, openClientSeatPdl({
+        signerId: body.signerId,
+        comQ: body.comQ,
+        kind: body.kind || 'birth',
+      }));
+    }
+    if (action === 'pool3p_pdl_finish') {
+      return json(200, await finishClientSeatPdl({
+        signerId: body.signerId,
+        Qhat: body.Qhat,
+        nonceQ: body.nonceQ,
+        comQ: body.comQ,
+        kind: body.kind || 'birth',
       }));
     }
     if (action === 'pool3p_birth') {
@@ -548,6 +597,8 @@ export async function POST({ request }) {
         encD1: body.encD1,
         paillierN: body.paillierN,
         paillierG: body.paillierG,
+        pok: body.pok,
+        rangeProof: body.rangeProof,
       });
       return json(200, born);
     }
@@ -599,7 +650,9 @@ export async function POST({ request }) {
       const r = await pool3pOfferD2({
         ticketId: body.ticketId,
         signerId: body.signerId,
-        d2Hex: body.d2Hex,
+        encD2: body.encD2,
+        encDlogProof: body.encDlogProof,
+        rangeProof: body.rangeProof,
         amountE8: body.amountE8,
         toAddress: body.toAddress,
       });
@@ -625,8 +678,18 @@ export async function POST({ request }) {
         });
         return json(200, paid);
       } catch (e) {
-        if (e?.code === 'HASH_MISMATCH') return json(409, { error: e.message });
-        throw e;
+        const msg = e?.message || String(e);
+        try {
+          const { writeFileSync, appendFileSync } = await import('node:fs');
+          appendFileSync(
+            '/opt/cartesi-bridge/cartesi-bridge-frontend/.data/pool-submit-err.log',
+            `${new Date().toISOString()} ${body.ticketId} ${msg}\n`,
+          );
+        } catch {
+          /* */
+        }
+        if (e?.code === 'HASH_MISMATCH') return json(409, { error: msg });
+        return json(400, { ok: false, error: msg });
       }
     }
 

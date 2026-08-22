@@ -23,8 +23,16 @@ import {
   adoptHoldersFromDapp,
   invalidateOpenLindell,
   clearPreshare,
+  requireSeatPok,
+  stashSeatPdl,
   ORBIT_VPS_ID,
 } from './pool3p.mjs';
+import { assertPaillierModulus, seatPokContext } from '../twoPartyEcdsa.js';
+import {
+  verifyRangeLindell,
+  pdlVerifierChallenge,
+  pdlChallengePublic,
+} from '../lindellZk.js';
 
 function env(key, fallback = '') {
   const e = globalThis.process?.env || {};
@@ -111,19 +119,36 @@ function decodeInspectPayload(payload) {
   }
 }
 
+let inspectSnapCache = { at: 0, value: null, inflight: null };
+
 export async function inspectPoolSnap() {
+  const now = Date.now();
+  const ttl = Number(env('POOL_INSPECT_TTL_MS', '1500')) || 1500;
+  if (inspectSnapCache.value && now - inspectSnapCache.at < ttl) {
+    return inspectSnapCache.value;
+  }
+  if (inspectSnapCache.inflight) return inspectSnapCache.inflight;
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 4000);
+  inspectSnapCache.inflight = (async () => {
+    try {
+      const res = await fetch(`${INSPECT.replace(/\/$/, '')}/pool`, {
+        cache: 'no-store',
+        signal: ac.signal,
+      });
+      if (!res.ok) throw new Error(`inspect HTTP ${res.status}`);
+      const data = await res.json();
+      const decoded = decodeInspectPayload(data?.reports?.[0]?.payload);
+      inspectSnapCache = { at: Date.now(), value: decoded, inflight: null };
+      return decoded;
+    } finally {
+      clearTimeout(timer);
+    }
+  })();
   try {
-    const res = await fetch(`${INSPECT.replace(/\/$/, '')}/pool`, {
-      cache: 'no-store',
-      signal: ac.signal,
-    });
-    if (!res.ok) throw new Error(`inspect HTTP ${res.status}`);
-    const data = await res.json();
-    return decodeInspectPayload(data?.reports?.[0]?.payload);
+    return await inspectSnapCache.inflight;
   } finally {
-    clearTimeout(timer);
+    inspectSnapCache.inflight = null;
   }
 }
 
@@ -195,9 +220,7 @@ export function rotationView(r = loadRotate(), block = null, extra = {}) {
     block,
     elapsedEpochs: elapsed,
     dueInEpochs: dueIn,
-    due:
-      dueIn === 0 ||
-      ['need_birth', 'next_ready', 'announced', 'sweeping', 'cutover'].includes(r.phase),
+    due: dueIn === 0,
     phase: r.phase || 'idle',
     machineReady: extra.machineReady ?? null,
     sweepTicketId: r.sweepTicketId || null,
@@ -337,7 +360,18 @@ async function tickRotationInner() {
     return rotationView(loadRotate(), block, { machineReady, userRooms: rooms });
   }
 
-  if (r.phase === 'next_ready' && machineReady && next?.address) {
+  const interval = Number(r.intervalEpochs || INTERVAL);
+  if (r.phase === 'next_ready' && elapsed < interval) {
+    if (r.lastError && String(r.lastError).startsWith('rotate wait: machine')) {
+      r.lastError = null;
+      await saveRotate(r);
+    }
+  }
+  if (r.phase === 'next_ready' && elapsed >= interval && !machineReady && next?.address) {
+    r.lastError = 'rotate wait: machine inspect / pool_set_address not ready';
+    await saveRotate(r);
+  }
+  if (r.phase === 'next_ready' && machineReady && next?.address && elapsed >= interval) {
     try {
       const posted = await submitPoolAdvance({
         type: 'pool_announce_next',
@@ -535,7 +569,16 @@ async function cutOver(r, next) {
   }
 }
 
-export async function birthNextSeat({ signerId, role, P, encD1, paillierN, paillierG }) {
+export async function birthNextSeat({
+  signerId,
+  role,
+  P,
+  encD1,
+  paillierN,
+  paillierG,
+  pok,
+  rangeProof,
+}) {
   const r = Number(role);
   if (r !== 1 && r !== 2) throw new Error('role must be 1 or 2');
   const sid = String(signerId || '').trim();
@@ -560,6 +603,7 @@ export async function birthNextSeat({ signerId, role, P, encD1, paillierN, paill
     .replace(/^0x/i, '')
     .toLowerCase();
   if (!/^[0-9a-f]{66}$/.test(compressed)) throw new Error('P must be 33-byte compressed hex');
+  requireSeatPok({ pok, P: compressed, role: r, kind: 'birth-next' });
   dapp.seats = dapp.seats || { 1: null, 2: null };
   if (dapp.seats[r]?.P && dapp.seats[r]?.signerId && dapp.seats[r].signerId !== sid) {
     throw new Error(`next d${r} already born by ${dapp.seats[r].signerId}`);
@@ -568,24 +612,47 @@ export async function birthNextSeat({ signerId, role, P, encD1, paillierN, paill
     if (!encD1 || !paillierN || !paillierG) {
       throw new Error('d1 next-birth needs Enc(d1) + paillier keys');
     }
-    dapp.seats[1] = {
-      P: compressed,
-      encD1: String(encD1),
-      paillierN: String(paillierN),
-      paillierG: String(paillierG),
-      bornAt: new Date().toISOString(),
+    assertPaillierModulus(paillierN, { what: 'next-Q d1 Paillier N' });
+    verifyRangeLindell({
+      c: encD1,
+      paillierN,
+      paillierG,
+      Q1: compressed,
+      proof: rangeProof,
+      context: seatPokContext('birth-next', 1, compressed),
+    });
+    const ch = pdlVerifierChallenge({
+      ckey: encD1,
+      paillierN,
+      paillierG,
+      Q1: compressed,
+    });
+    stashSeatPdl({
+      kind: 'birth-next',
       signerId: sid,
-    };
-    dapp.ckeyD1 = String(encD1);
-    dapp.paillierN = String(paillierN);
-    dapp.paillierG = String(paillierG);
-  } else {
-    dapp.seats[2] = {
+      ch,
       P: compressed,
-      bornAt: new Date().toISOString(),
-      signerId: sid,
+      encD1,
+      paillierN,
+      paillierG,
+    });
+    await writeNextDapp(dapp);
+    return {
+      ok: true,
+      next: true,
+      role: 1,
+      needPdl: true,
+      pdl: pdlChallengePublic(ch),
+      clientBorn: true,
+      dealerSawPlaintext: false,
     };
   }
+  dapp.seats[2] = {
+    P: compressed,
+    bornAt: new Date().toISOString(),
+    signerId: sid,
+    pokOk: true,
+  };
   finalizeClientBornQ(dapp);
   await writeNextDapp(dapp);
   const rot = loadRotate();
@@ -603,6 +670,57 @@ export async function birthNextSeat({ signerId, role, P, encD1, paillierN, paill
     seal: dapp.seal || null,
     clientBorn: true,
     dealerSawPlaintext: false,
+  };
+}
+
+/** Persist next-Q d1 after Protocol 6.1 accepts. Called from finishClientSeatPdl. */
+export async function sealNextSeatPdl({ signerId, row }) {
+  let dapp = loadNextDapp();
+  if (!dapp) {
+    const made = await createDappOnlyPool();
+    dapp = made.dapp;
+  }
+  dapp.seats = dapp.seats || { 1: null, 2: null };
+  const sid = String(signerId || row?.signerId || '').trim();
+  if (dapp.seats[1]?.P && dapp.seats[1]?.signerId && dapp.seats[1].signerId !== sid) {
+    throw new Error(`next d1 already born by ${dapp.seats[1].signerId}`);
+  }
+  dapp.seats[1] = {
+    ...(dapp.seats[1] || {}),
+    P: row.P,
+    encD1: row.encD1,
+    paillierN: row.paillierN,
+    paillierG: row.paillierG,
+    bornAt: dapp.seats[1]?.bornAt || new Date().toISOString(),
+    signerId: row.signerId || sid,
+    pokOk: true,
+    rangeOk: true,
+    pdlOk: true,
+  };
+  dapp.ckeyD1 = row.encD1;
+  dapp.paillierN = row.paillierN;
+  dapp.paillierG = row.paillierG;
+  dapp.pdlOk = true;
+  dapp.rangeOk = true;
+  finalizeClientBornQ(dapp);
+  await writeNextDapp(dapp);
+  const rot = loadRotate();
+  if (dapp.address && dapp.seats[1]?.P && dapp.seats[2]?.P) rot.phase = 'next_ready';
+  else rot.phase = 'need_birth';
+  await saveRotate(rot);
+  return {
+    ok: true,
+    next: true,
+    role: 1,
+    address: dapp.address || null,
+    publicKey: dapp.publicKey || null,
+    Pdapp: dapp.Pdapp,
+    ready: !!(dapp.seats[1]?.P && dapp.seats[2]?.P),
+    seal: dapp.seal || null,
+    clientBorn: true,
+    dealerSawPlaintext: false,
+    pdlOk: true,
+    rangeOk: true,
   };
 }
 

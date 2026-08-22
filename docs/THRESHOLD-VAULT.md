@@ -73,7 +73,8 @@ CARTESI_INSPECT_URL=http://127.0.0.1:8080/inspect
 COSIGNER_UPSTREAM=http://127.0.0.1:8791
 COSIGNER_ALLOW_FORCE=0
 COSIGNER_REQUIRE_TICKETS=0
-# optional: PAILLIER_BITS=2048 for stronger Paillier (slower keygen)
+# PAILLIER_BITS floor is 2048 (1024 refused). Path A 3P: see docs/POOL-3P-LINDELL.md
+# d2 is visible to the VPS at sign. Phase 0 hygiene ≠ Lindell malicious security.
 ```
 
 ## Tests

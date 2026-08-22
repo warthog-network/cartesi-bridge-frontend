@@ -9,6 +9,7 @@ import {
   clientSignFinish,
 } from '../src/utils/twoPartyEcdsa.js';
 import { createHash } from 'crypto';
+import { secp256k1 } from '@noble/curves/secp256k1';
 
 console.log('PAILLIER default bits', DEFAULT_PAILLIER_BITS);
 console.time('keygen');
@@ -24,6 +25,8 @@ console.log('roundtrip user share', dec.userShareHex === vault.clientSecret.user
 
 const hashHex = createHash('sha256').update('test').digest('hex');
 const { k1Hex, R1Hex } = clientSignRound1();
+const dapp = BigInt('0x' + vault.cosignerRegister.dappShareHex);
+const Q2Hex = Buffer.from(secp256k1.ProjectivePoint.BASE.multiply(dapp).toRawBytes(true)).toString('hex');
 const step = cosignerSignStep({
   R1Hex,
   hashHex,
@@ -31,7 +34,22 @@ const step = cosignerSignStep({
   ckeyStr: vault.cosignerRegister.ckey,
   paillierN: vault.cosignerRegister.paillierN,
   paillierG: vault.cosignerRegister.paillierG,
+  Q2Hex,
+  sid: 'aes-keygen',
 });
-const sig = clientSignFinish({ k1Hex, rHex: step.rHex, ciphertext: step.ciphertext, hashHex, clientSecret: vault.clientSecret });
+const sig = clientSignFinish({
+  k1Hex,
+  rHex: step.rHex,
+  ciphertext: step.ciphertext,
+  hashHex,
+  clientSecret: vault.clientSecret,
+  RHex: step.RHex,
+  pokR: step.pokR,
+  pokC: step.pokC,
+  R2Hex: step.R2Hex,
+  Q2Hex: step.Q2Hex,
+  ckeyAdj: step.ckeyAdj,
+  sid: 'aes-keygen',
+});
 console.log('sig keys', Object.keys(sig));
 console.log('OK');

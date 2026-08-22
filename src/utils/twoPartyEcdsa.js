@@ -20,6 +20,13 @@ import {
 } from 'ethers-v6';
 import CryptoJS from 'crypto-js';
 import {
+  proveSignC,
+  verifySignC,
+  sampleSignRho,
+  randomCoprimeTo,
+  invModQ,
+} from './lindellZk.js';
+import {
   downloadTextFile,
   promptDownloadFilename,
   sanitizeDownloadFilename,
@@ -37,8 +44,16 @@ const ENC_PREFIX_XOR_V1 = 'cartesi-bridge-2p-ecdsa-enc-v1';
 /** AES-256-GCM + PBKDF2 (v2) blob prefix */
 const ENC_PREFIX_AES_V2 = 'cartesi-bridge-2p-aesgcm-v2:';
 const USER_STORE_PREFIX = 'cartesi-bridge-msig2p-user-v1:';
-/** Default Paillier modulus bits (lab was 1024; product floor 2048) */
+/** Default Paillier modulus bits. Floor is 2048 — 1024 is refused at keygen/birth/rekey. */
 export const DEFAULT_PAILLIER_BITS = 2048;
+export const MIN_PAILLIER_BITS = 2048;
+/**
+ * Lindell'17 samples ρ ← Z_q² (~512 bits) and adds Enc(ρ·q).
+ * 32-byte ρ was not paper-faithful. High bit set so the client can reject a
+ * missing/tiny pad. This is statistical hiding of x2 from P1, NOT a
+ * well-formedness proof of c. Phase 0/1 ≠ malicious Lindell.
+ */
+export const LINDELL_RHO_BITS = 512;
 const PBKDF2_ITERS = 120_000;
 
 export function modN(a) {
@@ -121,6 +136,243 @@ export function ethAddressFromPubCompressedHex(pubHex) {
 
 function hashToScalar(hashHex) {
   return modN(BigInt('0x' + String(hashHex).replace(/^0x/i, '')));
+}
+
+export function paillierBitLength(nStr) {
+  const n = BigInt(nStr);
+  if (n <= 0n) return 0;
+  return n.toString(2).length;
+}
+
+/** Refuse <2048-bit N at keygen / birth / rekey. */
+export function assertPaillierModulus(
+  nStr,
+  { minBits = MIN_PAILLIER_BITS, what = 'Paillier N' } = {},
+) {
+  const bits = paillierBitLength(nStr);
+  if (bits < minBits) {
+    throw new Error(
+      `${what} is ${bits}-bit; floor is ${minBits} (1024-bit Enc(d1) is a d1 leak if N factors)`,
+    );
+  }
+  return bits;
+}
+
+export function seatPokContext(kind, role, Phex) {
+  return [
+    'wart-3p-seat',
+    String(kind || ''),
+    String(Number(role || 0)),
+    String(Phex || '')
+      .replace(/^0x/i, '')
+      .toLowerCase(),
+  ].join('|');
+}
+
+function schnorrChallengeScalar(Phex, Rhex, context) {
+  const msg = [
+    'wart-3p-schnorr-v1',
+    String(context || ''),
+    String(Phex || '').replace(/^0x/i, '').toLowerCase(),
+    String(Rhex || '').replace(/^0x/i, '').toLowerCase(),
+  ].join('|');
+  return hashToScalar(String(sha256(toUtf8Bytes(msg))).replace(/^0x/i, ''));
+}
+
+/**
+ * Schnorr PoK of dlog(P). Does NOT prove Enc(d) encrypts that dlog.
+ * Birth still needs a range/DL proof on the ciphertext for Lindell keygen.
+ */
+export function schnorrProveDlog(shareHex, context) {
+  const d = hexToScalar(shareHex);
+  const P = G.multiply(d);
+  const Phex = pointToCompressedHex(P);
+  let k;
+  let Rhex;
+  let e;
+  for (let i = 0; i < 8; i++) {
+    k = randomScalar();
+    Rhex = pointToCompressedHex(G.multiply(k));
+    e = schnorrChallengeScalar(Phex, Rhex, context);
+    if (e !== 0n) break;
+  }
+  if (!e) throw new Error('schnorr challenge was 0');
+  return {
+    P: Phex,
+    R: Rhex,
+    s: scalarToHex(modN(k + e * d)),
+    context: String(context || ''),
+  };
+}
+
+export function schnorrVerifyDlog(pok, expectedP, context) {
+  if (!pok?.R || !pok?.s) throw new Error('SCHNORR_MISSING: need {R,s} PoK of dlog(P)');
+  const ctx = String(context || pok.context || '');
+  const Phex = String(expectedP || pok.P || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (!/^[0-9a-f]{66}$/.test(Phex)) throw new Error('SCHNORR_BAD_P');
+  const P = pointFromCompressedHex(Phex);
+  const R = pointFromCompressedHex(pok.R);
+  const s = hexToScalar(pok.s);
+  const e = schnorrChallengeScalar(Phex, String(pok.R).replace(/^0x/i, ''), ctx);
+  const left = G.multiply(s);
+  const right = R.add(P.multiply(e));
+  if (pointToCompressedHex(left) !== pointToCompressedHex(right)) {
+    throw new Error('SCHNORR_BAD: sG ≠ R + eP — not the dlog of P');
+  }
+  return { ok: true, P: Phex, context: ctx };
+}
+
+function normPubHex(hex) {
+  return String(hex || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+}
+
+function schnorrChallengeOnBase(statementHex, commitHex, baseHex, context) {
+  const msg = [
+    'wart-3p-schnorr-base-v1',
+    String(context || ''),
+    normPubHex(baseHex),
+    normPubHex(statementHex),
+    normPubHex(commitHex),
+  ].join('|');
+  return hashToScalar(String(sha256(toUtf8Bytes(msg))).replace(/^0x/i, ''));
+}
+
+/**
+ * Schnorr PoK of dlog_Base(Statement) = witness. Seat PoK stays on G
+ * (wart-3p-schnorr-v1). This domain is for R = k2·R1.
+ */
+export function schnorrProveDlogOnBase(witnessHex, baseHex, context) {
+  const w = hexToScalar(witnessHex);
+  const Base = pointFromCompressedHex(baseHex);
+  const statementHex = pointToCompressedHex(Base.multiply(w));
+  const baseN = normPubHex(baseHex);
+  let k;
+  let commitHex;
+  let e;
+  for (let i = 0; i < 8; i++) {
+    k = randomScalar();
+    commitHex = pointToCompressedHex(Base.multiply(k));
+    e = schnorrChallengeOnBase(statementHex, commitHex, baseN, context);
+    if (e !== 0n) break;
+  }
+  if (!e) throw new Error('schnorr-on-base challenge was 0');
+  return {
+    P: statementHex,
+    R: commitHex,
+    s: scalarToHex(modN(k + e * w)),
+    base: baseN,
+    context: String(context || ''),
+  };
+}
+
+export function schnorrVerifyDlogOnBase(pok, expectedStatement, baseHex, context) {
+  if (!pok?.R || !pok?.s) {
+    throw new Error('LINDELL_R_POK_MISSING: need {R,s} PoK of dlog_{R1}(R)');
+  }
+  const ctx = String(context || pok.context || '');
+  const statementHex = normPubHex(expectedStatement || pok.P);
+  const baseN = normPubHex(baseHex || pok.base);
+  if (!/^[0-9a-f]{66}$/.test(statementHex) || !/^[0-9a-f]{66}$/.test(baseN)) {
+    throw new Error('LINDELL_R_POK: bad R or R1');
+  }
+  const Base = pointFromCompressedHex(baseN);
+  const Statement = pointFromCompressedHex(statementHex);
+  const T = pointFromCompressedHex(pok.R);
+  const s = hexToScalar(pok.s);
+  const e = schnorrChallengeOnBase(statementHex, normPubHex(pok.R), baseN, ctx);
+  const left = Base.multiply(s);
+  const right = T.add(Statement.multiply(e));
+  if (pointToCompressedHex(left) !== pointToCompressedHex(right)) {
+    throw new Error('LINDELL_R_POK: s·R1 ≠ T + e·R — coordinator does not know k2');
+  }
+  return { ok: true, P: statementHex, base: baseN, context: ctx };
+}
+
+/** Fiat-Shamir bind for R = k2·R1. Not a well-formedness proof of c. */
+export function lindellRPokContext({ R1Hex, RHex, rHex, hashHex, ciphertext }) {
+  const cHash = String(sha256(toUtf8Bytes(String(ciphertext || '')))).replace(/^0x/i, '');
+  return [
+    'wart-3p-r-eq-k2r1-v1',
+    normPubHex(R1Hex),
+    normPubHex(RHex),
+    String(rHex || '')
+      .replace(/^0x/i, '')
+      .toLowerCase(),
+    String(hashHex || '')
+      .replace(/^0x/i, '')
+      .toLowerCase(),
+    cHash,
+  ].join('|');
+}
+
+export function proveLindellR({ k2Hex, R1Hex, RHex, rHex, hashHex, ciphertext }) {
+  const ctx = lindellRPokContext({ R1Hex, RHex, rHex, hashHex, ciphertext });
+  const pok = schnorrProveDlogOnBase(k2Hex, R1Hex, ctx);
+  if (normPubHex(pok.P) !== normPubHex(RHex)) {
+    throw new Error('LINDELL_R_POK: k2·R1 ≠ R');
+  }
+  return pok;
+}
+
+/**
+ * d1 checks: R1 = k1·G, r = Rx(R), and coordinator knows k2 with R = k2·R1.
+ * Does not prove c is the Lindell tuple for (R1, z, k2).
+ */
+export function verifyLindellR({ pok, k1Hex, R1Hex, RHex, rHex, hashHex, ciphertext }) {
+  if (!pok?.R || !pok?.s) {
+    throw new Error('LINDELL_R_POK_MISSING: need Schnorr that R = k2·R1');
+  }
+  if (!RHex) throw new Error('LINDELL_R_POK_MISSING: need RHex');
+  const k1 = hexToScalar(k1Hex);
+  const R1got = pointToCompressedHex(G.multiply(k1));
+  const R1n = normPubHex(R1Hex || R1got);
+  if (normPubHex(R1got) !== R1n) {
+    throw new Error('LINDELL_R_POK: R1 ≠ k1·G');
+  }
+  const R = pointFromCompressedHex(RHex);
+  if (modN(R.toAffine().x) !== hexToScalar(rHex)) {
+    throw new Error('LINDELL_R_POK: r ≠ Rx(R) mod n');
+  }
+  const ctx = lindellRPokContext({
+    R1Hex: R1n,
+    RHex,
+    rHex,
+    hashHex,
+    ciphertext,
+  });
+  schnorrVerifyDlogOnBase(pok, RHex, R1n, ctx);
+  return true;
+}
+
+/**
+ * Honest Dec(c) = k2^{-1}z + k2^{-1} r x2 + x1·k2^{-1} r + ρ·n
+ * with ρ ∈ [2^{511}, 2^{512}). Missing pad ⇒ pt ≈ O(n²) and fails the floor.
+ */
+export function lindellPlaintextBounds(paillierN) {
+  const n = CURVE_N;
+  const N = BigInt(paillierN);
+  const rhoMin = 1n << BigInt(LINDELL_RHO_BITS - 1);
+  const rhoMax = (1n << BigInt(LINDELL_RHO_BITS)) - 1n;
+  const lo = rhoMin * n;
+  const hi = rhoMax * n + 2n * n * n + 2n * n;
+  if (lo >= N) {
+    throw new Error('Paillier N too small for 512-bit Lindell ρ');
+  }
+  return { lo, hi: hi < N ? hi : N - 1n };
+}
+
+export function assertLindellPlaintextRange(pt, paillierN) {
+  const { lo, hi } = lindellPlaintextBounds(paillierN);
+  if (pt < lo || pt > hi) {
+    throw new Error(
+      'LINDELL_RANGE: Dec(c) not in the 512-bit ρ window — refusing s (missing pad or malformed c)',
+    );
+  }
+  return true;
 }
 
 function getSubtle() {
@@ -765,17 +1017,38 @@ export function clientSignRound1() {
   };
 }
 
+/** ρ ← {2^{511} … 2^{512}-1} so Dec(c) sits in a checkable window. Not a proof of c. */
+export function sampleLindellRho(paillierN) {
+  const N = BigInt(paillierN);
+  const bytes = crypto.getRandomValues(new Uint8Array(LINDELL_RHO_BITS / 8));
+  bytes[0] |= 0x80; // force ≥ 2^{511}
+  let rho = 0n;
+  for (const b of bytes) rho = (rho << 8n) | BigInt(b);
+  const pad = rho * CURVE_N;
+  if (pad >= N) {
+    throw new Error('Lindell ρ·n ≥ Paillier N — need ≥2048-bit N');
+  }
+  return rho;
+}
+
 /**
  * Cosigner: R = k2·R1, build Lindell ciphertext for client.
- * Never sees d_user or full d.
+ * Phase 6: Coinbase integer-commit ZK that c is the Lindell tuple, plus R = k2·R1.
+ *
+ * x2 is the coordinator share (d_dapp, plus d2 if folded into the scalar).
+ * ckey encrypts the dealer share only (d1). Q2Hex = x2·G (Pdapp, or P2+Pdapp).
  */
 export function cosignerSignStep({
   R1Hex,
   hashHex,
   dappShareHex,
+  d2Hex,
+  encD2Str,
   ckeyStr,
   paillierN,
   paillierG,
+  Q2Hex,
+  sid,
 }) {
   const k2 = randomScalar();
   const R1 = pointFromCompressedHex(R1Hex);
@@ -784,38 +1057,112 @@ export function cosignerSignStep({
   if (r === 0n) throw new Error('bad r — retry');
 
   const z = hashToScalar(hashHex);
-  const x2 = hexToScalar(dappShareHex);
-  const k2inv = invScalar(k2);
+  let x2 = hexToScalar(dappShareHex);
+  if (d2Hex && !encD2Str) x2 = modN(x2 + hexToScalar(d2Hex));
+  const k2inv = invModQ(k2);
 
   const pub = new PublicKey(BigInt(paillierN), BigInt(paillierG));
-  const ckey = BigInt(ckeyStr);
+  const slack = CURVE_N << 80n;
+  let ckeyAdj = pub.plaintextAddition(BigInt(ckeyStr), slack);
+  if (encD2Str) {
+    ckeyAdj = pub.addition(ckeyAdj, BigInt(String(encD2Str)));
+  }
+  const w2 = modN(k2inv * x2);
+  const rho = sampleSignRho();
+  const rc = randomCoprimeTo(pub.n);
+  const temp = k2inv * z + w2 * r + rho * CURVE_N;
+  const exp = k2inv * r;
+  const c = pub.addition(pub.multiply(ckeyAdj, exp), pub.encrypt(temp, rc));
 
-  const termM = modN(k2inv * z);
-  const termX2 = modN(k2inv * r * x2);
-  const exp = modN(k2inv * r);
-
-  const rhoBytes = crypto.getRandomValues(new Uint8Array(32));
-  let rho = 0n;
-  for (const b of rhoBytes) rho = (rho << 8n) | BigInt(b);
-  rho = (rho % (pub.n - 1n)) + 1n;
-
-  let c = pub.encrypt(termM);
-  c = pub.addition(c, pub.encrypt(termX2));
-  c = pub.addition(c, pub.multiply(ckey, exp));
-  c = pub.addition(c, pub.encrypt(rho * CURVE_N));
+  const rHex = scalarToHex(r);
+  const RHex = pointToCompressedHex(R);
+  const R2Hex = pointToCompressedHex(G.multiply(k2));
+  const ciphertext = c.toString();
+  const pokR = proveLindellR({
+    k2Hex: scalarToHex(k2),
+    R1Hex,
+    RHex,
+    rHex,
+    hashHex,
+    ciphertext,
+  });
+  if (!Q2Hex) {
+    throw new Error('Q2Hex required — x2·G (Pdapp or P2+Pdapp) for the c-wellformedness proof');
+  }
+  const pokC = proveSignC({
+    paillierN,
+    paillierG,
+    ckey: ckeyAdj.toString(),
+    c: ciphertext,
+    Q2Hex,
+    R2Hex,
+    m: z,
+    r,
+    k2,
+    x2,
+    rho,
+    rc,
+    sid: sid || hashHex,
+    aux: 0,
+  });
 
   return {
-    rHex: scalarToHex(r),
-    ciphertext: c.toString(),
-    RHex: pointToCompressedHex(R),
+    rHex,
+    ciphertext,
+    RHex,
+    R2Hex,
+    Q2Hex: String(Q2Hex).replace(/^0x/i, '').toLowerCase(),
+    ckeyAdj: ckeyAdj.toString(),
+    pokR,
+    pokC,
   };
 }
 
 /**
  * Client finishes s = k1^{-1} * (Dec(c) mod n); returns Warthog signature65.
- * Never sees d_dapp.
+ * Never sees d_dapp. Requires pokR (R = k2·R1) before decrypt.
  */
-export function clientSignFinish({ k1Hex, rHex, ciphertext, hashHex, clientSecret }) {
+export function clientSignFinish({
+  k1Hex,
+  rHex,
+  ciphertext,
+  hashHex,
+  clientSecret,
+  RHex,
+  R1Hex,
+  pokR,
+  pokC,
+  R2Hex,
+  Q2Hex,
+  ckeyAdj,
+  sid,
+}) {
+  verifyLindellR({
+    pok: pokR,
+    k1Hex,
+    R1Hex,
+    RHex,
+    rHex,
+    hashHex,
+    ciphertext,
+  });
+  const z = hashToScalar(hashHex);
+  if (!Q2Hex || !R2Hex || ckeyAdj == null) {
+    throw new Error('LINDELL_C_ZK_MISSING: need Q2Hex, R2Hex, and ckeyAdj');
+  }
+  verifySignC({
+    paillierN: clientSecret.paillierN,
+    paillierG: clientSecret.paillierG,
+    ckey: String(ckeyAdj),
+    c: ciphertext,
+    Q2Hex,
+    R2Hex,
+    m: z,
+    r: hexToScalar(rHex),
+    pokC,
+    sid: sid || hashHex,
+    aux: 0,
+  });
   const k1 = hexToScalar(k1Hex);
   const r = hexToScalar(rHex);
 

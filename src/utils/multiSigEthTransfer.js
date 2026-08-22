@@ -138,6 +138,13 @@ export async function multiSigTransferEth({
       ciphertext: partial.ciphertext,
       hashHex,
       clientSecret,
+      RHex: partial.RHex,
+      pokR: partial.pokR,
+      pokC: partial.pokC,
+      R2Hex: partial.R2Hex,
+      Q2Hex: partial.Q2Hex,
+      ckeyAdj: partial.ckeyAdj,
+      sid: vaultBare,
     });
   } catch (e) {
     await releaseBudget();
