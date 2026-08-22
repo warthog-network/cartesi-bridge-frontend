@@ -3487,15 +3487,31 @@ export default function FungiblePool({
         ? 'WART → wWART'
         : 'wWART → WART';
   const ethQ = eth3pSt?.address || '';
-  const wartKey = String(wartFrom || '')
-    .replace(/^0x/i, '')
-    .toLowerCase();
   const ethLedger = (() => {
-    const credits = (eth3pSt?.credits || []).filter(
-      (c) => !wartKey || String(c.wartAddress || '').toLowerCase() === wartKey,
+    const empty = {
+      availableHuman: '0',
+      lockedHuman: '0',
+      usedHuman: '0',
+      wartL1Human: '0',
+    };
+    const ownerEth = String(owner || '').toLowerCase();
+    const wartKey = String(wartFrom || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    if (!ownerEth && !wartKey) return empty;
+    const credits = (eth3pSt?.credits || []).filter((c) => {
+      const from = String(c.fromEth || '').toLowerCase();
+      const wart = String(c.wartAddress || '').toLowerCase();
+      if (ownerEth && from && from === ownerEth) return true;
+      if (wartKey && wart === wartKey) return true;
+      return false;
+    });
+    const wartSet = new Set(
+      credits.map((c) => String(c.wartAddress || '').toLowerCase()).filter(Boolean),
     );
-    const wraps = (eth3pSt?.wraps || []).filter(
-      (w) => !wartKey || String(w.issuerWart || '').toLowerCase() === wartKey,
+    if (wartKey) wartSet.add(wartKey);
+    const wraps = (eth3pSt?.wraps || []).filter((w) =>
+      wartSet.has(String(w.issuerWart || '').toLowerCase()),
     );
     let locked = 0n;
     let available = 0n;
@@ -3712,7 +3728,7 @@ export default function FungiblePool({
                   : (snap?.availableHuman ?? '…')}
               </span>
               <span className="wi-stat-hint">
-                {swapAsset === 'ETH' ? 'unused ETH lock (can mint receipt)' : 'your unused deposit'}
+                {swapAsset === 'ETH' ? 'your unused ETH lock' : 'your unused deposit'}
               </span>
             </div>
             <div className="wi-stat">
@@ -3723,7 +3739,7 @@ export default function FungiblePool({
                   : (snap?.lockedHuman ?? '…')}
               </span>
               <span className="wi-stat-hint">
-                {swapAsset === 'ETH' ? 'ETH credited to 3P' : 'your WART credited'}
+                {swapAsset === 'ETH' ? 'your ETH credited' : 'your WART credited'}
               </span>
             </div>
             <div className="wi-stat">
@@ -3734,7 +3750,7 @@ export default function FungiblePool({
                   : (snap?.claimedHuman ?? '…')}
               </span>
               <span className="wi-stat-hint">
-                {swapAsset === 'ETH' ? 'minted as wETH receipt' : 'your minted claim'}
+                {swapAsset === 'ETH' ? 'your minted wETH receipt' : 'your minted claim'}
               </span>
             </div>
             <div className="wi-stat wi-stat--spoof">
@@ -3747,7 +3763,7 @@ export default function FungiblePool({
                   : mmWwartLabel}
               </span>
               <span className="wi-stat-hint">
-                {swapAsset === 'ETH' ? 'receipt still on Warthog' : 'your L1 token'}
+                {swapAsset === 'ETH' ? 'your receipt on Warthog' : 'your L1 token'}
               </span>
             </div>
           </div>
