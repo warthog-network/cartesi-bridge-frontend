@@ -3788,7 +3788,7 @@ export default function FungiblePool({
             </div>
             <div className="wi-stat wi-stat--spoof">
               <span className="wi-stat-k">
-                {swapAsset === 'ETH' ? 'WART L1' : 'MetaMask wWART'}
+                {swapAsset === 'ETH' ? 'WART L1 wETH' : 'MetaMask wWART'}
               </span>
               <span className="wi-stat-v">
                 {swapAsset === 'ETH'
