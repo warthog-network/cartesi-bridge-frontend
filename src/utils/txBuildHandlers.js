@@ -28,6 +28,16 @@ export async function executeBuildSpec(ctx, account, spec) {
     }
     case 'ASSET_CREATE':
       return buildAssetCreationTx(ctx, account, spec);
+    case 'TRANSFER_ASSET': {
+      const { buildAssetTransferTx } = await import('./buildAssetTx.js');
+      return buildAssetTransferTx(ctx, account, {
+        assetHash: spec.assetHash,
+        toAddress: spec.toAddress || spec.recipient,
+        amount: spec.amount,
+        decimals: spec.decimals ?? 8,
+        isLiquidity: false,
+      });
+    }
     default:
       throw new Error(`Unknown transaction build spec: ${spec.type}`);
   }

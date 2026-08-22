@@ -1917,6 +1917,23 @@ const WarthogWallet = ({
           const api = await createWarthogApi(selectedNode);
           return api.getAccountAssetBalance(wallet.address, assetHash);
         },
+        sendAsset: async ({ assetHash, toAddress, amount, decimals = 8 }) => {
+          const api = await createWarthogApi(selectedNode);
+          const nonceId = getSmartNonce(wallet.address, nextNonce ?? 0);
+          const { nonce, data } = await signAndSubmitTransaction(api, {
+            privateKey: wallet.privateKey,
+            nonceId,
+            buildSpec: {
+              type: 'TRANSFER_ASSET',
+              assetHash,
+              toAddress,
+              amount: String(amount),
+              decimals,
+            },
+          });
+          bumpNonceAfterSuccess(wallet.address, nonce, nextNonce ?? 0);
+          return data;
+        },
       });
     } else {
       onBridgeApi(null);

@@ -21,6 +21,9 @@ import {
   assertPaillierModulus,
   schnorrVerifyDlog,
   seatPokContext,
+  cosignerSignStep,
+  clientSignRound1,
+  clientSignFinish,
 } from '../twoPartyEcdsa.js';
 import {
   verifyRangeLindell,
@@ -28,6 +31,7 @@ import {
   pdlChallengePublic,
   pdlVerifierOpen,
   pdlVerifierAccept,
+  verifyEncEqualsDlog,
 } from '../lindellZk.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -54,6 +58,10 @@ const ETH_WRAPS_PATH =
   env('POOL_ETH3P_WRAPS') || path.join(DEFAULT_DATA, 'pool-eth-3p-wraps.json');
 const ETH_BIND_PATH =
   env('POOL_ETH3P_BIND') || path.join(DEFAULT_DATA, 'pool-eth-3p-bind.json');
+const ETH_SESS_PATH =
+  env('POOL_ETH3P_SESSIONS') || path.join(DEFAULT_DATA, 'pool-eth-3p-sessions.json');
+const WART_NODE = env('WARTHOG_NODE_URL', 'http://127.0.0.1:3001');
+const ETH_RPC = env('CARTESI_RPC_URL', 'http://127.0.0.1:8545');
 
 /** Nothing-up-my-sleeve Warthog burn bin (no mnemonic). 48-hex. */
 export const ETH_BURN_BIN = createHash('sha256')
@@ -509,6 +517,7 @@ export async function heartbeatEth3p({ signerId, seatEpoch } = {}) {
       Pdapp: dapp?.Pdapp || null,
       needBirth: !!(share?.needBirth),
       seal: dapp?.seal || null,
+      open: listOpenEthTickets().map(ticketView),
     };
   });
 }
@@ -540,10 +549,13 @@ export async function publicEth3pStatus() {
     seal: d.seal || null,
     hasCkeyE1: !!(d.ckeyD1 || d.seats?.[1]?.encD1),
     hasFullKey: false,
+    paillierN: d.paillierN || d.seats?.[1]?.paillierN || null,
+    paillierG: d.paillierG || d.seats?.[1]?.paillierG || null,
     burnBin: ETH_BURN_BIN,
     wraps: (wraps.wraps || []).slice(-20),
     credits: (wraps.credits || []).slice(-20),
     burns: (wraps.burns || []).slice(-20),
+    open: listOpenEthTickets().map(ticketView),
     orbit: {
       liveCount: live.length,
       live,
@@ -724,3 +736,346 @@ export async function bindEthOwner({ wartAddress, ethAddress }) {
 export function eth3pBurnBin() {
   return ETH_BURN_BIN;
 }
+
+const ETH_RAM_D2 = new Map();
+function loadEthSess() {
+  return loadJson(ETH_SESS_PATH, { tickets: {} });
+}
+async function saveEthSess(s) {
+  await saveJson(ETH_SESS_PATH, s);
+}
+
+function pointFromHex(hex) {
+  return secp256k1.ProjectivePoint.fromHex(
+    String(hex || '')
+      .replace(/^0x/i, '')
+      .toLowerCase(),
+  );
+}
+
+async function lookupWartTx(txHash) {
+  const h = String(txHash || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(h)) throw new Error('wartTxHash required');
+  const res = await fetch(`${WART_NODE.replace(/\/$/, '')}/transaction/lookup/${h}`);
+  if (!res.ok) throw new Error(`Warthog lookup HTTP ${res.status}`);
+  const body = await res.json();
+  if (body.code != null && body.code !== 0) {
+    throw new Error(body.error || `lookup code ${body.code}`);
+  }
+  const t = body.data?.transaction || body.data || {};
+  const nested = t.data || {};
+  const common = t.signedCommon || {};
+  return {
+    txHash: String(t.hash || h).replace(/^0x/i, '').toLowerCase(),
+    fromAddress: String(common.originAddress || nested.fromAddress || '')
+      .replace(/^0x/i, '')
+      .toLowerCase(),
+    toAddress: String(nested.toAddress || '')
+      .replace(/^0x/i, '')
+      .toLowerCase(),
+    assetHash: String(nested.tokenHash || nested.assetHash || nested.tokenId || '')
+      .replace(/^0x/i, '')
+      .toLowerCase(),
+    amountE8: String(nested.amount?.E8 ?? nested.tokenAmount?.E8 ?? nested.amountE8 ?? '0'),
+    confirmations: Number(body.data?.confirmations ?? 0),
+  };
+}
+
+async function buildEthUnsigned({ to, valueWei }) {
+  const { JsonRpcProvider, Transaction } = await import('ethers-v6');
+  const dapp = loadEthDapp();
+  if (!dapp?.address) throw new Error('ETH 3P Q not sealed');
+  const provider = new JsonRpcProvider(ETH_RPC);
+  const from = String(dapp.address).toLowerCase();
+  const nonce = await provider.getTransactionCount(from, 'pending');
+  const net = await provider.getNetwork();
+  const fee = await provider.getFeeData();
+  const tx = {
+    to: String(to).toLowerCase(),
+    value: BigInt(valueWei),
+    nonce,
+    gasLimit: 21000n,
+    chainId: Number(net.chainId),
+    type: 0,
+    gasPrice: fee.gasPrice || 1n,
+  };
+  const unsigned = Transaction.from(tx);
+  const hashHex = unsigned.unsignedHash.replace(/^0x/i, '').toLowerCase();
+  return {
+    tx: {
+      to: tx.to,
+      value: tx.value.toString(),
+      nonce: tx.nonce,
+      gasLimit: tx.gasLimit.toString(),
+      chainId: tx.chainId,
+      type: 0,
+      gasPrice: tx.gasPrice.toString(),
+    },
+    hashHex,
+    from,
+  };
+}
+
+function ticketView(t) {
+  if (!t) return { ok: false };
+  return {
+    ok: true,
+    ticketId: t.ticketId,
+    status: t.status,
+    haveR1: !!t.haveR1,
+    haveD2: !!t.haveD2,
+    hasPartial: !!t.ciphertext,
+    rHex: t.rHex || null,
+    ciphertext: t.ciphertext || null,
+    R1Hex: t.R1Hex || null,
+    RHex: t.RHex || null,
+    R2Hex: t.R2Hex || null,
+    Q2Hex: t.Q2Hex || null,
+    ckeyAdj: t.ckeyAdj || null,
+    pokR: t.pokR || null,
+    pokC: t.pokC || null,
+    hashHex: t.hashHex || t.prep?.hashHex || null,
+    amountE8: t.amountE8,
+    toAddress: t.toAddress,
+    amountWei: t.amountWei,
+    assetHash: t.assetHash,
+    burnerWart: t.burnerWart,
+    prep: t.prep || null,
+    paillierN: loadEthDapp()?.paillierN || null,
+    paillierG: loadEthDapp()?.paillierG || null,
+    txHash: t.payout?.txHash || null,
+    payout: t.payout || null,
+  };
+}
+
+function listOpenEthTickets() {
+  const s = loadEthSess();
+  return Object.values(s.tickets || {}).filter(
+    (t) => t && t.room !== false && t.status !== 'paid' && t.status !== 'abandoned',
+  );
+}
+
+/**
+ * Verify WETH was sent to the burn bin, then open an ETH 3P Lindell room
+ * paying the burner's bound L1 address.
+ */
+export async function openEthRedeem({
+  wartTxHash,
+  assetHash,
+  amountE8,
+  burnerWart,
+  ethAddress,
+}) {
+  const dapp = loadEthDapp();
+  if (!dapp?.address || !dapp?.ckeyD1) {
+    throw new Error('ETH 3P not ready (need sealed Q + Enc(e1))');
+  }
+  const looked = await lookupWartTx(wartTxHash);
+  if (looked.toAddress !== ETH_BURN_BIN) {
+    throw new Error(
+      `burn tx to ${looked.toAddress || '∅'} is not the burn bin ${ETH_BURN_BIN}`,
+    );
+  }
+  const hash = String(assetHash || looked.assetHash || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error('assetHash required');
+  if (looked.assetHash && looked.assetHash !== hash) {
+    throw new Error('lookup asset hash does not match wrap');
+  }
+  const burner = String(burnerWart || looked.fromAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (looked.fromAddress && looked.fromAddress !== burner) {
+    throw new Error('burn tx from-address is not the claimed burner');
+  }
+  const y = BigInt(String(amountE8 || looked.amountE8 || '0'));
+  if (y <= 0n) throw new Error('amountE8 must be > 0');
+  if (ethAddress) {
+    await bindEthOwner({ wartAddress: burner, ethAddress });
+  }
+  const rec = await recordEthBurn({
+    assetHash: hash,
+    amountE8: y.toString(),
+    burnerWart: burner,
+    wartTxHash: looked.txHash,
+  });
+  const bound = rec.burn?.boundEth;
+  if (!bound) {
+    throw new Error('bind this Warthog address to a MetaMask 0x before redeem');
+  }
+  const unsigned = await buildEthUnsigned({
+    to: bound,
+    valueWei: (y * 10n ** 10n).toString(),
+  });
+  const ticketId = `eth-redeem-${looked.txHash.slice(0, 16)}`;
+  const s = loadEthSess();
+  s.tickets = s.tickets || {};
+  if (s.tickets[ticketId]?.status === 'paid') {
+    return { ok: true, alreadyPaid: true, ticketId, ...ticketView(s.tickets[ticketId]) };
+  }
+  s.tickets[ticketId] = {
+    ticketId,
+    status: 'open',
+    room: true,
+    assetHash: hash,
+    amountE8: y.toString(),
+    amountWei: unsigned.tx.value,
+    toAddress: bound,
+    burnerWart: burner,
+    wartTxHash: looked.txHash,
+    hashHex: unsigned.hashHex,
+    prep: { ...unsigned, hashHex: unsigned.hashHex },
+    openedAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  await saveEthSess(s);
+  return { ok: true, ticketId, burnBin: ETH_BURN_BIN, ...ticketView(s.tickets[ticketId]) };
+}
+
+export async function eth3pOfferR1({ ticketId, signerId, R1Hex, hashHex }) {
+  const sid = String(signerId || '').trim();
+  if (currentHolderId(1) !== sid) throw new Error('e1 R1 must come from the current e1 holder');
+  const s = loadEthSess();
+  const t = s.tickets[String(ticketId)];
+  if (!t) throw new Error('unknown ETH redeem ticket');
+  if (t.status === 'paid') return { ok: false, alreadyPaid: true, ...ticketView(t) };
+  const nextHash = String(hashHex || t.hashHex || t.prep?.hashHex || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  const nextR1 = compactPoint(R1Hex);
+  t.R1Hex = nextR1;
+  t.hashHex = nextHash;
+  t.r1SignerId = sid;
+  t.haveR1 = true;
+  t.status = t.haveD2 ? 'ready' : 'wait_d2';
+  t.updatedAt = Date.now();
+  if (t.haveR1 && ETH_RAM_D2.has(t.ticketId)) {
+    t.haveD2 = true;
+    runEthLindell(t);
+  }
+  await saveEthSess(s);
+  return ticketView(t);
+}
+
+export async function eth3pOfferD2({
+  ticketId,
+  signerId,
+  encD2,
+  encDlogProof,
+  rangeProof,
+}) {
+  const sid = String(signerId || '').trim();
+  if (currentHolderId(2) !== sid) {
+    return { ok: false, skipped: true, error: 'e2 must come from the current e2 holder' };
+  }
+  const dapp = loadEthDapp();
+  const wantP2 = compactPoint(dapp.seats?.[2]?.P || dapp.seal?.P2);
+  if (!encD2 || !encDlogProof) throw new Error('e2 offer needs Enc(e2)+encDlogProof');
+  if (!dapp.paillierN || !dapp.paillierG) throw new Error('needs e1 Paillier N,g');
+  const ctx = `${seatPokContext('offer-d2', 2, wantP2)}|${ticketId}`;
+  verifyEncEqualsDlog({
+    c: encD2,
+    paillierN: dapp.paillierN,
+    paillierG: dapp.paillierG,
+    Qhex: wantP2,
+    proof: encDlogProof,
+    context: ctx,
+  });
+  if (rangeProof) {
+    verifyRangeLindell({
+      c: encD2,
+      paillierN: dapp.paillierN,
+      paillierG: dapp.paillierG,
+      Q1: wantP2,
+      proof: rangeProof,
+      context: ctx,
+    });
+  }
+  ETH_RAM_D2.set(String(ticketId), String(encD2));
+  const s = loadEthSess();
+  const t = s.tickets[String(ticketId)];
+  if (!t) throw new Error('unknown ETH redeem ticket');
+  t.haveD2 = true;
+  t.status = t.haveR1 ? 'ready' : 'wait_r1';
+  t.updatedAt = Date.now();
+  if (t.haveR1 && t.haveD2) runEthLindell(t);
+  await saveEthSess(s);
+  return ticketView(t);
+}
+
+function runEthLindell(t) {
+  const encD2 = ETH_RAM_D2.get(t.ticketId);
+  const dapp = loadEthDapp();
+  if (!encD2 || !t.R1Hex || !t.hashHex) return;
+  const Pd = dapp.seal?.Pdapp || dapp.Pdapp;
+  const step = cosignerSignStep({
+    R1Hex: t.R1Hex,
+    hashHex: t.hashHex,
+    dappShareHex: dapp.dappShareHex,
+    encD2Str: encD2,
+    ckeyStr: dapp.ckeyD1,
+    paillierN: dapp.paillierN,
+    paillierG: dapp.paillierG,
+    Q2Hex: compactPoint(Pd),
+    sid: t.ticketId,
+  });
+  t.rHex = step.rHex;
+  t.ciphertext = step.ciphertext;
+  t.RHex = step.RHex;
+  t.R2Hex = step.R2Hex;
+  t.Q2Hex = step.Q2Hex;
+  t.ckeyAdj = step.ckeyAdj;
+  t.pokR = step.pokR;
+  t.pokC = step.pokC;
+  t.status = 'partial';
+}
+
+export function eth3pStatusTicket(ticketId) {
+  const s = loadEthSess();
+  return ticketView(s.tickets[String(ticketId)]);
+}
+
+export async function eth3pSubmit({ ticketId, signature65 }) {
+  const s = loadEthSess();
+  const t = s.tickets[String(ticketId)];
+  if (!t) throw new Error('unknown ETH redeem ticket');
+  if (t.status === 'paid' && t.payout?.txHash) {
+    return { ok: true, alreadyPaid: true, txHash: t.payout.txHash };
+  }
+  const sig = String(signature65 || '').replace(/^0x/i, '');
+  if (!/^[0-9a-f]{130}$/i.test(sig)) throw new Error('signature65 required');
+  const { JsonRpcProvider, Transaction, Signature } = await import('ethers-v6');
+  const r = '0x' + sig.slice(0, 64);
+  const sHex = '0x' + sig.slice(64, 128);
+  let v = parseInt(sig.slice(128, 130), 16);
+  if (v === 0 || v === 1) v += 27;
+  const signed = Transaction.from({
+    ...t.prep.tx,
+    value: BigInt(t.prep.tx.value),
+    gasLimit: BigInt(t.prep.tx.gasLimit),
+    gasPrice: BigInt(t.prep.tx.gasPrice),
+    signature: Signature.from({ r, s: sHex, v }),
+  });
+  const provider = new JsonRpcProvider(ETH_RPC);
+  const resp = await provider.broadcastTransaction(signed.serialized);
+  const rec = await resp.wait();
+  t.status = 'paid';
+  t.room = false;
+  t.payout = {
+    ok: true,
+    txHash: rec?.hash || resp.hash,
+    at: Date.now(),
+    scheme: ETH3P_SCHEME,
+  };
+  t.haveR1 = false;
+  t.haveD2 = false;
+  delete t.ciphertext;
+  ETH_RAM_D2.delete(t.ticketId);
+  await saveEthSess(s);
+  return { ok: true, txHash: t.payout.txHash, ticketId: t.ticketId };
+}
+
+export { clientSignRound1, clientSignFinish, listOpenEthTickets };

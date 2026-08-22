@@ -2924,23 +2924,70 @@ export default function FungiblePool({
     const supply = normalizeEthSupplyAmount(amt);
     const [w, f = ''] = String(supply).split('.');
     const e8 = BigInt(w || '0') * 10n ** 8n + BigInt((f + '00000000').slice(0, 8));
-    const rec = await poolApi('/api/pool', {
+    const bin = eth3pSt?.burnBin;
+    if (!bin) throw new Error('ETH 3P burn bin missing');
+    if (!wartBridgeApi?.sendAsset) {
+      throw new Error('Unlock Warthog wallet (sendAsset) to burn the receipt');
+    }
+    if (owner) {
+      await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({
+          action: 'eth3p_bind',
+          wartAddress: wartFrom,
+          ethAddress: owner,
+        }),
+      }).catch(() => null);
+    }
+    toast.loading(`Sending wETH to burn bin…`, { id: 'pool', duration: Infinity });
+    const sent = await wartBridgeApi.sendAsset({
+      assetHash: mine.assetHash,
+      toAddress: bin,
+      amount: supply,
+      decimals: 8,
+    });
+    const wartTx =
+      sent?.txHash ||
+      sent?.hash ||
+      sent?.data?.txHash ||
+      sent?.data?.hash;
+    if (!wartTx) throw new Error('Burn tx submitted but no hash returned');
+    toast.loading('Opening ETH 3P redeem…', { id: 'pool', duration: Infinity });
+    const opened = await poolApi('/api/pool', {
       method: 'POST',
       body: JSON.stringify({
-        action: 'eth3p_burn',
+        action: 'eth3p_open_redeem',
+        wartTxHash: wartTx,
         assetHash: mine.assetHash,
         amountE8: e8.toString(),
         burnerWart: wartFrom,
+        ethAddress: owner,
       }),
     });
-    setActionStatus({
-      kind: rec?.burn?.status === 'ready' ? 'ok' : 'info',
-      text:
-        rec?.burn?.status === 'need-bind'
-          ? 'Unwrap recorded — bind this Warthog addr to MetaMask to receive ETH.'
-          : `Unwrap recorded for ${amt} ETH. 3P ETH payout from the bin is next.`,
+    const ticketId = opened.ticketId;
+    toast.loading(`ETH 3P: waiting for e1 + e2 on ${ticketId}…`, {
+      id: 'pool',
+      duration: Infinity,
     });
-    toast.success(`wETH burn recorded (${amt} ETH)`, { id: 'pool', duration: 10000 });
+    const deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+      const t = await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'eth3p_ticket', ticketId }),
+      });
+      if (t?.status === 'paid' && t.txHash) {
+        setActionStatus({
+          kind: 'ok',
+          text: `wETH → ETH ${amt}. Paid ${t.txHash.slice(0, 12)}… to ${owner?.slice(0, 10)}…`,
+        });
+        toast.success(`wETH → ETH ${amt}`, { id: 'pool', duration: 10000 });
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    throw new Error(
+      'ETH 3P redeem still open — keep e1 and e2 Signing ON, then refresh',
+    );
   };
 
   /**
