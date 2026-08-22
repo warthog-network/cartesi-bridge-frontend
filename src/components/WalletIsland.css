@@ -1255,7 +1255,13 @@ button.eth-section-btn:hover {
   word-break: break-word !important;
 }
 
-/* Path A atomic swap */
+.bridge-toast {
+  font-family: inherit !important;
+  font-weight: 550 !important;
+  backdrop-filter: blur(12px);
+}
+
+/* Path A swap */
 .fungible-pool .fp-swap {
   margin: 0 0 0.75rem;
   padding: 0.85rem 0.9rem 1rem;
@@ -1506,4 +1512,194 @@ button.eth-section-btn:hover {
   border-radius: 999px;
   border: 1px solid rgba(240, 198, 116, 0.45);
   color: #f0c674;
+}
+.fungible-pool .fp-status-age {
+  color: #7a8;
+  font-weight: 600;
+}
+.fungible-pool .fp-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.32rem;
+  margin: 0 0 0.75rem;
+}
+.fungible-pool .fp-chip,
+.fungible-pool .fp-chip-q {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  padding: 0.16rem 0.48rem;
+  border-radius: 999px;
+  font-size: 0.66rem;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  color: #c5d4cf;
+}
+.fungible-pool .fp-chip-q {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  cursor: pointer;
+  color: #fdb913;
+  border-color: rgba(253, 185, 19, 0.4);
+  background: rgba(253, 185, 19, 0.1);
+}
+.fungible-pool .fp-chip-q:hover:not(:disabled) {
+  border-color: #fdb913;
+  background: rgba(253, 185, 19, 0.18);
+}
+.fungible-pool .fp-chip.is-ok {
+  color: #7dffa3;
+  border-color: rgba(0, 255, 204, 0.35);
+  background: rgba(0, 255, 204, 0.1);
+}
+.fungible-pool .fp-chip.is-wait {
+  color: #ffe6a8;
+  border-color: rgba(240, 198, 116, 0.4);
+  background: rgba(240, 198, 116, 0.1);
+}
+.fungible-pool .fp-chip.is-bad {
+  color: #ffb4a2;
+  border-color: rgba(255, 120, 100, 0.45);
+  background: rgba(255, 80, 60, 0.12);
+}
+.fungible-pool .fp-swap-leg-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.fungible-pool .fp-max {
+  border: 1px solid rgba(0, 255, 204, 0.4);
+  background: rgba(0, 255, 204, 0.12);
+  color: #00ffcc;
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  padding: 0.08rem 0.38rem;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.fungible-pool .fp-max:hover:not(:disabled) {
+  background: rgba(0, 255, 204, 0.22);
+}
+.fungible-pool .fp-max:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.fungible-pool .fp-amt-chips {
+  display: flex;
+  gap: 0.35rem;
+  margin: 0.55rem 0 0;
+}
+.fungible-pool .fp-amt {
+  flex: 1 1 0;
+  padding: 0.32rem 0.2rem;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(8, 12, 16, 0.55);
+  color: #9bb;
+  font-size: 0.72rem;
+  font-weight: 750;
+  cursor: pointer;
+}
+.fungible-pool .fp-amt.is-on,
+.fungible-pool .fp-amt:hover:not(:disabled) {
+  color: #00ffcc;
+  border-color: rgba(0, 255, 204, 0.45);
+  background: rgba(0, 255, 204, 0.1);
+}
+.fungible-pool .fp-amt:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.fungible-pool .fp-swap-to-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.55rem;
+}
+.fungible-pool .fp-swap-to-wrap .fp-swap-to {
+  margin-top: 0;
+  flex: 1 1 auto;
+}
+.fungible-pool .fp-icon-btn {
+  flex: 0 0 auto;
+  width: 2.1rem;
+  height: 2.1rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  border: 1px solid rgba(253, 185, 19, 0.4);
+  background: rgba(253, 185, 19, 0.1);
+  color: #fdb913;
+  cursor: pointer;
+}
+.fungible-pool .fp-icon-btn:hover {
+  background: rgba(253, 185, 19, 0.2);
+}
+.fungible-pool .fp-banner {
+  margin: 0 0 0.65rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 8px;
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+.fungible-pool .fp-banner-err {
+  border: 1px solid rgba(255, 120, 100, 0.55);
+  background: rgba(60, 16, 12, 0.85);
+  color: #ffb4a2;
+}
+.fungible-pool .fp-banner-ok {
+  border: 1px solid rgba(0, 255, 204, 0.45);
+  background: rgba(0, 40, 36, 0.85);
+  color: #7dffa3;
+}
+.fungible-pool .fp-banner-info {
+  border: 1px solid rgba(240, 198, 116, 0.5);
+  background: rgba(40, 30, 0, 0.85);
+  color: #ffe6a8;
+}
+.fungible-pool .fp-pending-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+  margin-bottom: 0.35rem;
+}
+.fungible-pool .fp-pending-hash {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.7rem;
+  color: #cde;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+}
+.fungible-pool .fp-pending-hash:hover {
+  color: #00ffcc;
+}
+.fungible-pool .fp-pending-amt {
+  font-size: 0.7rem;
+  color: #fdb913;
+  font-weight: 700;
+}
+.fungible-pool .fp-chip-status.is-credited {
+  color: #7dffa3;
+  border-color: rgba(0, 255, 204, 0.4);
+}
+.fungible-pool .fp-chip-status.is-submitted,
+.fungible-pool .fp-chip-status.is-pending,
+.fungible-pool .fp-chip-status.is-awaiting_rollup {
+  color: #ffe6a8;
+  border-color: rgba(240, 198, 116, 0.45);
+}
+@media (prefers-reduced-motion: reduce) {
+  .fungible-pool .fp-swap-flip.is-spinning > button svg,
+  .fungible-pool .fp-swap.is-flipping .fp-swap-leg {
+    animation: none;
+  }
 }

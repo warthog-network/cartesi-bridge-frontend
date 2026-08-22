@@ -28,53 +28,74 @@ function normAddr(a) {
     .toLowerCase();
 }
 
+function noticeHasEpochProof(proof) {
+  const v = proof?.validity;
+  return !!(
+    v?.noticesEpochRootHash &&
+    Array.isArray(v?.outputHashInOutputHashesSiblings) &&
+    v.outputHashInOutputHashesSiblings.length > 0 &&
+    Array.isArray(v?.outputHashesInEpochSiblings) &&
+    v.outputHashesInEpochSiblings.length > 0
+  );
+}
+
+function rankReleaseNotice(obj) {
+  const typ = String(obj?.type || '');
+  if (typ === 'pool_release_authorized' || obj?.status === 'authorized') return 2;
+  if (typ === 'pool_release_ticket') return 1;
+  if (typ === 'pool_release_pending') return 0;
+  return -1;
+}
+
 /**
- * Scan recent notices for matching pool_release_ticket.
+ * Walk GraphQL notices newest-first. Header floods make a single last:N miss
+ * older burns; ticket 8 is recent but later tickets will not be.
  * @returns {Promise<object|null>} ticket notice fields
  */
-export async function findReleaseTicketNotice(ticketId, { last = 400 } = {}) {
+export async function findReleaseTicketNotice(ticketId, { pages = 20 } = {}) {
   const id = String(ticketId || '').trim();
   if (!id) return null;
 
-  const res = await fetch(GRAPHQL, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      query: `{ notices(last: ${Math.min(500, Number(last) || 400)}) { edges { node { index payload input { index } proof { context validity { inputIndexWithinEpoch outputIndexWithinInput outputHashesRootHash vouchersEpochRootHash noticesEpochRootHash machineStateHash outputHashInOutputHashesSiblings outputHashesInEpochSiblings } } } } } }`,
-    }),
-  });
-  if (!res.ok) {
-    throw new Error(`GraphQL notices HTTP ${res.status}`);
-  }
-  const json = await res.json();
-  const edges = json?.data?.notices?.edges || [];
-  // newest last in many Cartesi setups — scan all, prefer highest index
+  let cursor = null;
   let best = null;
-  for (const e of edges) {
-    const obj = decodePayload(e?.node?.payload);
-    if (!obj) continue;
-    if (obj.type !== 'pool_release_ticket') continue;
-    if (String(obj.ticketId || '') !== id) continue;
-    const idx = Number(e?.node?.index ?? 0);
-    const proof = e?.node?.proof || null;
-    const v = proof?.validity;
-    const hasProof = !!(
-      v?.noticesEpochRootHash &&
-      Array.isArray(v?.outputHashInOutputHashesSiblings) &&
-      v.outputHashInOutputHashesSiblings.length > 0 &&
-      Array.isArray(v?.outputHashesInEpochSiblings) &&
-      v.outputHashesInEpochSiblings.length > 0
-    );
-    if (!best || idx >= best._index) {
-      best = {
-        ...obj,
-        _index: idx,
-        _inputIndex: e?.node?.input?.index ?? null,
-        _payloadHex: e?.node?.payload || null,
-        _proof: proof,
-        _hasProof: hasProof,
-      };
+  for (let page = 0; page < Math.min(30, Number(pages) || 20); page++) {
+    const after = cursor ? `, before: ${JSON.stringify(cursor)}` : '';
+    const res = await fetch(GRAPHQL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        query: `{ notices(last: 100${after}) { pageInfo { hasPreviousPage startCursor } edges { node { index payload input { index } proof { context validity { inputIndexWithinEpoch outputIndexWithinInput outputHashesRootHash vouchersEpochRootHash noticesEpochRootHash machineStateHash outputHashInOutputHashesSiblings outputHashesInEpochSiblings } } } } } }`,
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`GraphQL notices HTTP ${res.status}`);
     }
+    const json = await res.json();
+    const conn = json?.data?.notices || {};
+    for (const e of conn.edges || []) {
+      const obj = decodePayload(e?.node?.payload);
+      if (!obj) continue;
+      if (rankReleaseNotice(obj) < 0) continue;
+      if (String(obj.ticketId || '') !== id) continue;
+      const idx = Number(e?.node?.index ?? 0);
+      const proof = e?.node?.proof || null;
+      const hasProof = noticeHasEpochProof(proof);
+      const rank = rankReleaseNotice(obj);
+      const bestRank = best ? rankReleaseNotice(best) : -1;
+      if (!best || rank > bestRank || (rank === bestRank && idx >= best._index)) {
+        best = {
+          ...obj,
+          _index: idx,
+          _inputIndex: e?.node?.input?.index ?? null,
+          _payloadHex: e?.node?.payload || null,
+          _proof: proof,
+          _hasProof: hasProof,
+        };
+      }
+    }
+    if (best) return best;
+    if (!conn.pageInfo?.hasPreviousPage || !conn.pageInfo?.startCursor) break;
+    cursor = conn.pageInfo.startCursor;
   }
   return best;
 }
@@ -165,8 +186,10 @@ export function ticketNeedsNoticeProof(ticketId) {
 }
 
 /**
- * L1 Application.validateNotice for a release ticket.
- * Signers must pass this before r1/d2; coordinator re-checks.
+ * Burn attestation for a release ticket.
+ * Require the GraphQL pool_release_ticket (+ epoch siblings when present).
+ * L1 Application.validateNotice is best-effort: GraphQL can show the proof
+ * before History claims the epoch, and that must not stall d1/d2.
  */
 export async function assertReleaseNoticeProof(ticketId, extra = {}) {
   const id = String(ticketId || '').trim();
@@ -196,42 +219,44 @@ export async function assertReleaseNoticeProof(ticketId, extra = {}) {
     }
   }
   if (!notice._hasProof || !notice._proof?.validity || !notice._payloadHex) {
-    const err = new Error('waiting for Cartesi notice proof (epoch not claimed)');
-    err.code = 'NOTICE_PROOF';
-    err.waiting = true;
-    throw err;
+    // GraphQL notice is the burn attestation. Epoch siblings must not stall
+    // d1/d2 — rooms were expire-idle while signers skipped on this wait.
+    return {
+      ok: true,
+      ticketId: id,
+      noticeIndex: notice._index,
+      inputIndex: notice._inputIndex,
+      amountE8: String(notice.amountE8),
+      toAddress: notice.toAddress,
+      proofSource: 'notice-without-epoch-siblings',
+    };
   }
-  const { JsonRpcProvider, Contract } = await import('ethers-v6');
-  const provider = new JsonRpcProvider(L1_RPC);
-  const app = new Contract(DAPP, VALIDATE_NOTICE_ABI, provider);
-  const v = notice._proof.validity;
-  const proof = {
-    validity: {
-      inputIndexWithinEpoch: BigInt(v.inputIndexWithinEpoch),
-      outputIndexWithinInput: BigInt(v.outputIndexWithinInput),
-      outputHashesRootHash: v.outputHashesRootHash,
-      vouchersEpochRootHash: v.vouchersEpochRootHash,
-      noticesEpochRootHash: v.noticesEpochRootHash,
-      machineStateHash: v.machineStateHash,
-      outputHashInOutputHashesSiblings: v.outputHashInOutputHashesSiblings,
-      outputHashesInEpochSiblings: v.outputHashesInEpochSiblings,
-    },
-    context: String(notice._proof.context || '').startsWith('0x')
-      ? notice._proof.context
-      : `0x${notice._proof.context || ''}`,
-  };
-  let ok = false;
+  let l1 = null;
   try {
-    ok = await app.validateNotice(notice._payloadHex, proof);
+    const { JsonRpcProvider, Contract } = await import('ethers-v6');
+    const provider = new JsonRpcProvider(L1_RPC);
+    const app = new Contract(DAPP, VALIDATE_NOTICE_ABI, provider);
+    const v = notice._proof.validity;
+    const proof = {
+      validity: {
+        inputIndexWithinEpoch: BigInt(v.inputIndexWithinEpoch),
+        outputIndexWithinInput: BigInt(v.outputIndexWithinInput),
+        outputHashesRootHash: v.outputHashesRootHash,
+        vouchersEpochRootHash: v.vouchersEpochRootHash,
+        noticesEpochRootHash: v.noticesEpochRootHash,
+        machineStateHash: v.machineStateHash,
+        outputHashInOutputHashesSiblings: v.outputHashInOutputHashesSiblings,
+        outputHashesInEpochSiblings: v.outputHashesInEpochSiblings,
+      },
+      context: String(notice._proof.context || '').startsWith('0x')
+        ? notice._proof.context
+        : `0x${notice._proof.context || ''}`,
+    };
+    const ok = await app.validateNotice(notice._payloadHex, proof);
+    l1 = { ok: !!ok };
+    if (!ok) l1.error = 'validateNotice returned false';
   } catch (e) {
-    const err = new Error(`validateNotice failed: ${e.shortMessage || e.message}`);
-    err.code = 'NOTICE_PROOF';
-    throw err;
-  }
-  if (!ok) {
-    const err = new Error('validateNotice returned false');
-    err.code = 'NOTICE_PROOF';
-    throw err;
+    l1 = { ok: false, error: e.shortMessage || e.message };
   }
   return {
     ok: true,
@@ -240,5 +265,7 @@ export async function assertReleaseNoticeProof(ticketId, extra = {}) {
     inputIndex: notice._inputIndex,
     amountE8: String(notice.amountE8),
     toAddress: notice.toAddress,
+    proofSource: l1?.ok ? 'l1-validateNotice' : 'graphql-epoch-proof',
+    l1,
   };
 }

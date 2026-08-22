@@ -398,6 +398,12 @@ export async function birthClientSeat({
   const dapp = loadDapp();
   if (!dapp) throw new Error('3P pool not configured');
   dapp.seats = dapp.seats || { 1: null, 2: null };
+  const existingP = compactPoint(dapp.seats?.[r]?.P || dapp.seats?.[String(r)]?.P || '');
+  if (existingP && existingP !== compressed) {
+    throw new Error(
+      `birth denied — d${r} already born on this Pdapp; claim_born the live P (do not reuse another Q's cache)`,
+    );
+  }
   if (r === 1) {
     if (!encD1 || !paillierN || !paillierG) {
       throw new Error('d1 birth needs Enc(d1) + paillierN + paillierG');
@@ -991,6 +997,7 @@ export function rememberInspectTickets(tickets) {
   for (const t of tickets || []) {
     const id = String(t?.ticketId || '').trim();
     if (!id || ticketIsPaid(id, { amountE8: t.amountE8 })) continue;
+    if (!ticketOnLiveQ(t, { poolAddress: t.poolAddress })) continue;
     map.set(id, {
       ticketId: id,
       amountE8: t.amountE8 != null ? String(t.amountE8) : null,
@@ -998,6 +1005,9 @@ export function rememberInspectTickets(tickets) {
         ? String(t.toAddress).replace(/^0x/i, '').toLowerCase()
         : null,
       status: t.status || 'authorized',
+      poolAddress: t.poolAddress
+        ? String(t.poolAddress).replace(/^0x/i, '').toLowerCase()
+        : null,
     });
   }
   inspectRoomHints = map;
@@ -1014,7 +1024,7 @@ const ORBIT_PATH =
 
 const LEASE_MS = Number(env('POOL_3P_LEASE_MS', '900000')) || 900000;
 const ORBIT_LIVE_MS = Number(env('POOL_3P_ORBIT_LIVE_MS', '20000')) || 20000;
-const SEAT_IDLE_MS = Number(env('POOL_3P_SEAT_IDLE_MS', '300000')) || 300000;
+const SEAT_IDLE_MS = Number(env('POOL_3P_SEAT_IDLE_MS', '35000')) || 35000;
 const ORBIT_MIN = Number(env('POOL_3P_ORBIT_MIN', '2')) || 2;
 /** Close a hung user room so auto-rotate can proceed. Idle = no session write. */
 const ROOM_IDLE_MS = Number(env('POOL_3P_ROOM_IDLE_MS', '480000')) || 480000;
@@ -1093,6 +1103,68 @@ function holderStale(rec, now = nowMs()) {
   const seen = Date.parse(rec.lastSeen || rec.assignedAt || 0);
   if (!Number.isFinite(seen)) return true;
   return now - seen > SEAT_IDLE_MS;
+}
+
+function liveSeatP(role) {
+  const dapp = loadDapp();
+  const r = Number(role);
+  return compactPoint(
+    dapp?.seats?.[String(r)]?.P ||
+      dapp?.seats?.[r]?.P ||
+      dapp?.seal?.[r === 1 ? 'P1' : 'P2'] ||
+      '',
+  );
+}
+
+/** Born seats whose holder is missing or off orbit — pickup is claim_born, not a new birth. */
+function recoverableBornSeats(live = liveOrbitMembers()) {
+  const dapp = loadDapp();
+  const out = {};
+  if (!(dapp?.clientBorn || clientBornOn())) return out;
+  for (const r of ['1', '2']) {
+    const born = dapp.seats?.[r] || dapp.seats?.[Number(r)];
+    const P = born?.P || (r === '1' ? dapp.seal?.P1 : dapp.seal?.P2);
+    if (!P) continue;
+    const occupant = loadHolders().roles?.[r]?.signerId || null;
+    if (occupant && live.includes(occupant)) continue;
+    out[r] = {
+      expectedP: P,
+      bornSignerId: born?.signerId || null,
+      ghost: !!occupant,
+    };
+  }
+  return out;
+}
+
+function recoverVacantView(vacantBorn = recoverableBornSeats()) {
+  return {
+    recoverVacant: vacantBorn['1'] ? 1 : vacantBorn['2'] ? 2 : 0,
+    expectedP: vacantBorn['1']?.expectedP || vacantBorn['2']?.expectedP || null,
+    bornSignerId: vacantBorn['1']?.bornSignerId || vacantBorn['2']?.bornSignerId || null,
+    vacantBorn,
+  };
+}
+
+async function pruneStalePacks() {
+  let p;
+  try {
+    p = loadPreshare();
+  } catch {
+    return;
+  }
+  if (!p?.packs) return;
+  let changed = false;
+  for (const r of ['1', '2']) {
+    const pack = p.packs[r];
+    if (!pack) continue;
+    const liveP = liveSeatP(Number(r));
+    const packedP = compactPoint(pack.Pnext);
+    if (liveP && packedP && packedP !== liveP) {
+      delete p.packs[r];
+      changed = true;
+    }
+  }
+  if (changed) await savePreshare(p);
 }
 
 function readSignerFile(role) {
@@ -1273,31 +1345,60 @@ function signInFlight() {
   return listOpenPool3pTickets().length > 0;
 }
 
-/** True while any 3P room is open — freeze live seats + next-Q birth. */
+function normPoolAddr(v) {
+  return String(v || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+}
+
+function livePoolAddress() {
+  const d = loadDapp();
+  return normPoolAddr(d?.address || d?.seal?.address);
+}
+
+function ticketPoolAddr(t, extra = {}) {
+  return normPoolAddr(
+    extra.poolAddress ||
+      t?.poolAddress ||
+      t?.prep?.fromAddress ||
+      t?.prep?.poolAddress ||
+      t?.fromAddress,
+  );
+}
+
+/** Leftover-Q tickets must not freeze a new unsealed / different live dapp. */
+function ticketOnLiveQ(t, extra = {}) {
+  const live = livePoolAddress();
+  if (!live) return false;
+  const addr = ticketPoolAddr(t, extra);
+  if (!addr) return true;
+  return addr === live;
+}
+
+/** True while a 3P room for the *live* Q is open — freeze next-Q birth only. */
 export function holdersFrozen() {
   if (listOpenPool3pTickets().length > 0) return true;
+  const live = livePoolAddress();
+  if (!live) return false;
   for (const hint of inspectRoomHints.values()) {
     const id = String(hint?.ticketId || '');
-    if (id && !ticketIsPaid(id, { amountE8: hint.amountE8 })) return true;
+    if (!id || !ticketOnLiveQ(hint)) continue;
+    if (!ticketIsPaid(id, { amountE8: hint.amountE8 })) return true;
   }
   return false;
 }
 
 export async function maybeAbandonStaleSeats() {
-  if (signInFlight() || holdersFrozen()) return [];
+  // Open rooms must not freeze pickup. A dead d2 seat with a live ticket is
+  // the jam: idle-drop so another tab can claim_born and finish Lindell.
+  await pruneStalePacks().catch(() => null);
   const h = loadHolders();
+  const live = liveOrbitMembers();
   const dropped = [];
   for (const r of [1, 2]) {
     const rec = h.roles?.[String(r)];
     if (!rec?.signerId || !holderStale(rec)) continue;
-    if (r === 1) {
-      try {
-        const p = loadPreshare();
-        if (!p.packs?.['1']?.shares?.length) continue;
-      } catch {
-        continue;
-      }
-    }
+    if (live.includes(rec.signerId)) continue;
     dropped.push(await refreshSeat(r, 'abandon-idle'));
   }
   return dropped;
@@ -1382,14 +1483,20 @@ export function packSnapshot() {
     const holder = r === '1' ? h1 : h2;
     const other = r === '1' ? h2 : h1;
     const need = live.filter((id) => id && id !== holder && id !== other);
-    if (!pack) {
+    const liveP = liveSeatP(Number(r));
+    const packedP = compactPoint(pack?.Pnext);
+    const stale = !!(liveP && packedP && packedP !== liveP);
+    if (!pack || stale) {
       out[r] = {
         ready: false,
-        from: null,
+        stale,
+        from: pack?.from || null,
+        Pnext: pack?.Pnext || null,
+        liveP: liveP || null,
         recipients: [],
         liveCovered: 0,
         liveNeed: need.length,
-        at: null,
+        at: pack?.at || null,
       };
       continue;
     }
@@ -1413,27 +1520,30 @@ export async function heartbeatPool3p({ signerId, seatEpoch } = {}) {
   await maybeAbandonStaleSeats();
   await touchOrbit(sid);
 
-  const h = loadHolders();
   let role = 0;
+  const nowIso = new Date().toISOString();
   for (const r of ['1', '2']) {
-    if (h.roles?.[r]?.signerId === sid) {
-      h.roles[r].lastSeen = new Date().toISOString();
+    const hh = loadHolders();
+    if (hh.roles?.[r]?.signerId === sid) {
+      hh.roles[r].lastSeen = nowIso;
+      await saveHolders(hh);
       role = Number(r);
     }
   }
-  await saveHolders(h);
 
-  // Vacant / VPS-only claim. Do not kick a live browser. Deliver share in-band
-  // so the client never needs a page refresh.
+  // Vacant / ghost pickup. Open rooms must not block claim_born — the room
+  // is waiting on the missing holder. Do not birth a new share during a room
+  // (enroll claim() still refuses unborn seats while frozen).
   let share = null;
   let justClaimed = false;
-  // Vacant seats can be claimed when idle. Never steal a seat during a room.
-  if (role === 0 && !holdersFrozen()) {
+  if (role === 0) {
     const claimed = await enrollPool3pSigner({ signerId: sid });
     if (claimed && !claimed.waitlist && (claimed.role === 1 || claimed.role === 2)) {
       role = Number(claimed.role);
       share = claimed;
       justClaimed = true;
+    } else if (claimed?.recoverVacant || claimed?.waitlist) {
+      share = claimed;
     }
   }
 
@@ -1447,6 +1557,7 @@ export async function heartbeatPool3p({ signerId, seatEpoch } = {}) {
     share = enrollPayloadForRole(role, sid, !justClaimed);
     shareUpdated = epochChanged || justClaimed;
   }
+  const recover = recoverVacantView();
 
   return {
     ok: true,
@@ -1465,8 +1576,11 @@ export async function heartbeatPool3p({ signerId, seatEpoch } = {}) {
     open: listOpenPool3pTickets(),
     clientBorn: !!(dapp?.clientBorn || clientBornOn()),
     address: dapp?.address || null,
+    Pdapp: dapp?.Pdapp || dapp?.seal?.Pdapp || null,
+    needBirth: !!(share?.needBirth),
     seal: dapp?.seal || null,
     packs: packSnapshot(),
+    ...recover,
   };
 }
 
@@ -1575,8 +1689,9 @@ function enrollPayloadForRole(role, signerId, already) {
       already: !!already,
       poolAddress: dapp?.address || null,
       publicKey: dapp?.publicKey || null,
-      Pdapp: dapp?.Pdapp || null,
+      Pdapp: dapp?.Pdapp || dapp?.seal?.Pdapp || null,
       P: seat?.P || null,
+      expectedP: seat?.P || (role === 1 ? dapp?.seal?.P1 : dapp?.seal?.P2) || null,
       seatEpoch: Number(dapp?.seatEpoch || 0),
       seal: dapp?.seal || null,
       leaseMs: LEASE_MS,
@@ -1664,23 +1779,28 @@ export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
     for (const r of ['1', '2']) {
       const bornSid = dapp.seats?.[r]?.signerId || dapp.seats?.[Number(r)]?.signerId;
       if (bornSid && bornSid === sid) {
+        const hh = loadHolders();
+        hh.roles = hh.roles || {};
         const other = r === '1' ? '2' : '1';
-        if (h.roles[other]?.signerId === sid) delete h.roles[other];
-        h.roles[r] = {
+        if (hh.roles[other]?.signerId === sid) delete hh.roles[other];
+        hh.roles[r] = {
           signerId: sid,
-          assignedAt: h.roles[r]?.assignedAt || ts,
+          assignedAt: hh.roles[r]?.assignedAt || ts,
           lastSeen: ts,
         };
-        await saveHolders(h);
+        hh.address = dapp.address;
+        await saveHolders(hh);
         return enrollPayloadForRole(Number(r), sid, true);
       }
     }
   }
 
   for (const r of ['1', '2']) {
-    if (h.roles[r]?.signerId === sid) {
-      h.roles[r].lastSeen = ts;
-      await saveHolders(h);
+    if (loadHolders().roles?.[r]?.signerId === sid) {
+      const hh = loadHolders();
+      hh.roles[r].lastSeen = ts;
+      hh.address = dapp.address;
+      await saveHolders(hh);
       return enrollPayloadForRole(Number(r), sid, true);
     }
   }
@@ -1699,8 +1819,7 @@ export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
   }
 
   async function claim(role) {
-    if (holdersFrozen()) return null;
-    const rec = h.roles[String(role)];
+    const rec = loadHolders().roles?.[String(role)];
     const occupant = rec?.signerId;
     const bornSid =
       dapp.seats?.[String(role)]?.signerId || dapp.seats?.[role]?.signerId || null;
@@ -1722,6 +1841,7 @@ export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
     if (clientBorn && born && bornSid && sid !== bornSid) {
       return null;
     }
+    if (holdersFrozen()) return null;
     const canPreempt = occupant && isVpsFallbackId(occupant) && !vpsOnly;
     const vacant = !occupant;
     if (!vacant && !canPreempt) return null;
@@ -1740,16 +1860,8 @@ export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
   const c2 = await claim(2);
   if (c2) return c2;
 
-  const vacantBorn = {};
-  for (const r of ['1', '2']) {
-    const born = dapp.seats?.[r];
-    if ((dapp.clientBorn || clientBornOn()) && born?.P && !loadHolders().roles?.[r]?.signerId) {
-      vacantBorn[r] = {
-        expectedP: born.P,
-        bornSignerId: born.signerId || null,
-      };
-    }
-  }
+  const vacantBorn = recoverableBornSeats();
+  const recover = recoverVacantView(vacantBorn);
   return {
     scheme: POOL3P_SCHEME,
     role: 0,
@@ -1757,21 +1869,25 @@ export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
     signerId: sid,
     poolAddress: dapp.address,
     publicKey: dapp.publicKey,
+    Pdapp: dapp.Pdapp || dapp.seal?.Pdapp || null,
     seal: dapp.seal || null,
     holders: {
       1: loadHolders().roles?.['1']?.signerId || null,
       2: loadHolders().roles?.['2']?.signerId || null,
     },
-    recoverVacant: vacantBorn['1'] ? 1 : vacantBorn['2'] ? 2 : 0,
-    expectedP: vacantBorn['1']?.expectedP || vacantBorn['2']?.expectedP || null,
-    bornSignerId: vacantBorn['1']?.bornSignerId || vacantBorn['2']?.bornSignerId || null,
-    vacantBorn,
+    ...recover,
     orbit: orbitSnapshot(),
     seatEpoch: Number(dapp.seatEpoch || 0),
     clientBorn: true,
-    message: vacantBorn['1']
-      ? 'd1 is already born. This refresh made a new orbit id. Restore the original d1 profile (same browser that first created the pool) — do not birth a new share.'
-      : 'Orbit voter only. 3P seats d1/d2 are leased.',
+    message: vacantBorn['2']
+      ? vacantBorn['2'].ghost
+        ? 'd2 holder is off orbit. Claim the live P2 (cache or pack). Do not birth a new d2.'
+        : 'd2 is born but the lease is empty. Restore the original d2 tab (or pack-rebuild). Do not birth a new d2.'
+      : vacantBorn['1']
+        ? vacantBorn['1'].ghost
+          ? 'd1 holder is off orbit. Claim the live P1 (cache or pack). Do not birth a new d1.'
+          : 'd1 is already born. This refresh made a new orbit id. Restore the original d1 profile — do not birth a new share.'
+        : 'Orbit voter only. 3P seats d1/d2 are leased.',
   };
 }
 
@@ -1804,15 +1920,9 @@ export async function claimBornSeat({ signerId, role, shareHex, pok }) {
   const h = loadHolders();
   h.roles = h.roles || {};
   const occupant = h.roles[String(r)]?.signerId || null;
-  const bornSid =
-    dapp.seats?.[String(r)]?.signerId || dapp.seats?.[r]?.signerId || null;
-  if (r === 1 && bornSid && bornSid !== sid && liveOrbitMembers().includes(bornSid)) {
-    throw new Error('claim denied — d1 dealer is live; do not steal the seat');
-  }
-  if (holdersFrozen() && occupant && occupant !== sid) {
-    if (sid !== bornSid) {
-      throw new Error('claim denied — user 3P room is open; live seats are frozen');
-    }
+  const occupantLive = !!(occupant && liveOrbitMembers().includes(occupant));
+  if (occupantLive && occupant !== sid) {
+    throw new Error(`claim denied — current d${r} holder is live`);
   }
   h.roles[String(r)] = { signerId: sid, assignedAt: ts, lastSeen: ts, claimedBorn: true };
   await saveHolders(h);
@@ -1829,7 +1939,7 @@ export function publicStatus() {
     mode: pool3pOn(),
     scheme: d.scheme,
     address: d.address,
-    legacyAddress: '966d1012941b1fb41d4fff2cadefca7115237dc1818a7cd7',
+    legacyAddress: d.legacyAddress || '5a13ece9ba0e3f31fd1e6028a8330aba98f05bed714ac229',
     signer1Id: d.signer1Id,
     signer2Id: d.signer2Id,
     holder1: h.roles?.['1']?.signerId || null,
@@ -1872,6 +1982,7 @@ export function publicStatus() {
     rotation: null,
     d1Live: !!(currentHolderId(1) && liveOrbitMembers().includes(currentHolderId(1))),
     d2Live: !!(currentHolderId(2) && liveOrbitMembers().includes(currentHolderId(2))),
+    ...recoverVacantView(),
     hasDappShare: !!d.dappShareHex,
     hasCkeyD1: !!d.ckeyD1,
     hasD1: false,
@@ -2424,6 +2535,7 @@ export function listOpenPool3pTickets() {
       return;
     }
     if (!amountE8 || !toAddress) return;
+    if (!ticketOnLiveQ(t, { poolAddress: t.poolAddress || hint?.poolAddress })) return;
     seen.add(id);
     const waitingOn = [];
     if (ticketNeedsNoticeProof(id) && !t.noticeProofOk) waitingOn.push('notice-proof');
@@ -2588,6 +2700,7 @@ export async function reopenAbandonedAuthorizedTickets(tickets = []) {
     const id = String(t?.ticketId || '').trim();
     if (!id || isRotateTicketId(id)) continue;
     if (String(t.status || 'authorized') !== 'authorized') continue;
+    if (!ticketOnLiveQ(t, { poolAddress: t.poolAddress })) continue;
     if (ticketIsPaid(id, { amountE8: t.amountE8 })) continue;
     let sess = null;
     try {
@@ -2604,6 +2717,9 @@ export async function reopenAbandonedAuthorizedTickets(tickets = []) {
     ) {
       continue;
     }
+    // Don't reopen a hung ticket until both spend holders are live (or a
+    // ghost seat can be claimed). Reopening used to re-freeze idle-drop.
+    if (!spendHoldersLive() && !recoverVacantView().recoverVacant) continue;
     const r = await openPool3pPayout({
       ticketId: id,
       toAddress: t.toAddress,

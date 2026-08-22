@@ -664,7 +664,10 @@ export async function POST({ request }) {
     if (action === 'pool3p_submit') {
       const dapp = loadPool3pDapp();
       if (!dapp) return json(400, { error: '3P pool not configured' });
-      const already = paidRecordFor(body.ticketId, { amountE8: body.amountE8 });
+      const already = paidRecordFor(body.ticketId, {
+        amountE8: body.amountE8,
+        toAddress: body.toAddress,
+      });
       if (already) return json(200, { ok: true, alreadyPaid: true, ticketId: body.ticketId, ...already });
       const oq = orbitQuorumInfo(body.ticketId);
       if (!oq.ok) return json(403, { error: oq.message, orbit: oq });

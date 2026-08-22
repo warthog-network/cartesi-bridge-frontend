@@ -17,6 +17,8 @@ import {
   Layers,
   Zap,
   ArrowDownUp,
+  Copy,
+  Check,
 } from 'lucide-react';
 import { toast } from 'react-hot-toast';
 import { ethers } from 'ethers-v6';
@@ -80,6 +82,23 @@ function humanFromE8(raw) {
     return frac ? `${whole}.${frac}` : whole.toString();
   } catch {
     return '0';
+  }
+}
+
+function shortHex(v, head = 8, tail = 6) {
+  const s = String(v || '').replace(/^0x/i, '');
+  if (s.length <= head + tail) return s;
+  return `${s.slice(0, head)}…${s.slice(-tail)}`;
+}
+
+async function copyText(value) {
+  const s = String(value || '');
+  if (!s) return false;
+  try {
+    await navigator.clipboard.writeText(s);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -206,7 +225,11 @@ async function ensureWartOwnerBind({
   }
   if (check.status === 'match') return check;
   if (!signWartMessage) {
-    throw new Error('Unlock Warthog to bind this wallet to MetaMask before sending');
+    throw new Error(
+      from
+        ? 'Warthog is unlocked but cannot sign the bind yet — refresh the page, then retry the swap (you will sign once in Warthog and once in MetaMask)'
+        : 'Unlock Warthog to bind this wallet to MetaMask before sending',
+    );
   }
   if (!signer?.signMessage) {
     throw new Error(
@@ -282,14 +305,38 @@ function toastWartSent(msg) {
 }
 
 function toastWartConfirmed(msg) {
-  return toast.success(msg, { id: 'pool', duration: 12000 });
+  return toast.success(msg, {
+    id: 'pool',
+    duration: 12000,
+    iconTheme: { primary: '#22c55e', secondary: '#052e16' },
+    style: {
+      background: 'rgba(6, 46, 22, 0.96)',
+      color: '#bbf7d0',
+      border: '1px solid #22c55e',
+    },
+  });
 }
 
 /**
  * Broadcast tx hash only. On Warthog the signed hashHex equals the txid, but
  * prep.hashHex exists before submit — do not treat that as a send by itself.
  */
-function extractBroadcastTx(st) {
+function payoutMatchesTicket(proof, ticket) {
+  if (!proof || !ticket) return true;
+  const to = String(proof.toAddress || proof.transaction?.toAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  const want = String(ticket.toAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (want && to && to !== want) return false;
+  const amt = Number(proof.amountE8 ?? proof.transaction?.amountE8 ?? 0);
+  const wantAmt = Number(ticket.amountE8 ?? 0);
+  if (wantAmt > 0 && amt > 0 && amt !== wantAmt) return false;
+  return true;
+}
+
+function extractBroadcastTx(st, ticket) {
   if (!st) return null;
   const status = String(st.status || '').toLowerCase();
   const paid =
@@ -299,8 +346,9 @@ function extractBroadcastTx(st) {
     st.payout?.ok === true;
   const raw = st.txHash || st.payout?.txHash || null;
   const hex = raw ? String(raw).replace(/^0x/i, '').toLowerCase() : '';
-  if (WART_TX_HASH_RE.test(hex) && (paid || st.payout?.txHash)) return hex;
-  return null;
+  if (!WART_TX_HASH_RE.test(hex) || !(paid || st.payout?.txHash)) return null;
+  if (ticket && !payoutMatchesTicket(st.payout || st, ticket)) return null;
+  return hex;
 }
 
 async function lookupPayoutTx(txHash) {
@@ -319,6 +367,8 @@ async function lookupPayoutTx(txHash) {
     txHash: tx.txHash || h,
     confirmations: Number(tx.confirmations ?? 0),
     blockHeight: tx.blockHeight ?? null,
+    toAddress: tx.toAddress || null,
+    amountE8: tx.amountE8 ?? null,
   };
 }
 
@@ -1006,6 +1056,8 @@ export default function FungiblePool({
   const [resumeTxHash, setResumeTxHash] = useState('');
   /** Sticky action line — toasts expire; this does not. */
   const [actionStatus, setActionStatus] = useState(null);
+  const [copiedKey, setCopiedKey] = useState('');
+  const [refreshedAt, setRefreshedAt] = useState(null);
   /** Host-queue WART→L1 bind. Conflict means do not send WART. */
   const [wartBind, setWartBind] = useState(null);
   /** Lab mode only when PUBLIC_POOL_LAB=1 or ?lab=1 — public demo hides it. */
@@ -1240,6 +1292,7 @@ export default function FungiblePool({
             recentTickets: json.recentTickets || [],
             source: 'rollup',
           });
+          setRefreshedAt(Date.now());
           return;
         }
       }
@@ -1276,6 +1329,7 @@ export default function FungiblePool({
         recentEvents: s.recentEvents,
         source: s.mode || 'api',
       });
+      setRefreshedAt(Date.now());
     } catch (e) {
       console.warn('[FungiblePool] api', e?.message || e);
     }
@@ -1323,7 +1377,7 @@ export default function FungiblePool({
     return last || wartBridgeApi.getWartTxProof(txHash);
   };
 
-  const pollPayoutConfirm = async (txHash, { timeoutMs = 180000 } = {}) => {
+  const pollPayoutConfirm = async (txHash, { timeoutMs = 180000, expect } = {}) => {
     const deadline = Date.now() + timeoutMs;
     let last = null;
     while (Date.now() < deadline) {
@@ -1336,46 +1390,66 @@ export default function FungiblePool({
               proof?.confirmations ?? proof?.transaction?.confirmations ?? 0,
             ),
             blockHeight: proof?.transaction?.blockHeight ?? null,
+            toAddress: proof?.transaction?.toAddress || null,
+            amountE8: proof?.transaction?.amountE8 ?? null,
           };
         } else {
           last = await lookupPayoutTx(txHash);
         }
-        if (Number(last?.confirmations || 0) >= 1) return last;
+        if (expect && last && !payoutMatchesTicket(last, expect)) {
+          last = { ...last, confirmations: 0, mismatch: true };
+        } else if (Number(last?.confirmations || 0) >= 1) {
+          return last;
+        }
       } catch {
         try {
           last = await lookupPayoutTx(txHash);
-          if (Number(last?.confirmations || 0) >= 1) return last;
+          if (expect && last && !payoutMatchesTicket(last, expect)) {
+            last = { ...last, confirmations: 0, mismatch: true };
+          } else if (Number(last?.confirmations || 0) >= 1) {
+            return last;
+          }
         } catch {
           /* retry */
         }
       }
       await sleep(3000);
     }
-    if (Number(last?.confirmations || 0) < 1) {
+    if (Number(last?.confirmations || 0) < 1 && !last?.mismatch) {
       last = (await lookupPayoutTx(txHash).catch(() => null)) || last;
+      if (expect && last && !payoutMatchesTicket(last, expect)) {
+        last = { ...last, confirmations: 0, mismatch: true };
+      }
     }
     return last;
   };
 
-  const finishPayoutToast = async (txHash, label) => {
+  const finishPayoutToast = async (txHash, label, expect) => {
     const amt = label ? `${label} ` : '';
     const hash = WART_TX_HASH_RE.test(String(txHash || '').replace(/^0x/i, ''))
       ? String(txHash).replace(/^0x/i, '').toLowerCase()
       : null;
     if (!hash) {
-      toastWartConfirmed(`Released ${amt}WART`);
-      return;
+      toastWartSent(`Released ${amt}WART — waiting for broadcast hash…`);
+      return { confirmations: 0, missingHash: true };
     }
     toastWartSent(`Sent ${amt}WART · ${shortTx(hash)} — waiting for block…`);
-    const proof = await pollPayoutConfirm(hash);
+    const proof = await pollPayoutConfirm(hash, { expect });
+    if (proof?.mismatch) {
+      toastWartSent(
+        `Coordinator cited a previous tx for this ticket id — waiting for this ${amt}payout. Do not retry.`,
+      );
+      return { confirmations: 0, mismatch: true, txHash: hash };
+    }
     const conf = Number(proof?.confirmations || 0);
     if (conf >= 1) {
       toastWartConfirmed(`Confirmed ${amt}WART · ${shortTx(hash)} · ${conf} conf`);
-    } else {
-      toastWartSent(
-        `Sent ${amt}WART · ${shortTx(hash)} — still unconfirmed. Do not retry.`,
-      );
+      return { confirmations: conf, txHash: hash, ...proof };
     }
+    toastWartSent(
+      `Sent ${amt}WART · ${shortTx(hash)} — still unconfirmed. Do not retry.`,
+    );
+    return { confirmations: 0, txHash: hash, ...proof };
   };
 
   /** Enqueue server credit + local pending (relayer posts InputBox). */
@@ -2634,10 +2708,10 @@ export default function FungiblePool({
     await liveMint();
 
     const minInputIndex = await maxOwnerVoucherInputIndex(owner);
-    toast.loading('Atomic: withdraw voucher…', { id: 'pool', duration: Infinity });
+    toast.loading('WART → wWART: withdraw voucher…', { id: 'pool', duration: Infinity });
     const w = await liveWithdraw({ silentSuccess: true, minInputIndex });
 
-    toast.loading('Atomic: execute voucher → MetaMask wWART…', {
+    toast.loading('WART → wWART: execute voucher…', {
       id: 'pool',
       duration: Infinity,
     });
@@ -2650,12 +2724,9 @@ export default function FungiblePool({
       });
       setActionStatus({
         kind: 'ok',
-        text: `Atomic WART → wWART ${amt} landed on MetaMask.`,
+        text: `WART → wWART ${amt} landed on MetaMask.`,
       });
-      toast.success(
-        `Atomic WART → wWART · execute ${String(hash).slice(0, 10)}…`,
-        { id: 'pool', duration: 10000 },
-      );
+      toast.success(`WART → wWART ${amt}`, { id: 'pool', duration: 10000 });
       onRefreshMmWwart?.();
     } catch (e) {
       throw new Error(
@@ -2689,7 +2760,7 @@ export default function FungiblePool({
     refreshFlows();
     setActionStatus({
       kind: 'info',
-      text: `Atomic wWART → WART ${amt} (portal + burn + 3P pay)…`,
+      text: `wWART → WART ${amt}…`,
     });
 
     await confirmStyled({
@@ -2714,7 +2785,7 @@ export default function FungiblePool({
     });
     await portalDepositPoolWwart(signer, amt);
 
-    toast.loading(`Atomic: burn ${amt} and 3P-pay WART…`, {
+    toast.loading(`wWART → WART: burn ${amt} and pay…`, {
       id: 'pool',
       duration: Infinity,
     });
@@ -2722,9 +2793,9 @@ export default function FungiblePool({
 
     setActionStatus({
       kind: 'ok',
-      text: `Atomic wWART → WART ${amt} submitted to ${String(to).slice(0, 12)}…`,
+      text: `wWART → WART ${amt} submitted to ${String(to).slice(0, 12)}…`,
     });
-    toast.success(`Atomic wWART → WART ${amt}`, { id: 'pool', duration: 10000 });
+    toast.success(`wWART → WART ${amt}`, { id: 'pool', duration: 10000 });
     onRefreshMmWwart?.();
   };
 
@@ -2751,25 +2822,32 @@ export default function FungiblePool({
       }),
     });
 
-    // Immediate single-key (toggle OFF) or already paid
-    if (pay.txHash || pay.alreadyPaid || pay.skipped || pay.mode === 'hot-wallet') {
-      if (pay.skipped) {
-        toast.success(`Payout skipped: ${pay.skipReason || 'policy'}`, {
-          id: 'pool',
-          duration: 10000,
-        });
-      } else {
-        await finishPayoutToast(
-          pay.txHash || pay.payout?.txHash,
-          pay.amountHuman || amtLabel,
-        );
-      }
+    const expect = { toAddress: to, amountE8: ticket.amountE8 };
+    const ticketId = pay.ticketId || ticket.ticketId;
+    const label = pay.amountHuman || amtLabel || humanFromE8(ticket.amountE8);
+    const finishThis = async (hash, extra = {}) => {
+      const done = await finishPayoutToast(hash, label, expect);
+      if (done?.mismatch || done?.missingHash) return null;
+      await refresh();
+      return { ok: true, ticketId, txHash: hash, ...extra, ...done };
+    };
+
+    if (pay.skipped) {
+      toast.success(`Payout skipped: ${pay.skipReason || 'policy'}`, {
+        id: 'pool',
+        duration: 10000,
+      });
       await refresh();
       return pay;
     }
 
+    const firstHash = extractBroadcastTx(pay, ticket);
+    if (firstHash && (pay.alreadyPaid || pay.mode === 'hot-wallet' || pay.txHash)) {
+      const finished = await finishThis(firstHash, pay);
+      if (finished) return finished;
+    }
+
     // Path A4: 3P Lindell — poll pool3p_ticket until paid
-    const ticketId = pay.ticketId || ticket.ticketId;
     if (pay.mode === 'pool-3p' || pay.custody === '3p-d1-d2') {
       toast.loading(`3P pool: waiting for d1 + d2 on ${ticketId}…`, { id: 'pool' });
       const deadline = Date.now() + 180000;
@@ -2787,26 +2865,37 @@ export default function FungiblePool({
           continue;
         }
         const status = String(st.status || '');
-        const realTx = extractBroadcastTx(st);
-        if (realTx || status === 'paid' || st.payout?.ok || st.alreadyPaid) {
-          const hash = realTx || st.txHash || st.payout?.txHash || null;
-          await finishPayoutToast(
-            hash,
-            amtLabel || humanFromE8(ticket.amountE8),
+        const realTx = extractBroadcastTx(st, ticket);
+        if (realTx) {
+          const finished = await finishThis(realTx, { mode: 'pool-3p', ...st });
+          if (finished) return finished;
+          continue;
+        }
+        if (status === 'paid' || st.payout?.ok || st.alreadyPaid) {
+          toast.loading(
+            `3P Lindell · ignored old ${ticketId} hash — waiting for this payout…`,
+            { id: 'pool' },
           );
-          await refresh();
-          return { ok: true, ticketId, mode: 'pool-3p', txHash: hash, ...st };
+          continue;
         }
         const wait = (st.waitingOn || []).join('+') || (status || 'signing');
-        const line = `3P Lindell · ${wait} · d1 ${st.haveR1 ? 'in' : '…'} · d2 ${st.haveD2 ? 'in' : '…'}`;
+        const d2Who = st.members?.d2?.signerId
+          ? `${String(st.members.d2.signerId).slice(0, 12)}…`
+          : 'no holder';
+        const line = `3P Lindell · ${wait} · d1 ${st.haveR1 ? 'in' : '…'} · d2 ${st.haveD2 ? 'in' : `… (${d2Who})`}`;
         if ((st.waitingOn || []).includes('notice-proof')) {
           toastWartSent(`${line} — waiting for Cartesi notice proof`);
+        } else if ((st.waitingOn || []).includes('d2-holder')) {
+          toast.loading(
+            `${line} — d2 vacant; reopen the original d2 tab (orbit extras cannot fill it)`,
+            { id: 'pool' },
+          );
         } else {
           toast.loading(line, { id: 'pool' });
         }
       }
       throw new Error(
-        `3P payout timeout for ${ticketId} — keep both browser d1 and d2 tabs signed in`,
+        `3P payout timeout for ${ticketId} — d2 is vacant. Extra signers are orbit-only; reopen the browser profile that birthed d2 (or one that still has that hex / orbit pack).`,
       );
     }
 
@@ -2849,9 +2938,9 @@ export default function FungiblePool({
       }
       if (st.status === 'paid' || st.paid?.txHash) {
         const tx = st.paid?.txHash || st.payout?.txHash;
-        await finishPayoutToast(tx, amtLabel || humanFromE8(ticket.amountE8));
-        await refresh();
-        return { ok: true, ...st.paid, ticketId, mode: 'threshold-3of4', txHash: tx };
+        const finished = await finishThis(tx, { mode: 'threshold-3of4', ...st.paid });
+        if (finished) return finished;
+        continue;
       }
       if (st.status === 'lab_paid') {
         toast.success(`Lab 3-of-4 complete (no chain transfer)`, {
@@ -2987,15 +3076,23 @@ export default function FungiblePool({
       advanceFlowForOwner(owner, 'payout_pending', { ticketId: ticket.ticketId });
       refreshFlows();
       const paid = await payoutTicket(ticket, to, humanFromE8(ticket.amountE8) || amt);
-      advanceFlowForOwner(owner, 'complete', {
-        ticketId: ticket.ticketId,
-        note: 'WART payout submitted',
-      });
-      listOpenFlows(owner).forEach((f) => {
-        if (f.step === 'complete' || f.ticketId === ticket.ticketId) {
-          completeFlow(f.id, { payoutTxHash: paid?.txHash || null });
-        }
-      });
+      if (Number(paid?.confirmations || 0) >= 1) {
+        advanceFlowForOwner(owner, 'complete', {
+          ticketId: ticket.ticketId,
+          note: 'WART payout confirmed',
+        });
+        listOpenFlows(owner).forEach((f) => {
+          if (f.step === 'complete' || f.ticketId === ticket.ticketId) {
+            completeFlow(f.id, { payoutTxHash: paid?.txHash || null });
+          }
+        });
+      } else {
+        advanceFlowForOwner(owner, 'payout_pending', {
+          ticketId: ticket.ticketId,
+          payoutTxHash: paid?.txHash || null,
+          note: 'waiting for Warthog confirmation',
+        });
+      }
       refreshFlows();
       return paid;
     }
@@ -3104,8 +3201,18 @@ export default function FungiblePool({
     if (ticket?.ticketId) {
       advanceFlowForOwner(owner, 'payout_pending', { ticketId: ticket.ticketId });
       refreshFlows();
-      await payoutTicket(ticket, to, amt);
-      listOpenFlows(owner).forEach((f) => completeFlow(f.id, { ticketId: ticket.ticketId }));
+      const paid = await payoutTicket(ticket, to, amt);
+      if (Number(paid?.confirmations || 0) >= 1) {
+        listOpenFlows(owner).forEach((f) =>
+          completeFlow(f.id, { ticketId: ticket.ticketId, payoutTxHash: paid?.txHash || null }),
+        );
+      } else {
+        advanceFlowForOwner(owner, 'payout_pending', {
+          ticketId: ticket.ticketId,
+          payoutTxHash: paid?.txHash || null,
+          note: 'waiting for Warthog confirmation',
+        });
+      }
       refreshFlows();
       return;
     }
@@ -3151,13 +3258,33 @@ export default function FungiblePool({
           action === 'atomic_to_wwart' ||
           action === 'atomic_to_wart'
         ) {
-          throw new Error('Atomic / 1-click is live-only (real WART ↔ real wWART)');
+          throw new Error('Swap is live-only (WART ↔ wWART)');
         }
         await labAction(action);
       } else if (action === 'one_click_wwart') await liveOneClickToWwart();
       else if (action === 'atomic_to_wwart') await liveAtomicToWwart();
       else if (action === 'atomic_to_wart') await liveAtomicToWart();
-      else if (action === 'deposit') await liveDeposit();
+      else if (action === 'bind') {
+        if (!wartFrom) throw new Error('Unlock Warthog first');
+        if (!owner) throw new Error('Connect MetaMask first');
+        toast.loading('Sign Warthog + MetaMask to bind…', { id: 'pool' });
+        const bound = await ensureWartOwnerBind({
+          fromAddress: wartFrom,
+          owner,
+          signer,
+          signWartMessage: wartBridgeApi?.signMessage,
+        });
+        setWartBind(bound);
+        const ok = bound?.status === 'match' || bound?.ok;
+        setActionStatus({
+          kind: ok ? 'ok' : 'err',
+          text: ok
+            ? `Bound ${String(wartFrom).slice(0, 12)}… → ${String(owner).slice(0, 10)}…`
+            : bound?.error || 'Bind failed',
+        });
+        if (ok) toast.success('WART↔ETH bound', { id: 'pool' });
+        else throw new Error(bound?.error || 'Bind failed');
+      } else if (action === 'deposit') await liveDeposit();
       else if (action === 'credit_resume') {
         const h = String(resumeTxHash || '').trim();
         if (!h) throw new Error('Paste Warthog tx hash to resume credit');
@@ -3197,6 +3324,27 @@ export default function FungiblePool({
   };
 
   const u = snap?.user;
+  const flashCopy = async (key, value) => {
+    const ok = await copyText(value);
+    if (!ok) {
+      toast.error('Copy failed');
+      return;
+    }
+    setCopiedKey(key);
+    toast.success('Copied', { id: 'fp-copy', duration: 1400 });
+    setTimeout(() => setCopiedKey((k) => (k === key ? '' : k)), 1600);
+  };
+  const maxPay =
+    swapDir === 'to_wart' && mmWwartBal != null && Number(mmWwartBal) > 0
+      ? String(mmWwartBal).trim()
+      : '';
+  const ageLabel = (() => {
+    if (!refreshedAt) return null;
+    const sec = Math.max(0, Math.round((Date.now() - refreshedAt) / 1000));
+    if (sec < 8) return 'just now';
+    if (sec < 60) return `${sec}s ago`;
+    return `${Math.round(sec / 60)}m ago`;
+  })();
 
   return (
     <section
@@ -3287,17 +3435,54 @@ export default function FungiblePool({
       </header>
 
       <p className="fp-status-line">
-        1:1 reserved mint path. Until you hold wWART, only you can mint/withdraw your deposit.
-        After you have wWART it is unbound — anyone you send it to can redeem WART from the pool.
+        1:1 reserved mint. Until you hold wWART, only you can mint or withdraw your deposit.
+        After that, anyone holding the token can redeem WART.
+        {ageLabel ? <span className="fp-status-age"> · pool {ageLabel}</span> : null}
+      </p>
+      <div className="fp-chip-row" aria-label="Pool status">
+        <button
+          type="button"
+          className="fp-chip fp-chip-q"
+          title={poolAddr || 'pool address'}
+          disabled={!poolAddr}
+          onClick={() => flashCopy('q', poolAddr)}
+        >
+          {copiedKey === 'q' ? <Check size={12} /> : <Copy size={12} />}
+          Q {poolAddr ? shortHex(poolAddr, 6, 4) : '…'}
+        </button>
+        <span
+          className={`fp-chip${wartBind?.status === 'match' ? ' is-ok' : bindBlocked ? ' is-bad' : ' is-wait'}`}
+        >
+          {wartBind?.status === 'match'
+            ? 'Bound'
+            : bindBlocked
+              ? 'Bind clash'
+              : owner && wartFrom
+                ? 'Bind needed'
+                : 'Unbound'}
+        </span>
         {pool3pSt?.configured ? (
           <>
-            {' '}
-            Signers {pool3pSt.d1Live ? 'd1 live' : 'd1 waiting'} ·{' '}
-            {pool3pSt.d2Live ? 'd2 live' : 'd2 waiting'}
-            {pool3pSt.orbit ? ` · orbit ${pool3pSt.orbit.liveCount || 0}` : ''}.
+            <span className={`fp-chip${pool3pSt.d1Live ? ' is-ok' : ' is-wait'}`}>
+              {pool3pSt.d1Live ? 'd1 live' : 'd1 wait'}
+            </span>
+            <span className={`fp-chip${pool3pSt.d2Live ? ' is-ok' : ' is-wait'}`}>
+              {pool3pSt.d2Live ? 'd2 live' : 'd2 vacant'}
+            </span>
+            {pool3pSt.orbit ? (
+              <span className={`fp-chip${Number(pool3pSt.orbit.liveCount) >= 4 ? ' is-ok' : ' is-wait'}`}>
+                orbit {pool3pSt.orbit.liveCount || 0}
+              </span>
+            ) : null}
           </>
         ) : null}
-      </p>
+        {spv ? (
+          <span className={`fp-chip${spv.bootstrapped ? ' is-ok' : ' is-wait'}`}>
+            SPV {spv.bootstrapped ? 'on' : 'off'}
+            {spv.bestHeight != null ? ` · ${spv.bestHeight}` : ''}
+          </span>
+        ) : null}
+      </div>
 
       {open && (
         <>
@@ -3339,12 +3524,22 @@ export default function FungiblePool({
               <div className="fp-swap-leg">
                 <div className="fp-swap-leg-top">
                   <span>You pay</span>
-                  <span>
+                  <span className="fp-swap-leg-meta">
                     {swapDir === 'to_wwart'
                       ? 'from Warthog'
                       : mmWwartLabel
                         ? `wallet ${mmWwartLabel}`
                         : 'from MetaMask'}
+                    {maxPay ? (
+                      <button
+                        type="button"
+                        className="fp-max"
+                        disabled={busy || !owner}
+                        onClick={() => setAmount(maxPay)}
+                      >
+                        MAX
+                      </button>
+                    ) : null}
                   </span>
                 </div>
                 <div className="fp-swap-row">
@@ -3354,6 +3549,12 @@ export default function FungiblePool({
                     className="fp-swap-input"
                     value={amount}
                     onChange={(e) => setAmount(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !busy && owner) {
+                        e.preventDefault();
+                        run(swapDir === 'to_wwart' ? 'atomic_to_wwart' : 'atomic_to_wart');
+                      }
+                    }}
                     placeholder="0.0"
                     disabled={busy || !owner}
                     aria-label="Amount you pay"
@@ -3410,20 +3611,70 @@ export default function FungiblePool({
                 </div>
               </div>
               {swapDir === 'to_wart' ? (
-                <input
-                  type="text"
-                  className="fp-swap-to"
-                  value={toAddress}
-                  onChange={(e) => setToAddress(e.target.value)}
-                  placeholder={
-                    wartBridgeApi?.address
-                      ? `WART pays to ${String(wartBridgeApi.address).slice(0, 12)}… (or paste another)`
-                      : 'Warthog address to receive WART'
-                  }
-                  disabled={busy || !owner}
-                  aria-label="Warthog address for WART payout"
-                />
+                <div className="fp-swap-to-wrap">
+                  <input
+                    type="text"
+                    className="fp-swap-to"
+                    value={toAddress}
+                    onChange={(e) => setToAddress(e.target.value)}
+                    placeholder={
+                      wartBridgeApi?.address
+                        ? `WART pays to ${shortHex(wartBridgeApi.address, 10, 6)} (or paste another)`
+                        : 'Warthog address to receive WART'
+                    }
+                    disabled={busy || !owner}
+                    aria-label="Warthog address for WART payout"
+                  />
+                  {wartBridgeApi?.address ? (
+                    <button
+                      type="button"
+                      className="fp-icon-btn"
+                      title="Use unlocked Warthog address"
+                      onClick={() => {
+                        setToAddress(String(wartBridgeApi.address));
+                        void flashCopy('to', wartBridgeApi.address);
+                      }}
+                    >
+                      {copiedKey === 'to' ? <Check size={14} /> : <Copy size={14} />}
+                    </button>
+                  ) : null}
+                </div>
               ) : null}
+              <div className="fp-amt-chips" aria-label="Quick amounts">
+                {['1', '5', '15'].map((n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    className={`fp-amt${amount === n ? ' is-on' : ''}`}
+                    disabled={busy || !owner}
+                    onClick={() => setAmount(n)}
+                  >
+                    {n}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                className="btn secondary fp-swap-go"
+                disabled={busy || !owner || !signer || !wartFrom || bindBlocked}
+                onClick={() => run('bind')}
+                title="Dual-sign: bind this Warthog address to the connected MetaMask account. Required before deposit/withdraw on a fresh stack."
+              >
+                {wartBind?.status === 'match'
+                  ? `Bound ${String(wartFrom).slice(0, 8)}… → ${String(owner).slice(0, 8)}…`
+                  : 'Bind WART ↔ ETH'}
+              </button>
+              <p className="fp-swap-hint" style={{ marginTop: '-0.2rem' }}>
+                {!owner
+                  ? 'Connect MetaMask to bind.'
+                  : !wartFrom
+                    ? 'Unlock Warthog to bind.'
+                    : bindBlocked
+                      ? wartBind?.error || 'This Warthog wallet is bound to another L1 account.'
+                      : wartBind?.status === 'match'
+                        ? 'This pair is bound. You can swap.'
+                        : 'Bind once (Warthog sig + MetaMask sig), then deposit or withdraw.'}
+              </p>
               <button
                 type="button"
                 className="btn primary fp-swap-go"
@@ -3458,31 +3709,7 @@ export default function FungiblePool({
           {actionStatus ? (
             <div
               role="status"
-              style={{
-                margin: '0 0 0.65rem',
-                padding: '0.5rem 0.65rem',
-                borderRadius: 8,
-                fontSize: '0.78rem',
-                lineHeight: 1.4,
-                border:
-                  actionStatus.kind === 'err'
-                    ? '1px solid rgba(255,120,100,0.55)'
-                    : actionStatus.kind === 'ok'
-                      ? '1px solid rgba(0,255,204,0.45)'
-                      : '1px solid rgba(240,198,116,0.5)',
-                background:
-                  actionStatus.kind === 'err'
-                    ? 'rgba(60,16,12,0.85)'
-                    : actionStatus.kind === 'ok'
-                      ? 'rgba(0,40,36,0.85)'
-                      : 'rgba(40,30,0,0.85)',
-                color:
-                  actionStatus.kind === 'err'
-                    ? '#ffb4a2'
-                    : actionStatus.kind === 'ok'
-                      ? '#7dffa3'
-                      : '#ffe6a8',
-              }}
+              className={`fp-banner fp-banner-${actionStatus.kind || 'info'}`}
             >
               {actionStatus.text}
             </div>
@@ -3944,21 +4171,26 @@ export default function FungiblePool({
                   }}
                 >
                   {pendingList.map((p) => (
-                    <li
-                      key={p.txHash}
-                      style={{
-                        display: 'flex',
-                        flexWrap: 'wrap',
-                        gap: '0.35rem',
-                        alignItems: 'center',
-                        marginBottom: '0.3rem',
-                        fontFamily: 'monospace',
-                      }}
-                    >
-                      <span title={p.txHash}>
-                        {String(p.txHash).slice(0, 12)}… · {p.status}
-                        {p.amountHuman ? ` · ${p.amountHuman}` : ''}
+                    <li key={p.txHash} className="fp-pending-row">
+                      <button
+                        type="button"
+                        className="fp-pending-hash"
+                        title={p.txHash}
+                        onClick={() => flashCopy(`tx-${p.txHash}`, p.txHash)}
+                      >
+                        {copiedKey === `tx-${p.txHash}` ? (
+                          <Check size={12} />
+                        ) : (
+                          <Copy size={12} />
+                        )}
+                        {shortHex(p.txHash, 10, 6)}
+                      </button>
+                      <span className={`fp-chip fp-chip-status is-${String(p.status || 'pending')}`}>
+                        {p.status}
                       </span>
+                      {p.amountHuman ? (
+                        <span className="fp-pending-amt">{p.amountHuman} WART</span>
+                      ) : null}
                       <button
                         type="button"
                         className="btn secondary small"

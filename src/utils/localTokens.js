@@ -10,7 +10,7 @@ export const LOCAL_WWART = {
   chainId: 31337,
   openMint: false,
   minterOnly: true,
-  minter: '0xab7528bb862fB57E8A2BCd567a2e929a0Be56a5e',
+  minter: '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC',
   note: 'Minter-only. L1 mint via authorized minter / voucher — no free faucet.',
 };
 

@@ -1,27 +1,229 @@
 ---
-// Minimal product header
+// WART Bridge header — 3P span graphic (not the Green Anvil logo)
 ---
 <header class="bridge-header">
+  <div class="span-anim" aria-hidden="true">
+    <div class="span-stage">
+      <span class="orb seat-d1"></span>
+      <span class="orb seat-q"></span>
+      <span class="orb seat-d2"></span>
+      <span class="ring ring-l"></span>
+      <span class="ring ring-r"></span>
+      <span class="span span-a"></span>
+      <span class="span span-b"></span>
+      <span class="pkt"></span>
+      <span class="dot p1"></span>
+      <span class="dot p2"></span>
+      <span class="dot p3"></span>
+      <span class="dot p4"></span>
+    </div>
+  </div>
   <h1>WART Bridge</h1>
-  <p class="bridge-sub">Lock WART · claim wWART · execute voucher</p>
+  <p class="bridge-sub">Lock WART · claim wWART · 3P spend</p>
 </header>
 
 <style>
   .bridge-header {
     text-align: center;
-    padding: 1rem 0.75rem 0.5rem;
+    padding: 1.1rem 0.75rem 0.55rem;
   }
+  .span-anim {
+    margin: 0 auto 0.85rem;
+    max-width: 22rem;
+  }
+  .span-stage {
+    position: relative;
+    width: 100%;
+    height: 76px;
+    border-radius: 18px;
+    overflow: hidden;
+    isolation: isolate;
+    background:
+      radial-gradient(ellipse 40% 80% at 14% 50%, rgba(45, 212, 191, 0.18), transparent 58%),
+      radial-gradient(ellipse 36% 70% at 50% 50%, rgba(201, 162, 39, 0.12), transparent 55%),
+      radial-gradient(ellipse 40% 80% at 86% 50%, rgba(56, 189, 248, 0.12), transparent 58%),
+      linear-gradient(135deg, rgba(17, 24, 39, 0.96), rgba(8, 12, 22, 0.82));
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.04),
+      0 12px 40px rgba(0, 0, 0, 0.28);
+  }
+  .span-stage::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(148, 163, 184, 0.055) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(148, 163, 184, 0.055) 1px, transparent 1px);
+    background-size: 16px 16px;
+    mask-image: linear-gradient(90deg, transparent, black 12%, black 88%, transparent);
+    opacity: 0.5;
+    animation: grid-drift 16s linear infinite;
+    pointer-events: none;
+  }
+  .span-stage .orb {
+    position: absolute;
+    border-radius: 50%;
+    top: 50%;
+    filter: blur(0.4px);
+  }
+  /* d1 · Q · d2  — three seats on a span */
+  .seat-d1 {
+    width: 28px;
+    height: 28px;
+    left: 10%;
+    margin-top: -14px;
+    background: radial-gradient(circle at 35% 32%, #99f6e4, #2dd4bf 48%, transparent 72%);
+    box-shadow: 0 0 22px rgba(45, 212, 191, 0.4);
+    animation: seat-breathe 5.5s ease-in-out infinite;
+  }
+  .seat-q {
+    width: 36px;
+    height: 36px;
+    left: 50%;
+    margin-left: -18px;
+    margin-top: -18px;
+    background: radial-gradient(circle at 38% 30%, #f5e6a3, #c9a227 50%, transparent 72%);
+    box-shadow: 0 0 26px rgba(201, 162, 39, 0.38);
+    animation: seat-breathe 6.8s ease-in-out infinite 0.4s;
+  }
+  .seat-d2 {
+    width: 28px;
+    height: 28px;
+    right: 10%;
+    margin-top: -14px;
+    background: radial-gradient(circle at 38% 32%, #bae6fd, #38bdf8 50%, transparent 72%);
+    box-shadow: 0 0 22px rgba(56, 189, 248, 0.38);
+    animation: seat-breathe 5.8s ease-in-out infinite 0.8s;
+  }
+  .ring {
+    position: absolute;
+    border-radius: 50%;
+    pointer-events: none;
+    top: 50%;
+  }
+  .ring-l {
+    width: 40px;
+    height: 40px;
+    left: 8%;
+    margin-top: -20px;
+    border: 1px solid rgba(45, 212, 191, 0.22);
+    border-top-color: rgba(94, 234, 212, 0.7);
+    border-right-color: transparent;
+    animation: ring-spin 11s linear infinite;
+  }
+  .ring-r {
+    width: 40px;
+    height: 40px;
+    right: 8%;
+    margin-top: -20px;
+    border: 1px solid rgba(56, 189, 248, 0.2);
+    border-bottom-color: rgba(125, 211, 252, 0.65);
+    border-left-color: transparent;
+    animation: ring-spin 10s linear infinite reverse;
+  }
+  .span {
+    position: absolute;
+    height: 1px;
+    top: 50%;
+    pointer-events: none;
+    opacity: 0.65;
+  }
+  .span-a {
+    left: 18%;
+    right: 18%;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      rgba(45, 212, 191, 0.55),
+      rgba(201, 162, 39, 0.7),
+      rgba(56, 189, 248, 0.5),
+      transparent
+    );
+    animation: span-pulse 4.2s ease-in-out infinite;
+  }
+  .span-b {
+    left: 22%;
+    right: 22%;
+    top: 58%;
+    background: linear-gradient(90deg, transparent, rgba(201, 162, 39, 0.28), transparent);
+    animation: span-pulse 5.4s ease-in-out infinite 0.7s;
+  }
+  .pkt {
+    position: absolute;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    top: 50%;
+    margin-top: -3.5px;
+    left: 16%;
+    background: #f5e6a3;
+    box-shadow: 0 0 10px rgba(245, 230, 163, 0.95);
+    animation: pkt-cross 3.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  }
+  .dot {
+    position: absolute;
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: #5eead4;
+    box-shadow: 0 0 6px rgba(45, 212, 191, 0.75);
+  }
+  .p1 { left: 32%; top: 24%; animation: dot-blink 3.1s ease-in-out infinite; }
+  .p2 { left: 48%; top: 22%; animation: dot-blink 4s ease-in-out infinite 0.5s; background: #c9a227; box-shadow: 0 0 6px rgba(201, 162, 39, 0.7); }
+  .p3 { left: 66%; top: 70%; animation: dot-blink 3.5s ease-in-out infinite 0.9s; background: #7dd3fc; }
+  .p4 { left: 38%; top: 72%; animation: dot-blink 4.4s ease-in-out infinite 0.3s; }
+
   .bridge-header h1 {
     margin: 0;
-    font-size: clamp(1.35rem, 4vw, 1.75rem);
+    font-size: clamp(1.4rem, 4vw, 1.9rem);
     font-weight: 800;
     letter-spacing: -0.02em;
-    color: #fff;
+    background: linear-gradient(90deg, #5eead4 0%, #2dd4bf 32%, #e8c547 78%, #38bdf8 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
   }
   .bridge-sub {
     font-size: 0.8rem;
-    opacity: 0.65;
     margin: 0.3rem 0 0;
-    color: #ccc;
+    color: #94a3b8;
+  }
+
+  @keyframes grid-drift {
+    from { transform: translateX(0); }
+    to { transform: translateX(-16px); }
+  }
+  @keyframes seat-breathe {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.08); }
+  }
+  @keyframes ring-spin {
+    to { transform: rotate(360deg); }
+  }
+  @keyframes span-pulse {
+    0%, 100% { opacity: 0.28; }
+    50% { opacity: 0.85; }
+  }
+  @keyframes pkt-cross {
+    0% { left: 16%; opacity: 0; }
+    12% { opacity: 1; }
+    88% { opacity: 1; }
+    100% { left: 80%; opacity: 0; }
+  }
+  @keyframes dot-blink {
+    0%, 100% { opacity: 0.2; transform: scale(0.8); }
+    50% { opacity: 1; transform: scale(1.2); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .span-stage::before,
+    .span-stage .orb,
+    .span-stage .ring,
+    .span-stage .span,
+    .span-stage .pkt,
+    .span-stage .dot {
+      animation: none !important;
+    }
+    .pkt { left: 50%; opacity: 0.7; }
   }
 </style>

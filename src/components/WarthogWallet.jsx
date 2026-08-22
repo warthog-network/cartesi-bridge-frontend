@@ -278,7 +278,7 @@ import {
   getNextNonceFromAccount,
 } from '../utils/warthogFormat.js';
 import { getSmartNonce, bumpNonceAfterSuccess } from '../utils/cancelLimitOrder.js';
-import { unlockSigningWorker, lockSigningWorker, terminateSigningWorker } from '../utils/signingBridge.js';
+import { unlockSigningWorker, lockSigningWorker, terminateSigningWorker, signMessageInWorker } from '../utils/signingBridge.js';
 import {
   PRESET_NODES,
   MAINNET_NODES,
@@ -1865,13 +1865,14 @@ const WarthogWallet = ({
     }
   };
 
-  // Expose send + proof helpers for Path A fungible pool (no cosigner)
+  // Expose send + proof + bind-sign helpers for Path A fungible pool (no cosigner)
   useEffect(() => {
     if (!onBridgeApi) return;
     if (wallet?.address) {
       onBridgeApi({
         sendTransaction: handleSendTransaction,
         getWartTxProof,
+        signMessage: (message) => signMessageInWorker(message),
         address: wallet.address,
         selectedNode,
       });

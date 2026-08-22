@@ -111,6 +111,9 @@ export async function preparePool3pTransfer({
     toNorm = expanded.hex;
   }
   const from = String(fromAddress).replace(/^0x/i, '').toLowerCase();
+  if (from && toNorm && from === toNorm) {
+    throw new Error('Self send transaction not allowed');
+  }
   const amt = BigInt(amountE8);
 
   const balRes = await api.getAccountWartBalance(from);

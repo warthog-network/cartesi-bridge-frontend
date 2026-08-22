@@ -168,6 +168,67 @@ export async function machineSupportsSetAddress() {
   }
 }
 
+/**
+ * Keep Cartesi inspect on the sealed live coordinator Q.
+ * Fresh start is not done until this matches. Does not invent Q.
+ */
+export async function syncInspectToLiveCoordinator() {
+  const dapp = loadDapp();
+  const addr = normQ(dapp?.address);
+  if (!/^[0-9a-f]{48}$/.test(addr)) {
+    return { ok: false, skipped: 'coordinator has no sealed Q' };
+  }
+  const p1 = dapp?.seats?.[1]?.P || dapp?.seats?.['1']?.P || dapp?.seal?.P1;
+  const p2 = dapp?.seats?.[2]?.P || dapp?.seats?.['2']?.P || dapp?.seal?.P2;
+  if (!p1 || !p2 || !dapp?.seal) {
+    return { ok: false, skipped: 'seats not both born' };
+  }
+  if (!(await machineSupportsSetAddress())) {
+    return { ok: false, skipped: 'machine has no pool_set_address' };
+  }
+  let snap = await inspectPoolSnap();
+  const inspectAddr = normQ(snap?.poolAddress);
+  if (inspectAddr === addr) {
+    return {
+      ok: true,
+      already: true,
+      address: addr,
+      poolAccountId: snap?.poolAccountId || null,
+    };
+  }
+  const pending = normQ(snap?.pendingNext?.address || snap?.pendingNext);
+  let announce = null;
+  if (pending !== addr) {
+    announce = await submitPoolAdvance({
+      type: 'pool_announce_next',
+      address: addr,
+      publicKey: dapp.publicKey || dapp.seal?.publicKey || null,
+    });
+    inspectSnapCache = { at: 0, value: null, inflight: null };
+    snap = await waitInspect(
+      (s) => normQ(s?.pendingNext?.address || s?.pendingNext) === addr,
+      24,
+      1500,
+    );
+  }
+  const acct = await wartAccount(addr).catch(() => null);
+  const posted = await submitPoolAdvance({
+    type: 'pool_set_address',
+    address: addr,
+    accountId: acct?.accountId || null,
+  });
+  inspectSnapCache = { at: 0, value: null, inflight: null };
+  const after = await inspectPoolSnap();
+  return {
+    ok: normQ(after?.poolAddress) === addr,
+    address: addr,
+    inspect: after?.poolAddress || null,
+    accountId: acct?.accountId || after?.poolAccountId || null,
+    announceTx: announce?.txHash || null,
+    setTx: posted?.txHash || null,
+  };
+}
+
 async function wartAccount(addr) {
   const a = String(addr || '').replace(/^0x/i, '').toLowerCase();
   if (!/^[0-9a-f]{48}$/.test(a)) return null;
@@ -308,6 +369,12 @@ async function tickRotationInner() {
   const auto = envOn('POOL_3P_AUTO_ROTATE', true);
   const elapsed = Math.max(0, block - Number(r.anchorBlock));
   await expireStaleUserRooms().catch(() => ({ closed: [] }));
+  if (r.phase === 'idle') {
+    await syncInspectToLiveCoordinator().catch((e) => {
+      r.lastError = `inspect-sync: ${e.message || e}`;
+      return null;
+    });
+  }
   const rooms = userRoomsOpen();
   if (
     auto &&

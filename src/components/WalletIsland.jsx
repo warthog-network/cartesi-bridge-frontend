@@ -83,6 +83,28 @@ const ERC20_PORTAL_ADDRESS = _addrs.erc20Portal || LOCAL_ADDRESSES.erc20Portal;
 const _wwart = getWwartToken();
 const WWART_ADDRESS = (_wwart?.address || LOCAL_WWART?.address || '').toLowerCase();
 const ACTIVE_NETWORK_ID = getNetworkId();
+
+function wwartOfferKey(addr) {
+  const a = String(addr || '').toLowerCase();
+  const t = String(WWART_ADDRESS || '').toLowerCase();
+  return `wart.wwart.offered.${ACTIVE_NETWORK_ID}.${a}.${t}`;
+}
+function hasOfferedWwart(addr) {
+  if (!addr || !WWART_ADDRESS) return false;
+  try {
+    return localStorage.getItem(wwartOfferKey(addr)) === '1';
+  } catch {
+    return false;
+  }
+}
+function markOfferedWwart(addr) {
+  if (!addr || !WWART_ADDRESS) return;
+  try {
+    localStorage.setItem(wwartOfferKey(addr), '1');
+  } catch {
+    /* */
+  }
+}
 const CTSI_ADDRESS = "0xae7f61eCf06C65405560166b259C54031428A9C4";
 const USDC_ADDRESS = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
 
@@ -474,7 +496,7 @@ export default function WalletIsland() {
             `Auto-connected (${describeProvider(eth)}): ${addr.slice(0, 6)}...${addr.slice(-4)}`,
           );
           refreshVault(addr);
-          importWwartToken({ silent: true }).catch(() => {});
+          importWwartToken({ silent: true, skipIfOffered: true }).catch(() => {});
         }
       } catch (err) {
         console.log('No auto-connect');
@@ -833,12 +855,21 @@ export default function WalletIsland() {
    * token is not added on Ethereum mainnet. Checksum address — some wallets
    * reject lowercase. Object params first, then array (WalletConnect).
    */
-  const importWwartToken = async ({ silent = false } = {}) => {
+  const importWwartToken = async ({ silent = false, skipIfOffered = false } = {}) => {
     const raw = WWART_ADDRESS || LOCAL_WWART?.address || '';
     if (!raw) {
       if (!silent) toast.error('wWART token not configured');
       return false;
     }
+    const who = address || (await (async () => {
+      try {
+        const accs = await (getEip1193() || window.ethereum)?.request?.({ method: 'eth_accounts' });
+        return accs?.[0] || '';
+      } catch {
+        return '';
+      }
+    })());
+    if (skipIfOffered && who && hasOfferedWwart(who)) return true;
     let addr = raw;
     try {
       addr = ethers.getAddress(raw);
@@ -874,6 +905,7 @@ export default function WalletIsland() {
           params: [payload],
         });
       }
+      if (who) markOfferedWwart(who);
       if (added) {
         if (!silent) toast.success(`${symbol} added · ${addr.slice(0, 8)}…`);
         return true;
@@ -888,6 +920,7 @@ export default function WalletIsland() {
       }
       return false;
     } catch (e) {
+      if (silent && who) markOfferedWwart(who);
       if (!silent) {
         try {
           await navigator.clipboard?.writeText(addr);
@@ -1148,7 +1181,7 @@ export default function WalletIsland() {
       toast.success(`Connected (${label}): ${addr.slice(0, 6)}...${addr.slice(-4)}`);
       refreshVault(addr);
       // Add live wWART on this chain (no-op if the wallet already has it).
-      importWwartToken({ silent: true }).catch(() => {});
+      importWwartToken({ silent: true, skipIfOffered: true }).catch(() => {});
 
       // Keep session in sync for WC disconnects
       if (isWalletConnectProvider(eth) && eth.on) {
