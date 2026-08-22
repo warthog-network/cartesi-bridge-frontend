@@ -691,6 +691,9 @@ export async function recordEthBurn({
   if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error('assetHash required');
   if (!/^[0-9a-f]{48}$/.test(burner)) throw new Error('burnerWart required');
   if (y <= 0n) throw new Error('amountE8 must be > 0');
+  if (!/^[0-9a-f]{64}$/.test(tx)) {
+    throw new Error('wartTxHash required — send the receipt to the burn bin first');
+  }
   const wraps = loadWraps();
   const wrap = (wraps.wraps || []).find((w) => w.assetHash === hash);
   if (!wrap) throw new Error('unknown wrap hash — not a credited ETH receipt');

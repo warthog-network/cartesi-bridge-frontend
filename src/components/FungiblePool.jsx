@@ -2917,9 +2917,18 @@ export default function FungiblePool({
     const amt = String(amount || '').trim();
     if (!amt) throw new Error('Enter amount');
     const wraps = eth3pSt?.wraps || [];
-    const mine = [...wraps].reverse().find((w) => BigInt(w.outstandingE8 || '0') > 0n);
+    const hold = await fetchWartAssetHoldings(
+      wartFrom,
+      wraps.map((w) => w.assetHash),
+      wartBridgeApi?.selectedNode,
+    );
+    const live = hold.find((h) => BigInt(h.e8 || 0) > 0n);
+    const mine =
+      live?.hash
+        ? { assetHash: live.hash, outstandingE8: live.e8 }
+        : [...wraps].reverse().find((w) => BigInt(w.outstandingE8 || '0') > 0n);
     if (!mine?.assetHash) {
-      throw new Error('No outstanding wETH receipt to unwrap — swap ETH → wETH first');
+      throw new Error('No wETH on this Warthog address to unwrap');
     }
     const supply = normalizeEthSupplyAmount(amt);
     const [w, f = ''] = String(supply).split('.');
