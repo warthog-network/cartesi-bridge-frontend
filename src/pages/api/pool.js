@@ -85,7 +85,11 @@ import {
   eth3pOfferD2,
   eth3pStatusTicket,
   eth3pSubmit,
+  birthEthSeatNext,
+  openEthSeatPdlNext,
+  finishEthSeatPdlNext,
 } from '../../utils/server/poolEth3p.mjs';
+import { tickEthRotation } from '../../utils/server/poolEth3pRotate.mjs';
 import { preparePool3pTransfer, submitPool3pTransfer } from '../../utils/server/pool3pPay.mjs';
 import { allowLabMutation } from '../../utils/server/poolOpsAuth.mjs';
 import { assertPayoutMatchesTicket } from '../../utils/server/poolTicketVerify.mjs';
@@ -489,16 +493,19 @@ export async function POST({ request }) {
 
     if (action === 'eth3p_status') {
       if (!eth3pOn()) return json(200, { ok: false, configured: false, error: 'ETH 3P off' });
-      return json(200, await publicEth3pStatus());
+      const st = await publicEth3pStatus();
+      const rotation = await tickEthRotation().catch((e) => ({ lastError: String(e?.message || e) }));
+      return json(200, { ...st, rotation });
     }
     if (action === 'eth3p_enroll') {
       return json(200, await enrollEth3pSigner({ signerId: body.signerId }));
     }
     if (action === 'eth3p_heartbeat') {
-      return json(
-        200,
-        await heartbeatEth3p({ signerId: body.signerId, seatEpoch: body.seatEpoch }),
-      );
+      const hb = await heartbeatEth3p({ signerId: body.signerId, seatEpoch: body.seatEpoch });
+      const rotation = await tickEthRotation().catch((e) => ({
+        lastError: String(e?.message || e),
+      }));
+      return json(200, { ...hb, rotation });
     }
     if (action === 'eth3p_birth') {
       return json(
@@ -619,6 +626,35 @@ export async function POST({ request }) {
         await eth3pSubmit({
           ticketId: body.ticketId,
           signature65: body.signature65,
+        }),
+      );
+    }
+    if (action === 'eth3p_birth_next') {
+      return json(
+        200,
+        await birthEthSeatNext({
+          signerId: body.signerId,
+          role: body.role,
+          P: body.P,
+          encD1: body.encD1,
+          paillierN: body.paillierN,
+          paillierG: body.paillierG,
+          pok: body.pok,
+          rangeProof: body.rangeProof,
+        }),
+      );
+    }
+    if (action === 'eth3p_pdl_commit_next') {
+      return json(200, openEthSeatPdlNext({ signerId: body.signerId, comQ: body.comQ }));
+    }
+    if (action === 'eth3p_pdl_finish_next') {
+      return json(
+        200,
+        await finishEthSeatPdlNext({
+          signerId: body.signerId,
+          Qhat: body.Qhat,
+          nonceQ: body.nonceQ,
+          comQ: body.comQ,
         }),
       );
     }

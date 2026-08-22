@@ -60,6 +60,8 @@ const ETH_BIND_PATH =
   env('POOL_ETH3P_BIND') || path.join(DEFAULT_DATA, 'pool-eth-3p-bind.json');
 const ETH_SESS_PATH =
   env('POOL_ETH3P_SESSIONS') || path.join(DEFAULT_DATA, 'pool-eth-3p-sessions.json');
+export const ETH_NEXT_PATH =
+  env('POOL_ETH3P_NEXT') || path.join(DEFAULT_DATA, 'pool-eth-3p-next.json');
 const WART_NODE = env('WARTHOG_NODE_URL', 'http://127.0.0.1:3001');
 const ETH_RPC = env('CARTESI_RPC_URL', 'http://127.0.0.1:8545');
 
@@ -121,6 +123,14 @@ async function saveJson(p, obj) {
 
 export function loadEthDapp() {
   return loadJson(ETH_DAPP_PATH, null);
+}
+
+export function loadEthNext() {
+  return loadJson(ETH_NEXT_PATH, null);
+}
+
+export async function writeEthNext(dapp) {
+  await saveJson(ETH_NEXT_PATH, dapp);
 }
 
 export async function writeEthDapp(dapp) {
@@ -391,6 +401,158 @@ export async function finishEthSeatPdl({ signerId, Qhat, nonceQ, comQ }) {
   };
 }
 
+function pdlNextKey(signerId) {
+  return `eth-birth-next:${String(signerId || '')}`;
+}
+
+export async function birthEthSeatNext({
+  signerId,
+  role,
+  P,
+  encD1,
+  paillierN,
+  paillierG,
+  pok,
+  rangeProof,
+}) {
+  const r = Number(role);
+  if (r !== 1 && r !== 2) throw new Error('role must be 1 (e1) or 2 (e2)');
+  const sid = String(signerId || '').trim();
+  const dapp = loadEthNext();
+  if (!dapp?.Pdapp) throw new Error('no next ETH 3P dapp');
+  dapp.seats = dapp.seats || { 1: null, 2: null };
+  const compressed = compactPoint(P);
+  secp256k1.ProjectivePoint.fromHex(compressed);
+  schnorrVerifyDlog(pok, compressed, seatPokContext('birth-next', r, compressed));
+  const existingP = compactPoint(dapp.seats?.[r]?.P || '');
+  if (existingP && existingP !== compressed) {
+    throw new Error(`next e${r} already born`);
+  }
+  if (r === 1) {
+    if (!encD1 || !paillierN || !paillierG) {
+      throw new Error('next e1 needs Enc(e1) + Paillier');
+    }
+    assertPaillierModulus(paillierN, { what: 'next e1 Paillier N' });
+    verifyRangeLindell({
+      c: encD1,
+      paillierN,
+      paillierG,
+      Q1: compressed,
+      proof: rangeProof,
+      context: seatPokContext('birth-next', 1, compressed),
+    });
+    const ch = pdlVerifierChallenge({
+      ckey: encD1,
+      paillierN,
+      paillierG,
+      Q1: compressed,
+    });
+    pdlRam.set(pdlNextKey(sid), {
+      ch,
+      P: compressed,
+      encD1: String(encD1),
+      paillierN: String(paillierN),
+      paillierG: String(paillierG),
+      signerId: sid,
+    });
+    return { ok: true, role: 1, nextQ: true, needPdl: true, pdl: pdlChallengePublic(ch) };
+  }
+  dapp.seats[2] = { P: compressed, bornAt: new Date().toISOString(), signerId: sid, pokOk: true };
+  finalizeEthClientBornQ(dapp);
+  await writeEthNext(dapp);
+  return {
+    ok: true,
+    role: 2,
+    nextQ: true,
+    address: dapp.address || null,
+    ready: !!(dapp.seats[1]?.P && dapp.seats[2]?.P),
+    seal: dapp.seal || null,
+  };
+}
+
+export function openEthSeatPdlNext({ signerId, comQ }) {
+  const row = pdlRam.get(pdlNextKey(signerId));
+  if (!row?.ch) throw new Error('LINDELL_PDL: no pending next-e1 challenge');
+  row.comQ = String(comQ);
+  return { ok: true, nextQ: true, needPdl: true, ...pdlVerifierOpen(row.ch) };
+}
+
+export async function finishEthSeatPdlNext({ signerId, Qhat, nonceQ, comQ }) {
+  const sid = String(signerId || '').trim();
+  const row = pdlRam.get(pdlNextKey(sid));
+  if (!row?.ch) throw new Error('LINDELL_PDL: no pending next-e1 challenge');
+  pdlVerifierAccept({ ch: row.ch, Qhat, nonceQ, comQ: comQ || row.comQ });
+  const dapp = loadEthNext();
+  if (!dapp) throw new Error('no next ETH 3P dapp');
+  dapp.seats = dapp.seats || { 1: null, 2: null };
+  dapp.seats[1] = {
+    P: row.P,
+    encD1: row.encD1,
+    paillierN: row.paillierN,
+    paillierG: row.paillierG,
+    bornAt: new Date().toISOString(),
+    signerId: row.signerId || sid,
+    pokOk: true,
+    rangeOk: true,
+    pdlOk: true,
+  };
+  dapp.ckeyD1 = row.encD1;
+  dapp.paillierN = row.paillierN;
+  dapp.paillierG = row.paillierG;
+  finalizeEthClientBornQ(dapp);
+  await writeEthNext(dapp);
+  pdlRam.delete(pdlNextKey(sid));
+  return {
+    ok: true,
+    role: 1,
+    nextQ: true,
+    address: dapp.address || null,
+    ready: !!(dapp.seats[1]?.P && dapp.seats[2]?.P),
+    seal: dapp.seal || null,
+    pdlOk: true,
+  };
+}
+
+export async function openEthSweepPayout({ toAddress, ticketId }) {
+  const dapp = loadEthDapp();
+  if (!dapp?.address || !dapp?.ckeyD1) throw new Error('live ETH 3P not ready');
+  const to = String(toAddress || '').toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(to)) throw new Error('sweep toAddress 0x… required');
+  const { JsonRpcProvider } = await import('ethers-v6');
+  const provider = new JsonRpcProvider(ETH_RPC);
+  const bal = await provider.getBalance(dapp.address);
+  const gas = 21000n;
+  const feeData = await provider.getFeeData();
+  const gasPrice = feeData.gasPrice || 1n;
+  const fee = gas * gasPrice;
+  if (bal <= fee) {
+    return { ok: true, skipped: true, reason: 'dust only' };
+  }
+  const valueWei = bal - fee;
+  const unsigned = await buildEthUnsigned({ to, valueWei: valueWei.toString() });
+  const id = String(ticketId || `eth-rotate-${Date.now()}`);
+  const s = loadEthSess();
+  s.tickets = s.tickets || {};
+  if (s.tickets[id]?.status === 'paid') {
+    return { ok: true, alreadyPaid: true, ticketId: id, ...ticketView(s.tickets[id]) };
+  }
+  s.tickets[id] = {
+    ticketId: id,
+    status: 'open',
+    room: true,
+    kind: 'rotate-sweep',
+    amountWei: unsigned.tx.value,
+    amountE8: (BigInt(unsigned.tx.value) / 10n ** 10n).toString(),
+    toAddress: to,
+    hashHex: unsigned.hashHex,
+    prep: { ...unsigned, hashHex: unsigned.hashHex },
+    openedAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  await saveEthSess(s);
+  return { ok: true, ticketId: id, ...ticketView(s.tickets[id]) };
+}
+
 function enrollPayload(role, signerId, already) {
   const dapp = loadEthDapp() || {};
   const born = !!(dapp.seats?.[role]?.P || dapp.seats?.[String(role)]?.P);
@@ -522,6 +684,7 @@ export async function heartbeatEth3p({ signerId, seatEpoch } = {}) {
       needBirth: !!(share?.needBirth),
       seal: dapp?.seal || null,
       open: listOpenEthTickets().map(ticketView),
+      lastPaid: lastPaidEthTicket(),
     };
   });
 }
@@ -560,6 +723,7 @@ export async function publicEth3pStatus() {
     credits: (wraps.credits || []).slice(-20),
     burns: (wraps.burns || []).slice(-20),
     open: listOpenEthTickets().map(ticketView),
+    lastPaid: lastPaidEthTicket(),
     orbit: {
       liveCount: live.length,
       live,
@@ -862,6 +1026,15 @@ function listOpenEthTickets() {
   return Object.values(s.tickets || {}).filter(
     (t) => t && t.room !== false && t.status !== 'paid' && t.status !== 'abandoned',
   );
+}
+
+function lastPaidEthTicket() {
+  const s = loadEthSess();
+  const paid = Object.values(s.tickets || {}).filter(
+    (t) => t?.status === 'paid' && t.payout?.txHash,
+  );
+  paid.sort((a, b) => Number(b.payout?.at || 0) - Number(a.payout?.at || 0));
+  return paid[0] ? ticketView(paid[0]) : null;
 }
 
 /**
