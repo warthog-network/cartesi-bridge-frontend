@@ -123,13 +123,13 @@ let inspectSnapCache = { at: 0, value: null, inflight: null };
 
 export async function inspectPoolSnap() {
   const now = Date.now();
-  const ttl = Number(env('POOL_INSPECT_TTL_MS', '1500')) || 1500;
+  const ttl = Number(env('POOL_INSPECT_TTL_MS', '4000')) || 4000;
   if (inspectSnapCache.value && now - inspectSnapCache.at < ttl) {
     return inspectSnapCache.value;
   }
   if (inspectSnapCache.inflight) return inspectSnapCache.inflight;
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 4000);
+  const timer = setTimeout(() => ac.abort(), 8000);
   inspectSnapCache.inflight = (async () => {
     try {
       const res = await fetch(`${INSPECT.replace(/\/$/, '')}/pool`, {
@@ -471,6 +471,24 @@ function openRotateRooms() {
 }
 
 async function maybeOpenOrAdvanceSweep(r, next) {
+  const snap = await inspectPoolSnap().catch(() => null);
+  if (!snap) {
+    r.lastError = 'sweep wait: inspect down';
+    await saveRotate(r);
+    return;
+  }
+  if (normQ(snap.poolAddress) === normQ(next.address)) {
+    r.phase = 'cutover';
+    r.lastError = null;
+    await saveRotate(r);
+    return;
+  }
+  if (normQ(snap.pendingNext?.address || snap.pendingNext) !== normQ(next.address)) {
+    r.lastError = 'sweep wait: inspect pendingNext is not next Q';
+    await saveRotate(r);
+    return;
+  }
+
   const paid = listPaidPool3pTickets(48).find(
     (p) =>
       p.ticketId === r.sweepTicketId ||
@@ -563,9 +581,10 @@ function normQ(a) {
     .toLowerCase();
 }
 
-async function waitInspect(pred, tries = 16, ms = 500) {
+async function waitInspect(pred, tries = 6, ms = 1500) {
   let last = null;
   for (let i = 0; i < tries; i += 1) {
+    inspectSnapCache = { at: 0, value: null, inflight: null };
     last = await inspectPoolSnap().catch(() => null);
     if (last && pred(last)) return last;
     await new Promise((res) => setTimeout(res, ms));
