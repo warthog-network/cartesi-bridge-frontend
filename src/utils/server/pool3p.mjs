@@ -2175,16 +2175,15 @@ export async function pool3pOfferR1({
     }
     const nextHash = String(hashHex).replace(/^0x/i, '').toLowerCase();
     const nextR1 = String(R1Hex).replace(/^0x/i, '').toLowerCase();
-    // Phase 0: same R1 must not sign a different hash (nonce-reuse class).
-    if (prev.haveR1 && prev.R1Hex && prev.hashHex) {
-      const sameR1 = String(prev.R1Hex).replace(/^0x/i, '').toLowerCase() === nextR1;
-      const sameHash = String(prev.hashHex).replace(/^0x/i, '').toLowerCase() === nextHash;
-      if (sameR1 && !sameHash) {
-        throw new Error(
-          'R1 already bound to another hashHex — post a fresh k1 (same R1 + different z is nonce reuse)',
-        );
-      }
+    const prevR1 = String(prev.R1Hex || '').replace(/^0x/i, '').toLowerCase();
+    const prevHash = String(prev.hashHex || '').replace(/^0x/i, '').toLowerCase();
+    // Same k1/R1 must not sign a different z (ECDSA nonce reuse).
+    if (prev.haveR1 && prevR1 && prevHash && prevR1 === nextR1 && prevHash !== nextHash) {
+      throw new Error(
+        'R1 already bound to another hashHex — post a fresh k1 (same R1 + different z is nonce reuse)',
+      );
     }
+    const r1Changed = !!(prev.haveR1 && prevR1 && prevR1 !== nextR1);
     s.tickets[id] = fillRoomMeta(
       {
         ...prev,
@@ -2200,6 +2199,17 @@ export async function pool3pOfferR1({
       },
       { amountE8, toAddress },
     );
+    if (r1Changed) {
+      delete s.tickets[id].lindellBind;
+      delete s.tickets[id].ciphertext;
+      delete s.tickets[id].rHex;
+      delete s.tickets[id].RHex;
+      delete s.tickets[id].pokR;
+      delete s.tickets[id].pokC;
+      delete s.tickets[id].R2Hex;
+      delete s.tickets[id].Q2Hex;
+      delete s.tickets[id].ckeyAdj;
+    }
     stripPersistedD2(s.tickets[id]);
     if (s.tickets[id].haveR1 && hasRamD2(id)) {
       s.tickets[id].haveD2 = true;
