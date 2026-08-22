@@ -3487,6 +3487,32 @@ export default function FungiblePool({
         ? 'WART → wWART'
         : 'wWART → WART';
   const ethQ = eth3pSt?.address || '';
+  const wartKey = String(wartFrom || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  const ethLedger = (() => {
+    const credits = (eth3pSt?.credits || []).filter(
+      (c) => !wartKey || String(c.wartAddress || '').toLowerCase() === wartKey,
+    );
+    const wraps = (eth3pSt?.wraps || []).filter(
+      (w) => !wartKey || String(w.issuerWart || '').toLowerCase() === wartKey,
+    );
+    let locked = 0n;
+    let available = 0n;
+    for (const c of credits) {
+      locked += BigInt(c.amountE8 || 0);
+      available += BigInt(c.remainingE8 || 0);
+    }
+    let wartL1 = 0n;
+    for (const w of wraps) wartL1 += BigInt(w.outstandingE8 || 0);
+    const used = locked > available ? locked - available : 0n;
+    return {
+      availableHuman: humanFromE8(available),
+      lockedHuman: humanFromE8(locked),
+      usedHuman: humanFromE8(used),
+      wartL1Human: humanFromE8(wartL1),
+    };
+  })();
   const ageLabel = (() => {
     if (!refreshedAt) return null;
     const sec = Math.max(0, Math.round((Date.now() - refreshedAt) / 1000));
@@ -3639,7 +3665,16 @@ export default function FungiblePool({
                 ? 'Bind needed'
                 : 'Unbound'}
         </span>
-        {pool3pSt?.configured ? (
+        {swapAsset === 'ETH' && eth3pSt?.ok ? (
+          <>
+            <span className={`fp-chip${eth3pSt.e1Live ? ' is-ok' : ' is-wait'}`}>
+              {eth3pSt.e1Live ? 'e1 live' : 'e1 wait'}
+            </span>
+            <span className={`fp-chip${eth3pSt.e2Live ? ' is-ok' : ' is-wait'}`}>
+              {eth3pSt.e2Live ? 'e2 live' : 'e2 vacant'}
+            </span>
+          </>
+        ) : pool3pSt?.configured ? (
           <>
             <span className={`fp-chip${pool3pSt.d1Live ? ' is-ok' : ' is-wait'}`}>
               {pool3pSt.d1Live ? 'd1 live' : 'd1 wait'}
@@ -3670,66 +3705,50 @@ export default function FungiblePool({
           >
             <div className="wi-stat wi-stat--liquid">
               <Layers size={16} className="wi-stat-icon" />
-              <span className="wi-stat-k">
-                {swapAsset === 'ETH' ? 'e1' : 'Available'}
-              </span>
+              <span className="wi-stat-k">Available</span>
               <span className="wi-stat-v">
                 {swapAsset === 'ETH'
-                  ? eth3pSt?.e1Live
-                    ? 'live'
-                    : eth3pSt?.holder1
-                      ? 'assigned'
-                      : 'vacant'
+                  ? ethLedger.availableHuman
                   : (snap?.availableHuman ?? '…')}
               </span>
               <span className="wi-stat-hint">
-                {swapAsset === 'ETH' ? 'ETH 3P dealer' : 'your unused deposit'}
+                {swapAsset === 'ETH' ? 'unused ETH lock (can mint receipt)' : 'your unused deposit'}
               </span>
             </div>
             <div className="wi-stat">
-              <span className="wi-stat-k">
-                {swapAsset === 'ETH' ? 'e2' : 'Locked'}
-              </span>
+              <span className="wi-stat-k">Locked</span>
               <span className="wi-stat-v">
                 {swapAsset === 'ETH'
-                  ? eth3pSt?.e2Live
-                    ? 'live'
-                    : eth3pSt?.holder2
-                      ? 'assigned'
-                      : 'vacant'
+                  ? ethLedger.lockedHuman
                   : (snap?.lockedHuman ?? '…')}
               </span>
               <span className="wi-stat-hint">
-                {swapAsset === 'ETH' ? 'ETH 3P dealer' : 'your WART credited'}
+                {swapAsset === 'ETH' ? 'ETH credited to 3P' : 'your WART credited'}
               </span>
             </div>
             <div className="wi-stat">
-              <span className="wi-stat-k">
-                {swapAsset === 'ETH' ? 'Wraps' : 'Used'}
-              </span>
+              <span className="wi-stat-k">Used</span>
               <span className="wi-stat-v">
                 {swapAsset === 'ETH'
-                  ? String((eth3pSt?.wraps || []).length)
+                  ? ethLedger.usedHuman
                   : (snap?.claimedHuman ?? '…')}
               </span>
               <span className="wi-stat-hint">
-                {swapAsset === 'ETH' ? 'receipts on Warthog' : 'your minted claim'}
+                {swapAsset === 'ETH' ? 'minted as wETH receipt' : 'your minted claim'}
               </span>
             </div>
             <div className="wi-stat wi-stat--spoof">
               <span className="wi-stat-k">
-                {swapAsset === 'ETH' ? 'MetaMask ETH' : 'MetaMask wWART'}
+                {swapAsset === 'ETH' ? 'WART L1' : 'MetaMask wWART'}
               </span>
               <span className="wi-stat-v">
                 {swapAsset === 'ETH'
-                  ? mmEthBal != null
-                    ? Number(mmEthBal).toLocaleString(undefined, {
-                        maximumFractionDigits: 4,
-                      })
-                    : '—'
+                  ? ethLedger.wartL1Human
                   : mmWwartLabel}
               </span>
-              <span className="wi-stat-hint">your L1 token</span>
+              <span className="wi-stat-hint">
+                {swapAsset === 'ETH' ? 'receipt still on Warthog' : 'your L1 token'}
+              </span>
             </div>
           </div>
 
