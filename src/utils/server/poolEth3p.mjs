@@ -73,6 +73,17 @@ function nowMs() {
   return Date.now();
 }
 
+/** Serialize orbit/holders/dapp writes — overlapping heartbeats were clobbering liveCount. */
+let ethLock = Promise.resolve();
+function withEthLock(fn) {
+  const run = ethLock.then(fn, fn);
+  ethLock = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 function pointToCompressedHex(P) {
   return Buffer.from(P.toRawBytes(true)).toString('hex');
 }
@@ -215,7 +226,7 @@ async function touchOrbit(sid) {
   const o = loadOrbit();
   o.members = o.members || {};
   o.members[sid] = { lastSeen: new Date().toISOString() };
-  const keep = ORBIT_LIVE_MS * 3;
+  const keep = Math.max(ORBIT_LIVE_MS, SEAT_IDLE_MS) * 4;
   const now = nowMs();
   for (const [id, m] of Object.entries(o.members)) {
     const seen = Date.parse(m.lastSeen || 0);
@@ -395,9 +406,7 @@ function enrollPayload(role, signerId, already) {
   };
 }
 
-export async function enrollEth3pSigner({ signerId }) {
-  const sid = String(signerId || '').trim();
-  if (!sid) throw new Error('signerId required');
+async function enrollUnlocked(sid) {
   await ensureEth3pDapp();
   await maybeAbandonEthSeats();
   await touchOrbit(sid);
@@ -442,63 +451,70 @@ export async function enrollEth3pSigner({ signerId }) {
   };
 }
 
+export async function enrollEth3pSigner({ signerId }) {
+  const sid = String(signerId || '').trim();
+  if (!sid) throw new Error('signerId required');
+  return withEthLock(() => enrollUnlocked(sid));
+}
+
 export async function heartbeatEth3p({ signerId, seatEpoch } = {}) {
   const sid = String(signerId || '').trim();
   if (!sid) throw new Error('signerId required');
-  await ensureEth3pDapp();
-  await maybeAbandonEthSeats();
-  await touchOrbit(sid);
-  const h = loadHolders();
-  let role = 0;
-  for (const r of ['1', '2']) {
-    if (h.roles?.[r]?.signerId === sid) {
-      role = Number(r);
-      h.roles[r].lastSeen = new Date().toISOString();
-      await saveHolders(h);
+  return withEthLock(async () => {
+    await ensureEth3pDapp();
+    await maybeAbandonEthSeats();
+    await touchOrbit(sid);
+    const h = loadHolders();
+    let role = 0;
+    for (const r of ['1', '2']) {
+      if (h.roles?.[r]?.signerId === sid) {
+        role = Number(r);
+        h.roles[r].lastSeen = new Date().toISOString();
+        await saveHolders(h);
+      }
     }
-  }
-  let share = null;
-  let justClaimed = false;
-  if (role === 0) {
-    const claimed = await enrollEth3pSigner({ signerId: sid });
-    if (claimed && !claimed.waitlist && (claimed.role === 1 || claimed.role === 2)) {
-      role = Number(claimed.role);
-      share = claimed;
-      justClaimed = true;
-    } else {
-      share = claimed;
+    let share = null;
+    let justClaimed = false;
+    if (role === 0) {
+      const claimed = await enrollUnlocked(sid);
+      if (claimed && !claimed.waitlist && (claimed.role === 1 || claimed.role === 2)) {
+        role = Number(claimed.role);
+        share = claimed;
+        justClaimed = true;
+      } else {
+        share = claimed;
+      }
     }
-  }
-  const dapp = loadEthDapp();
-  const curEpoch = Number(dapp?.seatEpoch || 0);
-  if (role > 0) share = enrollPayload(role, sid, !justClaimed);
-  const live = liveOrbitMembers();
-  return {
-    ok: true,
-    role,
-    seatEpoch: curEpoch,
-    lostSeat: role === 0,
-    share,
-    shareUpdated: justClaimed,
-    holder1: currentHolderId(1),
-    holder2: currentHolderId(2),
-    orbit: {
-      liveCount: live.length,
-      live,
-      leaseMs: ORBIT_LIVE_MS,
-      seatIdleMs: SEAT_IDLE_MS,
-    },
-    clientBorn: true,
-    address: dapp?.address || null,
-    Pdapp: dapp?.Pdapp || null,
-    needBirth: !!(share?.needBirth),
-    seal: dapp?.seal || null,
-  };
+    const dapp = loadEthDapp();
+    const curEpoch = Number(dapp?.seatEpoch || 0);
+    if (role > 0) share = enrollPayload(role, sid, !justClaimed);
+    const live = liveOrbitMembers();
+    return {
+      ok: true,
+      role,
+      seatEpoch: curEpoch,
+      lostSeat: role === 0,
+      share,
+      shareUpdated: justClaimed,
+      holder1: currentHolderId(1),
+      holder2: currentHolderId(2),
+      orbit: {
+        liveCount: live.length,
+        live,
+        leaseMs: ORBIT_LIVE_MS,
+        seatIdleMs: SEAT_IDLE_MS,
+      },
+      clientBorn: true,
+      address: dapp?.address || null,
+      Pdapp: dapp?.Pdapp || null,
+      needBirth: !!(share?.needBirth),
+      seal: dapp?.seal || null,
+    };
+  });
 }
 
 export async function publicEth3pStatus() {
   await ensureEth3pDapp();
-  await maybeAbandonEthSeats();
   const d = loadEthDapp() || {};
   const live = liveOrbitMembers();
   const wraps = loadWraps();

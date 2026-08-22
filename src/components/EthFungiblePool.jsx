@@ -62,7 +62,7 @@ export default function EthFungiblePool({
 
   useEffect(() => {
     refresh().catch((e) => setStatusLine({ kind: 'err', text: e.message || String(e) }));
-    const id = setInterval(() => refresh().catch(() => null), 4000);
+    const id = setInterval(() => refresh().catch(() => null), 8000);
     return () => clearInterval(id);
   }, [refresh]);
 
