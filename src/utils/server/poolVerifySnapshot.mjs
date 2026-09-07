@@ -72,6 +72,7 @@ function extractWartHead(j) {
 }
 
 
+let inspectLocalCache = { at: 0, value: null };
 const INSPECT_LOCAL_TTL_MS = 8000;
 
 async function fetchInspectPoolLocal() {
