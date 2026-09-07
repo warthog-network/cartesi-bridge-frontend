@@ -94,6 +94,7 @@ import { tickEthRotation } from '../../utils/server/poolEth3pRotate.mjs';
 import { preparePool3pTransfer, submitPool3pTransfer } from '../../utils/server/pool3pPay.mjs';
 import { assertPayoutMatchesTicket } from '../../utils/server/poolTicketVerify.mjs';
 import { getTicketVerifySnapshot } from '../../utils/server/poolVerifySnapshot.mjs';
+import { notePackReport } from '../../utils/server/packReports.mjs';
 
 export const prerender = false;
 
@@ -845,6 +846,18 @@ export async function POST({ request }) {
       }
       if (prep?.alreadyPaid) return json(200, { ok: true, ...prep });
       return json(200, prep);
+    }
+    if (action === 'pool3p_pack_report' || action === 'eth3p_pack_report') {
+      return json(200, notePackReport(action.startsWith('eth3p') ? 'eth' : 'wart', {
+        signerId: body.signerId,
+        role: body.role,
+        packed: body.packed,
+        reason: body.reason,
+        targets: body.targets,
+        need: body.need,
+        live: body.live,
+        client: body.client,
+      }));
     }
     if (action === 'pool3p_skip') {
       return json(200, pool3pNoteSkip({

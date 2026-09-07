@@ -34,6 +34,7 @@ import {
   verifyEncEqualsDlog,
 } from '../lindellZk.js';
 import { createSealedPreshareStore } from './sealedPreshare.mjs';
+import { latestPackReport } from './packReports.mjs';
 import { ETH3P_ADAPTER_ABI } from '../eth3pAdapter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -776,6 +777,39 @@ function seatStranded(dapp, role, live = liveOrbitMembers()) {
  * redeem then parked at wait_d2 forever and rotation jammed behind the open
  * room, which reads as "e1 is stuck" even though e1 is perfectly healthy.
  */
+/** Per-seat pack coverage from the sealed store, plus the holder's own report. */
+function ethPacksView(live = liveOrbitMembers()) {
+  let packs = {};
+  try {
+    packs = ethPreshare.summary().packs || {};
+  } catch {
+    packs = {};
+  }
+  const h1 = currentHolderId(1);
+  const h2 = currentHolderId(2);
+  const out = {};
+  for (const r of ['1', '2']) {
+    const holder = r === '1' ? h1 : h2;
+    const other = r === '1' ? h2 : h1;
+    const need = live.filter((id) => id && id !== holder && id !== other);
+    const p = packs[r];
+    const holders = p?.holders || [];
+    const covered = need.filter((id) => holders.includes(id));
+    out[r] = {
+      ready: !!(p?.live && covered.length >= Math.min(Number(p?.t || 2), need.length || 1)),
+      present: !!p,
+      live: !!p?.live,
+      from: p?.from || null,
+      recipients: holders,
+      liveCovered: covered.length,
+      liveNeed: need.length,
+      at: p?.at || null,
+      holderSays: holder ? latestPackReport('eth', r, holder) : latestPackReport('eth', r),
+    };
+  }
+  return out;
+}
+
 function recoverableEthBornSeats(live = liveOrbitMembers()) {
   const dapp = loadEthDapp();
   const out = {};
@@ -1940,6 +1974,8 @@ export async function publicEth3pStatus() {
     // Which born seat is free for a proven pickup, and the P a claimant must
     // prove dlog of. A stranded seat is only fatal if nothing can claim it.
     ...ethRecoverVacantView(recoverableEthBornSeats(live)),
+    // Sealed pack coverage per seat + what the holder tab last said about packing.
+    packs: ethPacksView(live),
     /**
      * Reported by the seat holder itself when it cannot sign for the live Q —
      * the one failure the coordinator cannot infer. A seat with a fault looks

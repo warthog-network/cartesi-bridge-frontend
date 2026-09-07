@@ -48,6 +48,7 @@ import {
 } from './poolTicketVerify.mjs';
 import { createSealedPreshareStore } from './sealedPreshare.mjs';
 import { writeJsonAtomic, makeJsonGate } from './jsonStore.mjs';
+import { latestPackReport } from './packReports.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FE_ROOT = path.join(__dirname, '../../..');
@@ -1882,6 +1883,12 @@ export function packSnapshot() {
       next: nextReady,
     };
   }
+  // The holder tab's own account of its last pack attempt (pool3p_pack_report).
+  for (const r of ['1', '2']) {
+    const holder = r === '1' ? h1 : h2;
+    const says = holder ? latestPackReport('wart', r, holder) : latestPackReport('wart', r);
+    if (out[r]) out[r].holderSays = says;
+  }
   return out;
 }
 
@@ -1910,11 +1917,13 @@ export function recoverabilityView(packs = packSnapshot()) {
     const holder = currentHolderId(Number(r));
     const holderLive = !!(holder && live.includes(holder));
     const packReady = !!pack?.ready;
+    const holderSays = pack?.holderSays || null;
     seats[r] = {
       recoverable: packReady,
       packReady,
       holder: holder || null,
       holderLive,
+      holderSays,
       liveCovered: Number(pack?.liveCovered || 0),
       liveNeed: Number(pack?.liveNeed || 0),
       // The share is one browser away from gone: no pack, and if the holder
@@ -1930,6 +1939,9 @@ export function recoverabilityView(packs = packSnapshot()) {
             ? `pack not ready (${pack.liveCovered || 0}/${pack.liveNeed || 0} live recipients)`
             : 'no pack for the live seat P',
     };
+    if (!packReady && holderSays && !holderSays.packed) {
+      seats[r].reason += ` — holder tab says: ${holderSays.reason}`;
+    }
   }
   const atRisk = ['1', '2'].filter((r) => !seats[r].recoverable);
   return {
