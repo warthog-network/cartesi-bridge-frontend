@@ -3,16 +3,9 @@
  * - status / public info
  * - payout: hot-wallet WART after verified rollup pool_release_ticket
  * - request_credit / credits: deposit queue for SPV relayer
- * - lab ledger: ops-token or POOL_LAB_MUTATIONS=1 only
+ * - lab ledger: read-only status (mutations retired with Path A3)
  */
 import { applyPoolAction } from '../../utils/server/poolLedger.mjs';
-import {
-  getPoolHotPublic,
-  payoutPoolTicket,
-  resyncPoolHotNonce,
-  listUnpaidPoolTickets,
-  sweepUnpaidPoolTickets,
-} from '../../utils/server/poolPayout.mjs';
 import {
   requestPoolCredit,
   listPoolCredits,
@@ -29,7 +22,6 @@ import {
 import { FUNGIBLE_POOL } from '../../utils/fungiblePoolConfig.js';
 import { submitPoolSignerInput } from '../../utils/server/poolOnchainSigners.mjs';
 import {
-  pool3pOn,
   publicStatus as pool3pPublicStatus,
   loadDapp as loadPool3pDapp,
   pool3pOfferR1,
@@ -100,18 +92,8 @@ import {
 } from '../../utils/server/poolEth3p.mjs';
 import { tickEthRotation } from '../../utils/server/poolEth3pRotate.mjs';
 import { preparePool3pTransfer, submitPool3pTransfer } from '../../utils/server/pool3pPay.mjs';
-import { allowLabMutation } from '../../utils/server/poolOpsAuth.mjs';
 import { assertPayoutMatchesTicket } from '../../utils/server/poolTicketVerify.mjs';
-import {
-  getThresholdStatus,
-  openThresholdPayout,
-  openLabDemoThreshold,
-  contributeThresholdShare,
-  listOpenThresholdRequests,
-  heartbeatSigner,
-  enrollThresholdSigner,
-  getTicketVerifySnapshot,
-} from '../../utils/server/poolThreshold.mjs';
+import { getTicketVerifySnapshot } from '../../utils/server/poolVerifySnapshot.mjs';
 
 export const prerender = false;
 
@@ -190,6 +172,44 @@ async function fetchRollupPoolInspect(owner) {
   }
 }
 
+/**
+ * Path A3 (Shamir 3-of-n) and the hot wallet were retired when 3P Lindell
+ * became custody. Their actions answer 410 so an old client or ops script
+ * learns why instead of hitting a generic "unknown action".
+ */
+const RETIRED_ACTIONS = new Set([
+  'threshold_open', 'open_threshold', 'threshold_request',
+  'threshold_contribute', 'contribute_share', 'threshold_share',
+  'threshold_list', 'list_threshold',
+  'threshold_lab_demo', 'threshold_demo', 'lab_threshold_demo',
+  'resync_nonce', 'nonce_resync', 'list_unpaid', 'unpaid',
+  'sweep_unpaid', 'payout_unpaid',
+  'deposit', 'mint', 'burn', 'redeem', 'reset_lab',
+]);
+
+/** What `?threshold=1` / `threshold_status` mean now: the 3P rooms. */
+async function threshold3pView(ticketId) {
+  const p3 = pool3pPublicStatus() || {};
+  const open = listOpenPool3pTickets();
+  const base = {
+    ok: true,
+    custody: '3p-lindell',
+    thresholdMode: false,
+    poolAddress: p3.address || null,
+    open,
+    openCount: open.length,
+    signers: {
+      poolAddress: p3.address || null,
+      holder1: p3.holder1 || null,
+      holder2: p3.holder2 || null,
+      live: p3.orbit?.liveCount ?? null,
+    },
+  };
+  if (!ticketId) return base;
+  const t = await pool3pStatusTicket(ticketId);
+  return { ...base, ticketId: String(ticketId), found: !!t?.ok, ...(t?.ok ? t : {}) };
+}
+
 export async function GET({ request }) {
   try {
     const url = new URL(request.url);
@@ -207,39 +227,21 @@ export async function GET({ request }) {
       }
     }
     if (url.searchParams.get('public') === '1') {
-      // Under 3P, never call getPoolHotPublic() — retired hot key has no privateKeyHex
-      // and would pollute the public payload with livePool/hot errors.
-      if (pool3pOn()) {
-        const p3 = pool3pPublicStatus();
-        return json(200, {
-          ok: true,
-          address: p3?.address || null,
-          custody: '3p-lindell',
-          poolId: p3?.poolId || FUNGIBLE_POOL.poolId || 'wart-pool-0',
-          ...(p3 && typeof p3 === 'object' ? p3 : {}),
-        });
-      }
-      const pub = await getPoolHotPublic();
+      const p3 = pool3pPublicStatus();
       return json(200, {
         ok: true,
-        ...pub,
+        address: p3?.address || null,
+        custody: '3p-lindell',
+        poolId: p3?.poolId || FUNGIBLE_POOL.poolId || 'wart-pool-0',
+        ...(p3 && typeof p3 === 'object' ? p3 : {}),
       });
     }
-    if (url.searchParams.get('nonce') === '1') {
-      // Ops: show local nonce cursor (no secrets). Hot-only under Path A1.
-      if (pool3pOn()) {
-        return json(403, {
-          ok: false,
-          error:
-            'hot/A1 nonce disabled while POOL_3P_MODE=1; use 3P payout',
-        });
-      }
-      const pub = await getPoolHotPublic();
-      return json(200, { ok: true, ...pub });
-    }
-    if (url.searchParams.get('unpaid') === '1') {
-      const list = await listUnpaidPoolTickets();
-      return json(200, list);
+    if (url.searchParams.get('nonce') === '1' || url.searchParams.get('unpaid') === '1') {
+      return json(410, {
+        ok: false,
+        retired: true,
+        error: 'hot-wallet nonce/unpaid views are retired — custody is 3P Lindell',
+      });
     }
     if (url.searchParams.get('credits') === '1') {
       const owner = url.searchParams.get('owner') || undefined;
@@ -269,24 +271,14 @@ export async function GET({ request }) {
     }
     // Path A3 — 3-of-4 threshold pool status (no secrets)
     if (url.searchParams.get('threshold') === '1') {
-      const ticketId = url.searchParams.get('ticket') || undefined;
-      const st = await getThresholdStatus(ticketId);
-      if (pool3pOn()) {
-        const extra = listOpenPool3pTickets();
-        const have = new Set((st.open || []).map((r) => String(r.ticketId)));
-        st.open = [...(st.open || []), ...extra.filter((r) => !have.has(String(r.ticketId)))];
-        st.openCount = (st.open || []).length;
-      }
-      return json(200, st);
+      return json(200, await threshold3pView(url.searchParams.get('ticket') || undefined));
     }
     if (url.searchParams.get('lookup')) {
       const txHash = url.searchParams.get('lookup');
       const pool =
         url.searchParams.get('pool') ||
         FUNGIBLE_POOL.address ||
-        (pool3pOn()
-          ? pool3pPublicStatus()?.address
-          : (await getPoolHotPublic()).address);
+        pool3pPublicStatus()?.address;
       try {
         const flat = await verifyPoolDepositTx(txHash, pool);
         return json(200, {
@@ -309,10 +301,7 @@ export async function GET({ request }) {
     const owner = url.searchParams.get('owner') || undefined;
     // Prefer not advertising lab ledger as truth — status is secondary
     const lab = await applyPoolAction({ action: 'status', owner });
-    const p3 = pool3pOn() ? pool3pPublicStatus() : null;
-    // Under 3P, do NOT call getPoolHotPublic() — retired hot key returns
-    // {error: missing privateKeyHex} which must not land in livePool.
-    const pub = p3 ? null : await getPoolHotPublic();
+    const p3 = pool3pPublicStatus();
     let inspected = null;
     try {
       inspected = await fetchRollupPoolInspect(owner || '');
@@ -323,34 +312,22 @@ export async function GET({ request }) {
       p3?.address ||
       inspected?.poolAddress ||
       FUNGIBLE_POOL.address ||
-      pub?.address ||
       null;
     const credits = owner
       ? await listPoolCredits({ owner, limit: 20 })
       : { items: [] };
-    const livePool = p3
-      ? {
-          address: liveAddress,
-          custody: '3p-lindell',
-          poolId: p3.poolId || FUNGIBLE_POOL.poolId || undefined,
-          previous:
-            p3?.rotation?.last?.previous ||
-            inspected?.previousAddress ||
-            null,
-        }
-      : {
-          ...pub,
-          address: liveAddress,
-          custody: pub?.custody,
-          previous: inspected?.previousAddress || null,
-        };
+    const livePool = {
+      address: liveAddress,
+      custody: '3p-lindell',
+      poolId: p3?.poolId || FUNGIBLE_POOL.poolId || undefined,
+      previous: p3?.rotation?.last?.previous || inspected?.previousAddress || null,
+    };
     return json(200, {
       ...lab,
       poolAddress: liveAddress || lab.poolAddress,
       livePool,
       pendingCredits: credits.items || [],
-      mode: 'rollup+hot-payout+relayer',
-      labMutations: process.env.POOL_LAB_MUTATIONS === '1' ? 'open' : 'ops-token',
+      mode: 'rollup+3p-payout+relayer',
       note:
         'Deposit is 1-button (WART send → credit queue → SPV relayer). Prefer /inspect/pool for balances. Payout requires matching release ticket notice.',
     });
@@ -364,162 +341,54 @@ export async function POST({ request }) {
     const body = await request.json().catch(() => ({}));
     const action = String(body?.action || '').toLowerCase();
 
+    if (RETIRED_ACTIONS.has(action)) {
+      return json(410, {
+        ok: false,
+        retired: true,
+        error: `"${action}" was Path A3 / hot-wallet and is retired — custody is 3P Lindell (use payout / pool3p_*)`,
+      });
+    }
+
     if (action === 'payout') {
-      // Harden: ticket must exist on rollup with matching amount/to/owner
+      // Ticket must exist on the rollup with matching amount/to/owner.
       const verified = await assertPayoutMatchesTicket({
         ticketId: body.ticketId,
         toAddress: body.toAddress,
         amountE8: body.amountE8,
         owner: body.owner,
       });
-      // Path A3: UI can toggle useThreshold (default true when server allows).
-      // forceHot / useThreshold:false → single pool hot key (real WART).
-      const thrAvailable =
-        String(globalThis.process?.env?.['POOL_THRESHOLD_MODE'] || '') === '1';
-      const wantThreshold =
-        thrAvailable &&
-        body.forceHot !== true &&
-        body.useThreshold !== false &&
-        String(body.useThreshold).toLowerCase() !== '0' &&
-        String(body.useThreshold).toLowerCase() !== 'false';
-      if (pool3pOn()) {
-        rememberInspectTickets([verified]);
-        const opened = await openPool3pPayout({
-          ticketId: verified.ticketId,
-          toAddress: verified.toAddress || body.toAddress,
-          amountE8: verified.amountE8,
-        });
-        return json(200, {
-          ok: true,
-          ...opened,
-          ticketId: verified.ticketId,
-          toAddress: verified.toAddress || body.toAddress,
-          amountE8: String(verified.amountE8),
-          verifiedTicket: true,
-          phase: verified.phase,
-          mode: 'pool-3p',
-          custody: '3p-d1-d2',
-          note: 'Waiting for browser d1 + d2 Lindell (orbit n-of-n among live)',
-        });
-      }
-      if (wantThreshold) {
-        const pub = await getPoolHotPublic();
-        const opened = await openThresholdPayout({
-          ticketId: verified.ticketId,
-          toAddress: verified.toAddress || body.toAddress,
-          amountE8: verified.amountE8,
-          owner: verified.owner || body.owner,
-          poolAddress: pub.address || FUNGIBLE_POOL.address,
-          noticeIndex: verified.notice?._index,
-        });
-        return json(200, {
-          ...opened,
-          verifiedTicket: true,
-          phase: verified.phase,
-          mode: 'threshold-3of4',
-          custody: '3-of-4',
-          note: 'Waiting for ≥3 of 4 signers — real WART leaves pool after assemble',
-        });
-      }
-      // Defense: forceHot / A1 must never load hot key while 3P is live.
-      if (pool3pOn()) {
-        return json(403, {
-          ok: false,
-          error:
-            'hot/A1 payout disabled while POOL_3P_MODE=1; use 3P payout',
-        });
-      }
-      const result = await payoutPoolTicket({
+      rememberInspectTickets([verified]);
+      const opened = await openPool3pPayout({
         ticketId: verified.ticketId,
         toAddress: verified.toAddress || body.toAddress,
         amountE8: verified.amountE8,
-        owner: verified.owner || body.owner,
-        verifiedFromNotice: true,
-        noticeIndex: verified.notice?._index,
-        forceHot: true,
       });
       return json(200, {
-        ...result,
-        verifiedTicket: true,
-        phase: verified.phase,
-        mode: 'hot-wallet',
-        custody: 'hot-wallet',
-      });
-    }
-
-    // Path A3 — open threshold payout (explicit; also used when mode off for lab)
-    if (
-      action === 'threshold_open' ||
-      action === 'open_threshold' ||
-      action === 'threshold_request'
-    ) {
-      if (pool3pOn()) {
-        return json(403, {
-          ok: false,
-          error:
-            'threshold_open (A3) disabled while POOL_3P_MODE=1; use 3P payout',
-        });
-      }
-      const verified = await assertPayoutMatchesTicket({
-        ticketId: body.ticketId,
-        toAddress: body.toAddress,
-        amountE8: body.amountE8,
-        owner: body.owner,
-      });
-      const pub = await getPoolHotPublic();
-      const opened = await openThresholdPayout({
-        ticketId: verified.ticketId,
-        toAddress: verified.toAddress || body.toAddress,
-        amountE8: verified.amountE8,
-        owner: verified.owner || body.owner,
-        poolAddress: body.poolAddress || pub.address || FUNGIBLE_POOL.address,
-        noticeIndex: verified.notice?._index,
-      });
-      return json(200, {
+        ok: true,
         ...opened,
+        ticketId: verified.ticketId,
+        toAddress: verified.toAddress || body.toAddress,
+        amountE8: String(verified.amountE8),
         verifiedTicket: true,
         phase: verified.phase,
-        mode: 'threshold-3of4',
+        mode: 'pool-3p',
+        custody: '3p-d1-d2',
+        note: 'Waiting for browser d1 + d2 Lindell (orbit n-of-n among live)',
       });
-    }
-
-    if (
-      action === 'threshold_contribute' ||
-      action === 'contribute_share' ||
-      action === 'threshold_share'
-    ) {
-      const result = await contributeThresholdShare({
-        ticketId: body.ticketId,
-        shareIndex: body.shareIndex,
-        shareHex: body.shareHex,
-        signerId: body.signerId,
-        verification: body.verification,
-      });
-      return json(200, { ...result, mode: 'threshold-3of4' });
     }
 
     if (action === 'threshold_status' || action === 'threshold') {
-      const st = await getThresholdStatus(body.ticketId);
-      return json(200, st);
+      return json(200, await threshold3pView(body.ticketId));
     }
 
     if (action === 'threshold_heartbeat' || action === 'signer_heartbeat') {
-      const idx = Number(body.shareIndex);
-      if (pool3pOn() && !Number.isFinite(idx)) {
-        return json(
-          200,
-          await heartbeatPool3p({
-            signerId: body.signerId,
-            seatEpoch: body.seatEpoch ?? body.epoch,
-          }),
-        );
-      }
-      const hb = await heartbeatSigner({
-        signerId: body.signerId,
-        shareIndex: body.shareIndex,
-        epoch: body.epoch,
-      });
-      return json(200, hb);
+      return json(
+        200,
+        await heartbeatPool3p({
+          signerId: body.signerId,
+          seatEpoch: body.seatEpoch ?? body.epoch,
+        }),
+      );
     }
 
     if (action === 'pool3p_close_room' || action === 'pool3p_reset_room') {
@@ -1092,109 +961,10 @@ export async function POST({ request }) {
     }
 
     if (action === 'threshold_enroll' || action === 'enroll_signer' || action === 'pool3p_enroll') {
-      const d3 = loadPool3pDapp();
-      if (d3) {
-        const enrolled = await enrollPool3pSigner({
-          signerId: body.signerId,
-          role: body.role,
-        });
-        return json(200, enrolled);
-      }
-      const enrolled = await enrollThresholdSigner({
+      return json(200, await enrollPool3pSigner({
         signerId: body.signerId,
         role: body.role,
-      });
-      return json(200, enrolled);
-    }
-
-    if (action === 'threshold_list' || action === 'list_threshold') {
-      const st = await listOpenThresholdRequests();
-      return json(200, st);
-    }
-
-    // Lab: open faux 3-of-4 request (no real burn) for UI + faux-signers demo
-    if (
-      action === 'threshold_lab_demo' ||
-      action === 'threshold_demo' ||
-      action === 'lab_threshold_demo'
-    ) {
-      // Allow on lab host without ops token when POOL_THRESHOLD_LAB=1 (default on for demo)
-      const thrLab = String(globalThis.process?.env?.['POOL_THRESHOLD_LAB'] ?? '1');
-      const thrMode = String(globalThis.process?.env?.['POOL_THRESHOLD_MODE'] || '');
-      const labOk = thrLab !== '0' || thrMode === '1';
-      if (!labOk) {
-        const auth = (
-          await import('../../utils/server/poolOpsAuth.mjs')
-        ).requirePoolOps(request, body);
-        if (!auth.ok) {
-          return json(auth.status || 403, { ok: false, error: auth.error });
-        }
-      }
-      const opened = await openLabDemoThreshold({
-        amountE8: body.amountE8,
-        poolAddress: body.poolAddress,
-        toAddress: body.toAddress,
-      });
-      return json(200, {
-        ...opened,
-        mode: 'threshold-3of4-lab-demo',
-        note: 'Faux request opened — run pool-threshold-faux-signers.mjs to contribute 3/4 shares',
-      });
-    }
-
-    if (action === 'resync_nonce' || action === 'nonce_resync') {
-      if (pool3pOn()) {
-        return json(403, {
-          ok: false,
-          error:
-            'resync_nonce (hot) disabled while POOL_3P_MODE=1; use 3P payout',
-        });
-      }
-      const gate = allowLabMutation(request, body);
-      // Allow ops token OR lab env — same gate as lab mutations
-      if (!gate.ok) {
-        // Also allow if only ops token required
-        const { requirePoolOps } = await import(
-          '../../utils/server/poolOpsAuth.mjs'
-        );
-        const auth = requirePoolOps(request, body);
-        if (!auth.ok) {
-          return json(auth.status || 403, { ok: false, error: auth.error });
-        }
-      }
-      const result = await resyncPoolHotNonce();
-      return json(200, result);
-    }
-
-    if (action === 'list_unpaid' || action === 'unpaid') {
-      const list = await listUnpaidPoolTickets();
-      return json(200, list);
-    }
-
-    if (action === 'sweep_unpaid' || action === 'payout_unpaid') {
-      if (pool3pOn()) {
-        return json(403, {
-          ok: false,
-          error:
-            'sweep_unpaid (hot) disabled while POOL_3P_MODE=1; use 3P payout',
-        });
-      }
-      // Paying real WART — require ops token (or lab gate)
-      const gate = allowLabMutation(request, body);
-      if (!gate.ok) {
-        const { requirePoolOps } = await import(
-          '../../utils/server/poolOpsAuth.mjs'
-        );
-        const auth = requirePoolOps(request, body);
-        if (!auth.ok) {
-          return json(auth.status || 403, { ok: false, error: auth.error });
-        }
-      }
-      const result = await sweepUnpaidPoolTickets({
-        limit: body.limit,
-        dryRun: Boolean(body.dryRun),
-      });
-      return json(200, result);
+      }));
     }
 
     if (action === 'register_bind' || action === 'bind') {
@@ -1241,8 +1011,7 @@ export async function POST({ request }) {
     }
 
     if (action === 'request_credit' || action === 'credit') {
-      const pool3p = pool3pOn() ? pool3pPublicStatus() : null;
-      const pub = pool3p ? null : await getPoolHotPublic();
+      const pool3p = pool3pPublicStatus();
       let inspected = null;
       try {
         inspected = await fetchRollupPoolInspect('');
@@ -1253,8 +1022,7 @@ export async function POST({ request }) {
         pool3p?.address ||
         inspected?.poolAddress ||
         body.poolAddress ||
-        FUNGIBLE_POOL.address ||
-        pub?.address;
+        FUNGIBLE_POOL.address;
       let verified = null;
       let verifyError = null;
       if (body.txHash) {
@@ -1289,26 +1057,6 @@ export async function POST({ request }) {
       });
     }
 
-    // Lab ledger — blocked on public demo without ops token
-    if (
-      action === 'deposit' ||
-      action === 'mint' ||
-      action === 'burn' ||
-      action === 'redeem' ||
-      action === 'reset_lab'
-    ) {
-      const gate = allowLabMutation(request, body);
-      if (!gate.ok) {
-        return json(gate.status || 403, { ok: false, error: gate.error });
-      }
-      const result = await applyPoolAction(body || {});
-      return json(200, {
-        ...result,
-        mode: 'lab-ledger',
-        authMode: gate.mode,
-      });
-    }
-
     if (action === 'status') {
       const result = await applyPoolAction(body || {});
       return json(200, { ...result, mode: 'lab-ledger' });
@@ -1316,7 +1064,7 @@ export async function POST({ request }) {
 
     return json(400, {
       ok: false,
-      error: `unknown action "${action}" (payout|threshold_open|threshold_contribute|threshold_status|resync_nonce|list_unpaid|sweep_unpaid|request_credit|status|lab*)`,
+      error: `unknown action "${action}" (payout|pool3p_*|eth3p_*|request_credit|register_bind|status)`,
     });
   } catch (e) {
     const msg = e?.message || String(e);

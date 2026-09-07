@@ -107,11 +107,6 @@ const PAID_PATH =
 export const SIGNER_DIR =
   env('POOL_3P_SIGNER_DIR') || path.join(DEFAULT_DATA, 'pool-3p-signers');
 
-export function pool3pOn() {
-  const v = env('POOL_3P_MODE', '0').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'on' || v === 'yes';
-}
-
 /** Browsers birth d1/d2. VPS keeps only d_dapp + points + Enc(d1). */
 export function clientBornOn() {
   const v = env('POOL_3P_CLIENT_BORN', '0').trim().toLowerCase();
@@ -2414,14 +2409,14 @@ export async function claimBornSeat({ signerId, role, shareHex, pok }) {
 
 export function publicStatus() {
   const d = loadDapp();
-  if (!d) return { ok: false, configured: false, mode: pool3pOn() };
+  if (!d) return { ok: false, configured: false, mode: true };
   const h = loadHolders();
   // Computed once — recoverabilityView() is a pure read over the same snapshot.
   const packs3p = packSnapshot();
   return {
     ok: true,
     configured: true,
-    mode: pool3pOn(),
+    mode: true,
     scheme: d.scheme,
     address: d.address,
     legacyAddress: d.legacyAddress || '5a13ece9ba0e3f31fd1e6028a8330aba98f05bed714ac229',
