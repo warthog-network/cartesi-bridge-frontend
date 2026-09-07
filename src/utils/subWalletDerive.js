@@ -79,7 +79,7 @@ export async function deriveSubWallet(mnemonic, index) {
 
 /**
  * Derive only the private key hex (no 0x) for a salted sub-wallet index.
- * Shared by SubWallet / PersonalVaultMvp sweep+withdraw paths.
+ * Shared by SubWallet fund/withdraw paths.
  */
 export function deriveSubPrivateKey(mnemonic, index) {
   const { hdNode } = deriveSubHdNode(mnemonic, index);

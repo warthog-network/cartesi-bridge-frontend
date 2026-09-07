@@ -2,6 +2,7 @@
 // Streamlined app shell — primary path only; extras collapsed
 import Header from '../components/Header.astro';
 import WalletIsland from '../components/WalletIsland.jsx';
+import BridgeProgress from '../components/BridgeProgress.jsx';
 import NotesPanel from '../components/NotesPanel.jsx';
 import '../styles/global.css';
 ---
@@ -17,7 +18,14 @@ import '../styles/global.css';
   <body>
     <main class="container app-main">
       <Header />
-      <WalletIsland client:load />
+      <div class="app-grid">
+        <div class="app-primary">
+          <WalletIsland client:load />
+        </div>
+        <aside class="app-rail" aria-label="Bridge activity">
+          <BridgeProgress client:load />
+        </aside>
+      </div>
       <details class="app-extras app-notes">
         <summary>Changelog</summary>
         <NotesPanel client:load />
@@ -35,6 +43,16 @@ import '../styles/global.css';
   .container {
     max-width: 42rem;
   }
+  .app-grid {
+    min-width: 0;
+  }
+  .app-primary,
+  .app-rail {
+    min-width: 0;
+  }
+  .app-rail {
+    margin-top: 1rem;
+  }
   .app-extras {
     max-width: 42rem;
     width: 100%;
@@ -42,8 +60,9 @@ import '../styles/global.css';
     margin: 1rem auto 1.5rem;
     padding: 0.55rem 0.85rem;
     border-radius: 12px;
-    border: 1px solid #2a2a2a;
-    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(0, 255, 204, 0.12);
+    background: rgba(6, 10, 12, 0.55);
+    backdrop-filter: blur(10px);
     color: #bbb;
     font-size: 0.82rem;
     overflow-x: hidden;
@@ -81,5 +100,141 @@ import '../styles/global.css';
   .app-extras[open] summary {
     color: #00ffcc;
     margin-bottom: 0.5rem;
+  }
+
+  /* Phone / small tablet: an idle tracker is just noise below the fold. */
+  @media (max-width: 1099px) {
+    .app-rail:has(.bp-empty) {
+      display: none;
+    }
+  }
+
+  /* ── Desktop: two columns instead of one phone-width strip ───────── */
+  @media (min-width: 1100px) {
+    .container.app-main {
+      max-width: 74rem;
+      padding-left: 1.5rem;
+      padding-right: 1.5rem;
+      padding-bottom: 3rem;
+    }
+    .app-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 21rem;
+      gap: 1.4rem;
+      align-items: start;
+      text-align: left;
+    }
+    .app-rail {
+      position: sticky;
+      top: 1rem;
+      margin-top: 0;
+      max-height: calc(100vh - 2rem);
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+    .app-extras {
+      max-width: 100%;
+    }
+    /* .wi-shell pins itself to 42rem — the phone column — so on desktop the
+       content sat in a strip inside its own column. Let it fill, but keep the
+       swap panel itself at a readable width. */
+    .wi-shell.vault-section {
+      max-width: none;
+    }
+    .wi-shell.vault-section > .wi-net-card,
+    .wi-shell.vault-section > .wi-l1-block,
+    .wi-shell.vault-section > .fungible-pool,
+    .wi-shell.vault-section > .warthog-section,
+    .wi-shell.vault-section > .eth-section {
+      /* These are built for a ~42rem column; stretched to the full width their
+         primary buttons become 1000px bars. Keep them readable. */
+      max-width: 46rem;
+      margin-left: auto;
+      margin-right: auto;
+    }
+  }
+
+  /* ── Cockpit: at real desktop width the connected view stops being one
+     long scroll and becomes zones — a status strip across the top, the swap
+     panel as the hero with the wallet identity card beside it, then the big
+     wallet sections full width. The activity rail sits outside, to the right.
+     Toaster and the MetaMask modal are position:fixed, so they are out of
+     flow and never become grid items. ──────────────────────────────────── */
+  @media (min-width: 1500px) {
+    .container.app-main {
+      max-width: 92rem;
+    }
+    .app-grid {
+      grid-template-columns: minmax(0, 1fr) 23rem;
+      gap: 1.75rem;
+    }
+
+    .wi-shell.vault-section {
+      /* .wi-shell caps itself at 42rem — that is the phone column again. */
+      max-width: none;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-areas:
+        'net    l1'
+        'swap   swap'
+        'wallet eth';
+      gap: 0.9rem 1.3rem;
+      align-items: start;
+      justify-content: center;
+    }
+    .wi-shell.vault-section > .wi-net-card {
+      grid-area: net;
+      margin-bottom: 0 !important;
+    }
+    .wi-shell.vault-section > .fungible-pool {
+      grid-area: swap;
+      /* Spans the strip above it but stays a readable width, centred — a
+         swap panel stretched to 1000px is worse than one that is not. */
+      width: 100%;
+      max-width: 46rem;
+      justify-self: center;
+      margin-bottom: 0 !important;
+      /* The hero of the page — let it read as one. */
+      box-shadow:
+        0 0 0 1px rgba(0, 255, 204, 0.18),
+        0 18px 48px rgba(0, 0, 0, 0.6),
+        0 0 60px -20px rgba(0, 255, 204, 0.35) !important;
+    }
+    .wi-shell.vault-section > .wi-l1-block {
+      grid-area: l1;
+      margin-top: 0;
+    }
+    .wi-shell.vault-section > .warthog-section {
+      grid-area: wallet;
+      max-width: none;
+    }
+    .wi-shell.vault-section > .eth-section {
+      grid-area: eth;
+      max-width: none;
+    }
+    /* Either wallet section can be hidden from the L1 card — whichever is
+       left takes the whole row instead of leaving half the grid empty. */
+    .wi-shell.vault-section:not(:has(> .eth-section)) > .warthog-section,
+    .wi-shell.vault-section:not(:has(> .warthog-section)) > .eth-section {
+      grid-column: 1 / -1;
+      max-width: 46rem;
+      margin-left: auto;
+      margin-right: auto;
+    }
+  }
+
+  @media (min-width: 1800px) {
+    .container.app-main {
+      max-width: 104rem;
+    }
+    .app-grid {
+      grid-template-columns: minmax(0, 1fr) 26rem;
+    }
+    .wi-shell.vault-section {
+      gap: 1.1rem 1.6rem;
+    }
+    .wi-shell.vault-section > .fungible-pool {
+      max-width: 50rem;
+    }
   }
 </style>

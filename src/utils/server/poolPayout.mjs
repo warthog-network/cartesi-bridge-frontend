@@ -25,13 +25,13 @@ const NONCE_PATH =
 const NONCE_LOCK_DIR =
   process.env.FUNGIBLE_POOL_NONCE_LOCK || `${NONCE_PATH}.lock`;
 const NODE_URL =
-  process.env.WARTHOG_RPC ||
-  process.env.FUNGIBLE_POOL_NODE ||
+  globalThis.process?.env?.WARTHOG_RPC ||
+  globalThis.process?.env?.FUNGIBLE_POOL_NODE ||
   'https://warthog-defitestnet.duckdns.org';
 /** Extra node URLs tried for history/balance (comma-separated). */
 const NODE_URLS = [
   NODE_URL,
-  ...(process.env.FUNGIBLE_POOL_NODE_FALLBACKS || 'http://127.0.0.1:3000')
+  ...(globalThis.process?.env?.FUNGIBLE_POOL_NODE_FALLBACKS || 'http://127.0.0.1:3000')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
@@ -730,7 +730,7 @@ export async function listUnpaidPoolTickets({ last = 400 } = {}) {
   const tickets = [];
 
   const GRAPHQL =
-    process.env.CARTESI_GRAPHQL_URL || 'http://127.0.0.1:8080/graphql';
+    globalThis.process?.env?.CARTESI_GRAPHQL_URL || 'http://127.0.0.1:8080/graphql';
   try {
     const res = await fetch(GRAPHQL, {
       method: 'POST',
@@ -766,7 +766,7 @@ export async function listUnpaidPoolTickets({ last = 400 } = {}) {
 
   if (tickets.length === 0) {
     const INSPECT =
-      process.env.CARTESI_INSPECT_URL || 'http://127.0.0.1:8080/inspect';
+      globalThis.process?.env?.CARTESI_INSPECT_URL || 'http://127.0.0.1:8080/inspect';
     try {
       const res = await fetch(`${INSPECT}/pool`);
       const j = await res.json();

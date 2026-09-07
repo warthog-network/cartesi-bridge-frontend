@@ -32,8 +32,8 @@ function noticeMatchesLiveWwart(n) {
 }
 
 const GRAPHQL_URL =
-  process.env.CARTESI_GRAPHQL_URL ||
-  process.env.PUBLIC_GRAPHQL_URL ||
+  globalThis.process?.env?.CARTESI_GRAPHQL_URL ||
+  globalThis.process?.env?.PUBLIC_GRAPHQL_URL ||
   'http://127.0.0.1:8080/graphql';
 
 /** Min interval between full GraphQL pulls for the same process. */

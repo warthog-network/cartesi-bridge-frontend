@@ -171,7 +171,7 @@ async function fetchReleaseNoticeLocal(ticketId) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        query: `{ notices(last: 100${after}) { pageInfo { hasPreviousPage startCursor } edges { node { index payload } } } }`,
+        query: `{ notices(last: 100${after}) { pageInfo { hasPreviousPage startCursor } edges { node { index payload input { index } } } } }`,
       }),
     });
     if (!res.ok) throw new Error(`GraphQL HTTP ${res.status}`);
@@ -208,14 +208,73 @@ async function fetchReleaseNoticeLocal(ticketId) {
             : 0
         : -1;
       if (!best || rank > bestRank || (rank === bestRank && idx >= best._index)) {
-        best = { ...obj, _index: idx };
+        best = {
+          ...obj,
+          _index: idx,
+          _inputIndex: e?.node?.input?.index ?? null,
+          _payloadHex: e?.node?.payload || null,
+          _proof: null,
+          _hasProof: false,
+        };
       }
     }
-    if (best) return best;
+    if (best) break;
     if (!conn.pageInfo?.hasPreviousPage || !conn.pageInfo?.startCursor) break;
     cursor = conn.pageInfo.startCursor;
   }
+  // Browser signers fall back to this snapshot when their GraphQL call fails
+  // and then need the epoch proof to pass validateNotice — without it every
+  // fallback read as "epoch not claimed". Same input-index lookup as the client.
+  if (best && best._inputIndex != null) {
+    try {
+      best = { ...best, ...(await fetchNoticeProofByInput(best._inputIndex, id)) };
+    } catch {
+      /* proof stays null — client reports it as waiting */
+    }
+  }
   return best;
+}
+
+function noticeHasEpochProof(proof) {
+  const v = proof?.validity;
+  if (!v?.outputHashesRootHash || !v?.noticesEpochRootHash || !v?.machineStateHash) return false;
+  return (
+    Array.isArray(v.outputHashInOutputHashesSiblings) &&
+    v.outputHashInOutputHashesSiblings.length > 0 &&
+    Array.isArray(v.outputHashesInEpochSiblings) &&
+    v.outputHashesInEpochSiblings.length > 0
+  );
+}
+
+async function fetchNoticeProofByInput(inputIndex, ticketId) {
+  const idx = Number(inputIndex);
+  if (!Number.isFinite(idx) || idx < 0) return {};
+  const res = await fetch(GRAPHQL_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      query: `{ input(index: ${idx}) { index notices { edges { node { index payload input { index } proof { context validity { inputIndexWithinEpoch outputIndexWithinInput outputHashesRootHash vouchersEpochRootHash noticesEpochRootHash machineStateHash outputHashInOutputHashesSiblings outputHashesInEpochSiblings } } } } } } }`,
+    }),
+  });
+  if (!res.ok) throw new Error(`GraphQL input HTTP ${res.status}`);
+  const json = await res.json();
+  for (const e of json?.data?.input?.notices?.edges || []) {
+    let obj = null;
+    try {
+      obj = JSON.parse(hexToUtf8(e?.node?.payload));
+    } catch {
+      continue;
+    }
+    if (String(obj?.ticketId || '') !== String(ticketId)) continue;
+    const proof = e?.node?.proof || null;
+    return {
+      _index: Number(e?.node?.index ?? 0),
+      _payloadHex: e?.node?.payload || null,
+      _proof: proof,
+      _hasProof: noticeHasEpochProof(proof),
+    };
+  }
+  return {};
 }
 
 async function fetchWartHeadLocal() {

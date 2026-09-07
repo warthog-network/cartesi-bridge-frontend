@@ -43,6 +43,8 @@ import {
   rememberInspectTickets,
   birthClientSeat,
   rekeyClientD1Paillier,
+  openClientSeatPdl,
+  finishClientSeatPdl,
   rebuildLindell,
   pool3pReuseOrPrepare,
   pool3pSubmitGuarded,
@@ -63,7 +65,40 @@ import {
   maybeAbandonStaleSeats,
   closePool3pRoom,
   expireStaleUserRooms,
+  reopenAbandonedAuthorizedTickets,
+  wartSealedPreshare,
+  sealedPreshareFieldsFor,
+  rememberWartNode,
+  pool3pNoteSkip,
 } from '../../utils/server/pool3p.mjs';
+import {
+  eth3pOn,
+  publicEth3pStatus,
+  enrollEth3pSigner,
+  heartbeatEth3p,
+  birthEthSeat,
+  openEthSeatPdl,
+  finishEthSeatPdl,
+  creditEthLock,
+  registerEthWrap,
+  recordEthBurn,
+  bindEthOwner,
+  ETH_BURN_BIN,
+  openEthRedeem,
+  eth3pOfferR1,
+  eth3pOfferD2,
+  eth3pStatusTicket,
+  eth3pSubmit,
+  birthEthSeatNext,
+  openEthSeatPdlNext,
+  finishEthSeatPdlNext,
+  ethSealedPreshare,
+  claimBornEthSeat,
+  ethWrapIndex,
+  ethMintable,
+  classifyEthBurn,
+} from '../../utils/server/poolEth3p.mjs';
+import { tickEthRotation } from '../../utils/server/poolEth3pRotate.mjs';
 import { preparePool3pTransfer, submitPool3pTransfer } from '../../utils/server/pool3pPay.mjs';
 import { allowLabMutation } from '../../utils/server/poolOpsAuth.mjs';
 import { assertPayoutMatchesTicket } from '../../utils/server/poolTicketVerify.mjs';
@@ -118,23 +153,41 @@ function decodeInspectHex(payload) {
   }
 }
 
+/** Coalesce / TTL-cache inspect/pool. Concurrent inspect+advance kills the validator. */
+const INSPECT_TTL_MS = Number(globalThis.process?.env?.POOL_INSPECT_TTL_MS || 1500) || 1500;
+const inspectCache = new Map();
+
 async function fetchRollupPoolInspect(owner) {
   const base = String(
-    process.env.CARTESI_INSPECT_URL || 'http://127.0.0.1:8080/inspect',
+    globalThis.process?.env?.CARTESI_INSPECT_URL || 'http://127.0.0.1:8080/inspect',
   ).replace(/\/$/, '');
   const path = owner
     ? `${base}/pool/${String(owner).replace(/^0x/i, '').toLowerCase()}`
     : `${base}/pool`;
-  const res = await fetch(path, { cache: 'no-store' });
-  if (!res.ok) {
-    throw new Error(`inspect HTTP ${res.status}`);
+  const now = Date.now();
+  const hit = inspectCache.get(path);
+  if (hit?.value && now - hit.at < INSPECT_TTL_MS) return hit.value;
+  if (hit?.inflight) return hit.inflight;
+  const inflight = (async () => {
+    const res = await fetch(path, { cache: 'no-store' });
+    if (!res.ok) {
+      throw new Error(`inspect HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    const decoded = decodeInspectHex(data?.reports?.[0]?.payload);
+    if (!decoded || decoded.error) {
+      throw new Error(decoded?.error || 'inspect returned no pool report');
+    }
+    inspectCache.set(path, { at: Date.now(), value: decoded });
+    return decoded;
+  })();
+  inspectCache.set(path, { ...(hit || {}), inflight });
+  try {
+    return await inflight;
+  } finally {
+    const cur = inspectCache.get(path);
+    if (cur?.inflight === inflight) delete cur.inflight;
   }
-  const data = await res.json();
-  const decoded = decodeInspectHex(data?.reports?.[0]?.payload);
-  if (!decoded || decoded.error) {
-    throw new Error(decoded?.error || 'inspect returned no pool report');
-  }
-  return decoded;
 }
 
 export async function GET({ request }) {
@@ -154,17 +207,33 @@ export async function GET({ request }) {
       }
     }
     if (url.searchParams.get('public') === '1') {
+      // Under 3P, never call getPoolHotPublic() — retired hot key has no privateKeyHex
+      // and would pollute the public payload with livePool/hot errors.
+      if (pool3pOn()) {
+        const p3 = pool3pPublicStatus();
+        return json(200, {
+          ok: true,
+          address: p3?.address || null,
+          custody: '3p-lindell',
+          poolId: p3?.poolId || FUNGIBLE_POOL.poolId || 'wart-pool-0',
+          ...(p3 && typeof p3 === 'object' ? p3 : {}),
+        });
+      }
       const pub = await getPoolHotPublic();
-      const p3 = pool3pOn() ? pool3pPublicStatus() : null;
       return json(200, {
         ok: true,
         ...pub,
-        address: p3?.address || pub.address,
-        custody: p3 ? '3p-lindell' : pub.custody,
       });
     }
     if (url.searchParams.get('nonce') === '1') {
-      // Ops: show local nonce cursor (no secrets)
+      // Ops: show local nonce cursor (no secrets). Hot-only under Path A1.
+      if (pool3pOn()) {
+        return json(403, {
+          ok: false,
+          error:
+            'hot/A1 nonce disabled while POOL_3P_MODE=1; use 3P payout',
+        });
+      }
       const pub = await getPoolHotPublic();
       return json(200, { ok: true, ...pub });
     }
@@ -215,7 +284,9 @@ export async function GET({ request }) {
       const pool =
         url.searchParams.get('pool') ||
         FUNGIBLE_POOL.address ||
-        (await getPoolHotPublic()).address;
+        (pool3pOn()
+          ? pool3pPublicStatus()?.address
+          : (await getPoolHotPublic()).address);
       try {
         const flat = await verifyPoolDepositTx(txHash, pool);
         return json(200, {
@@ -238,8 +309,10 @@ export async function GET({ request }) {
     const owner = url.searchParams.get('owner') || undefined;
     // Prefer not advertising lab ledger as truth — status is secondary
     const lab = await applyPoolAction({ action: 'status', owner });
-    const pub = await getPoolHotPublic();
     const p3 = pool3pOn() ? pool3pPublicStatus() : null;
+    // Under 3P, do NOT call getPoolHotPublic() — retired hot key returns
+    // {error: missing privateKeyHex} which must not land in livePool.
+    const pub = p3 ? null : await getPoolHotPublic();
     let inspected = null;
     try {
       inspected = await fetchRollupPoolInspect(owner || '');
@@ -250,20 +323,31 @@ export async function GET({ request }) {
       p3?.address ||
       inspected?.poolAddress ||
       FUNGIBLE_POOL.address ||
-      pub.address ||
+      pub?.address ||
       null;
     const credits = owner
       ? await listPoolCredits({ owner, limit: 20 })
       : { items: [] };
+    const livePool = p3
+      ? {
+          address: liveAddress,
+          custody: '3p-lindell',
+          poolId: p3.poolId || FUNGIBLE_POOL.poolId || undefined,
+          previous:
+            p3?.rotation?.last?.previous ||
+            inspected?.previousAddress ||
+            null,
+        }
+      : {
+          ...pub,
+          address: liveAddress,
+          custody: pub?.custody,
+          previous: inspected?.previousAddress || null,
+        };
     return json(200, {
       ...lab,
       poolAddress: liveAddress || lab.poolAddress,
-      livePool: {
-        ...pub,
-        address: liveAddress,
-        custody: p3 ? '3p-lindell' : pub.custody,
-        previous: p3?.rotation?.last?.previous || inspected?.previousAddress || null,
-      },
+      livePool,
       pendingCredits: credits.items || [],
       mode: 'rollup+hot-payout+relayer',
       labMutations: process.env.POOL_LAB_MUTATIONS === '1' ? 'open' : 'ops-token',
@@ -337,6 +421,14 @@ export async function POST({ request }) {
           note: 'Waiting for ≥3 of 4 signers — real WART leaves pool after assemble',
         });
       }
+      // Defense: forceHot / A1 must never load hot key while 3P is live.
+      if (pool3pOn()) {
+        return json(403, {
+          ok: false,
+          error:
+            'hot/A1 payout disabled while POOL_3P_MODE=1; use 3P payout',
+        });
+      }
       const result = await payoutPoolTicket({
         ticketId: verified.ticketId,
         toAddress: verified.toAddress || body.toAddress,
@@ -361,6 +453,13 @@ export async function POST({ request }) {
       action === 'open_threshold' ||
       action === 'threshold_request'
     ) {
+      if (pool3pOn()) {
+        return json(403, {
+          ok: false,
+          error:
+            'threshold_open (A3) disabled while POOL_3P_MODE=1; use 3P payout',
+        });
+      }
       const verified = await assertPayoutMatchesTicket({
         ticketId: body.ticketId,
         toAddress: body.toAddress,
@@ -428,15 +527,248 @@ export async function POST({ request }) {
     }
     if (action === 'pool3p_status') {
       await expireStaleUserRooms().catch(() => ({ closed: [] }));
+      try {
+        const inspected = await fetchRollupPoolInspect('');
+        const recent = inspected?.recentTickets || [];
+        rememberInspectTickets(recent);
+        await reopenAbandonedAuthorizedTickets(recent);
+      } catch (e) {
+        console.warn('[pool3p] inspect/reopen', e?.message || e);
+      }
       await maybeAbandonStaleSeats().catch(() => []);
       let rotation = null;
       try {
-        const { tickRotation } = await import('../../utils/server/pool3pRotate.mjs');
-        rotation = await tickRotation();
+        const { tickRotation, rotationView } = await import(
+          '../../utils/server/pool3pRotate.mjs'
+        );
+        rotation = await Promise.race([
+          tickRotation(),
+          new Promise((resolve) =>
+            setTimeout(() => resolve(rotationView()), 5000),
+          ),
+        ]);
       } catch {
         /* */
       }
-      return json(200, { ...pool3pPublicStatus(), orbit: orbitSnapshot(), rotation });
+      // orbitKeys here too, not just on the heartbeat: packCachedSeat reads the
+      // status endpoint to pick who to seal to, and without keys every target
+      // is dropped as unsealable and the seat silently never packs.
+      const wartOrbit = orbitSnapshot();
+      return json(200, {
+        ...pool3pPublicStatus(),
+        orbit: wartOrbit,
+        orbitKeys: wartSealedPreshare.orbitKeys(wartOrbit?.live),
+        rotation,
+      });
+    }
+
+    if (action === 'eth3p_status') {
+      if (!eth3pOn()) return json(200, { ok: false, configured: false, error: 'ETH 3P off' });
+      const st = await publicEth3pStatus();
+      const rotation = await tickEthRotation().catch((e) => ({ lastError: String(e?.message || e) }));
+      return json(200, { ...st, rotation });
+    }
+    if (action === 'eth3p_enroll') {
+      return json(200, await enrollEth3pSigner({ signerId: body.signerId }));
+    }
+    if (action === 'eth3p_heartbeat') {
+      const hb = await heartbeatEth3p({
+        signerId: body.signerId,
+        seatEpoch: body.seatEpoch,
+        seatFault: body.seatFault,
+        nodePubHex: body.nodePubHex,
+        attestation: body.attestation,
+      });
+      const rotation = await tickEthRotation().catch((e) => ({
+        lastError: String(e?.message || e),
+      }));
+      return json(200, { ...hb, rotation });
+    }
+    // Take a born-but-vacant e1/e2 by proving dlog(P). Never births — the seat's
+    // P stays put, so the pool address cannot move. See claimBornEthSeat().
+    if (action === 'eth3p_claim_born') {
+      return json(200, await claimBornEthSeat({
+        signerId: body.signerId,
+        role: body.role,
+        shareHex: body.pok ? undefined : (body.shareHex || body.e1Hex || body.e2Hex),
+        pok: body.pok,
+      }));
+    }
+    if (action === 'eth3p_birth') {
+      return json(
+        200,
+        await birthEthSeat({
+          signerId: body.signerId,
+          role: body.role,
+          P: body.P,
+          encD1: body.encD1,
+          paillierN: body.paillierN,
+          paillierG: body.paillierG,
+          pok: body.pok,
+          rangeProof: body.rangeProof,
+        }),
+      );
+    }
+    if (action === 'eth3p_pdl_commit') {
+      return json(200, openEthSeatPdl({ signerId: body.signerId, comQ: body.comQ }));
+    }
+    if (action === 'eth3p_pdl_finish') {
+      return json(
+        200,
+        await finishEthSeatPdl({
+          signerId: body.signerId,
+          Qhat: body.Qhat,
+          nonceQ: body.nonceQ,
+          comQ: body.comQ,
+        }),
+      );
+    }
+    if (action === 'eth3p_credit') {
+      return json(
+        200,
+        await creditEthLock({
+          ethTxHash: body.ethTxHash || body.txHash,
+          amountWei: body.amountWei,
+          wartAddress: body.wartAddress,
+          fromEth: body.fromEth,
+        }),
+      );
+    }
+    if (action === 'eth3p_register_wrap') {
+      return json(
+        200,
+        await registerEthWrap({
+          assetHash: body.assetHash,
+          supplyE8: body.supplyE8,
+          issuerWart: body.issuerWart || body.wartAddress,
+          assetTxHash: body.assetTxHash,
+          assetName: body.assetName,
+        }),
+      );
+    }
+    if (action === 'eth3p_burn') {
+      return json(
+        200,
+        await recordEthBurn({
+          assetHash: body.assetHash,
+          amountE8: body.amountE8,
+          burnerWart: body.burnerWart || body.wartAddress,
+          wartTxHash: body.wartTxHash,
+        }),
+      );
+    }
+    if (action === 'eth3p_bind') {
+      return json(
+        200,
+        await bindEthOwner({
+          wartAddress: body.wartAddress,
+          ethAddress: body.ethAddress,
+        }),
+      );
+    }
+    if (action === 'eth3p_burn_bin') {
+      return json(200, { ok: true, burnBin: ETH_BURN_BIN });
+    }
+    /**
+     * Which Warthog WETH assets the current ledger still backs. Every wrap mints
+     * a new asset that displays as "WETH", and a reset orphans the old ones, so
+     * the UI must classify holdings against this rather than by name.
+     */
+    if (action === 'eth3p_mintable') {
+      return json(
+        200,
+        ethMintable({ issuerWart: body.issuerWart || body.wartAddress }),
+      );
+    }
+    if (action === 'eth3p_assets') {
+      return json(200, ethWrapIndex());
+    }
+    /**
+     * Read-only burn precheck. Must be called BEFORE signing the transfer to the
+     * burn bin — a Warthog transfer is irreversible, and recordEthBurn() can only
+     * reject an orphan after the tokens are already gone.
+     */
+    if (action === 'eth3p_precheck_burn') {
+      return json(
+        200,
+        await classifyEthBurn({ assetHash: body.assetHash, amountE8: body.amountE8 }),
+      );
+    }
+    if (action === 'eth3p_open_redeem' || action === 'eth3p_redeem') {
+      return json(
+        200,
+        await openEthRedeem({
+          wartTxHash: body.wartTxHash || body.txHash,
+          assetHash: body.assetHash,
+          amountE8: body.amountE8,
+          burnerWart: body.burnerWart || body.wartAddress,
+          ethAddress: body.ethAddress,
+        }),
+      );
+    }
+    if (action === 'eth3p_r1') {
+      return json(
+        200,
+        await eth3pOfferR1({
+          ticketId: body.ticketId,
+          signerId: body.signerId,
+          R1Hex: body.R1Hex,
+          hashHex: body.hashHex,
+        }),
+      );
+    }
+    if (action === 'eth3p_d2') {
+      return json(
+        200,
+        await eth3pOfferD2({
+          ticketId: body.ticketId,
+          signerId: body.signerId,
+          encD2: body.encD2,
+          encDlogProof: body.encDlogProof,
+          rangeProof: body.rangeProof,
+        }),
+      );
+    }
+    if (action === 'eth3p_ticket') {
+      return json(200, eth3pStatusTicket(body.ticketId));
+    }
+    if (action === 'eth3p_submit') {
+      return json(
+        200,
+        await eth3pSubmit({
+          ticketId: body.ticketId,
+          signature65: body.signature65,
+        }),
+      );
+    }
+    if (action === 'eth3p_birth_next') {
+      return json(
+        200,
+        await birthEthSeatNext({
+          signerId: body.signerId,
+          role: body.role,
+          P: body.P,
+          encD1: body.encD1,
+          paillierN: body.paillierN,
+          paillierG: body.paillierG,
+          pok: body.pok,
+          rangeProof: body.rangeProof,
+        }),
+      );
+    }
+    if (action === 'eth3p_pdl_commit_next') {
+      return json(200, openEthSeatPdlNext({ signerId: body.signerId, comQ: body.comQ }));
+    }
+    if (action === 'eth3p_pdl_finish_next') {
+      return json(
+        200,
+        await finishEthSeatPdlNext({
+          signerId: body.signerId,
+          Qhat: body.Qhat,
+          nonceQ: body.nonceQ,
+          comQ: body.comQ,
+        }),
+      );
     }
     if (action === 'pool3p_birth_next') {
       const { birthNextSeat } = await import('../../utils/server/pool3pRotate.mjs');
@@ -447,6 +779,8 @@ export async function POST({ request }) {
         encD1: body.encD1,
         paillierN: body.paillierN,
         paillierG: body.paillierG,
+        pok: body.pok,
+        rangeProof: body.rangeProof,
       }));
     }
     if (action === 'pool3p_announce_next') {
@@ -493,6 +827,14 @@ export async function POST({ request }) {
         signerId: body.signerId,
         seatEpoch: body.seatEpoch,
       });
+      // Remember this node's key so other seats can seal pieces to it, and hand
+      // back any pieces it should reseal for a tab trying to recover a seat.
+      await rememberWartNode({
+        signerId: body.signerId,
+        nodePubHex: body.nodePubHex,
+        attestation: body.attestation,
+      }).catch(() => null);
+      const sealedFields = sealedPreshareFieldsFor(body.signerId, hb?.orbit?.live);
       let rotation = null;
       try {
         const { tickRotation } = await import('../../utils/server/pool3pRotate.mjs');
@@ -500,7 +842,7 @@ export async function POST({ request }) {
       } catch {
         /* */
       }
-      return json(200, { ...hb, rotation });
+      return json(200, { ...hb, ...sealedFields, rotation });
     }
     if (action === 'pool3p_abandon' || action === 'abandon_seat') {
       return json(200, await abandonPool3pSeat({
@@ -528,16 +870,34 @@ export async function POST({ request }) {
       return json(200, await claimBornSeat({
         signerId: body.signerId,
         role: body.role,
-        shareHex: body.shareHex || body.d1Hex || body.d2Hex,
+        shareHex: body.pok ? undefined : (body.shareHex || body.d1Hex || body.d2Hex),
+        pok: body.pok,
       }));
     }
     if (action === 'pool3p_rekey_d1' || action === 'rekey_d1') {
       return json(200, await rekeyClientD1Paillier({
         signerId: body.signerId,
-        d1Hex: body.d1Hex,
         encD1: body.encD1,
         paillierN: body.paillierN,
         paillierG: body.paillierG,
+        pok: body.pok,
+        rangeProof: body.rangeProof,
+      }));
+    }
+    if (action === 'pool3p_pdl_commit') {
+      return json(200, openClientSeatPdl({
+        signerId: body.signerId,
+        comQ: body.comQ,
+        kind: body.kind || 'birth',
+      }));
+    }
+    if (action === 'pool3p_pdl_finish') {
+      return json(200, await finishClientSeatPdl({
+        signerId: body.signerId,
+        Qhat: body.Qhat,
+        nonceQ: body.nonceQ,
+        comQ: body.comQ,
+        kind: body.kind || 'birth',
       }));
     }
     if (action === 'pool3p_birth') {
@@ -548,32 +908,88 @@ export async function POST({ request }) {
         encD1: body.encD1,
         paillierN: body.paillierN,
         paillierG: body.paillierG,
+        pok: body.pok,
+        rangeProof: body.rangeProof,
       });
       return json(200, born);
     }
+    // --- sealed preshare packs -------------------------------------------
+    // The coordinator relays these; it cannot open any of them.
+    if (action === 'eth3p_preshare_put') {
+      return json(200, await ethSealedPreshare.putPack(body));
+    }
+    if (action === 'eth3p_preshare_reseal_request') {
+      return json(200, await ethSealedPreshare.requestReseal(body));
+    }
+    if (action === 'eth3p_preshare_reseal_put') {
+      return json(200, await ethSealedPreshare.putResealed(body));
+    }
+    if (action === 'eth3p_preshare_collect') {
+      return json(200, ethSealedPreshare.collect({ signerId: body.signerId, role: body.role }));
+    }
+    if (action === 'eth3p_preshare_status') {
+      return json(200, ethSealedPreshare.summary());
+    }
+    if (action === 'pool3p_preshare_reseal_request') {
+      return json(200, await wartSealedPreshare.requestReseal(body));
+    }
+    if (action === 'pool3p_preshare_reseal_put') {
+      return json(200, await wartSealedPreshare.putResealed(body));
+    }
+    if (action === 'pool3p_preshare_status') {
+      return json(200, wartSealedPreshare.summary());
+    }
     if (action === 'pool3p_preshare_put') {
-      return json(200, await putPreshare(body));
+      return json(
+        200,
+        body.pack ? await wartSealedPreshare.putPack(body) : await putPreshare(body),
+      );
     }
     if (action === 'pool3p_preshare_get') {
       return json(200, await getPresharePiece({ signerId: body.signerId, role: body.role }));
     }
     if (action === 'pool3p_preshare_collect') {
+      const sealed = wartSealedPreshare.collect({ signerId: body.signerId, role: body.role });
+      if (sealed?.pack) return json(200, sealed);
       return json(200, await collectPreshare({ signerId: body.signerId, role: body.role }));
     }
     if (action === 'pool3p_prepare') {
       const dapp = loadPool3pDapp();
       if (!dapp) return json(400, { error: '3P pool not configured' });
-      const prep = await pool3pReuseOrPrepare(body.ticketId, {
-        toAddress: body.toAddress,
-        amountE8: body.amountE8,
-        makePrep: () => preparePool3pTransfer({
-          fromAddress: dapp.address,
+      let prep;
+      try {
+        prep = await pool3pReuseOrPrepare(body.ticketId, {
           toAddress: body.toAddress,
           amountE8: body.amountE8,
-        }),
-      });
+          makePrep: () => preparePool3pTransfer({
+            fromAddress: dapp.address,
+            toAddress: body.toAddress,
+            amountE8: body.amountE8,
+          }),
+        });
+      } catch (e) {
+        // A failed prepare used to die in the 400 body — d1 stalled with no journal line.
+        console.warn(
+          `[pool3p] prepare failed ticket=${body.ticketId || '?'} signer=${String(body.signerId || '?').slice(0, 20)}: ${e?.message || e}`,
+        );
+        throw e;
+      }
       if (prep?.alreadyPaid) return json(200, { ok: true, ...prep });
       return json(200, prep);
+    }
+    if (action === 'pool3p_skip') {
+      return json(200, pool3pNoteSkip({
+        signerId: body.signerId,
+        role: body.role,
+        ticketId: body.ticketId,
+        reasons: body.reasons,
+        checks: body.checks,
+        sources: body.sources,
+        local: body.local,
+        gqlError: body.gqlError,
+        network: body.network,
+        client: body.client,
+      }));
     }
     if (action === 'pool3p_relindell' || action === 'relindell') {
       return json(200, await rebuildLindell(body.ticketId));
@@ -599,7 +1015,9 @@ export async function POST({ request }) {
       const r = await pool3pOfferD2({
         ticketId: body.ticketId,
         signerId: body.signerId,
-        d2Hex: body.d2Hex,
+        encD2: body.encD2,
+        encDlogProof: body.encDlogProof,
+        rangeProof: body.rangeProof,
         amountE8: body.amountE8,
         toAddress: body.toAddress,
       });
@@ -611,7 +1029,10 @@ export async function POST({ request }) {
     if (action === 'pool3p_submit') {
       const dapp = loadPool3pDapp();
       if (!dapp) return json(400, { error: '3P pool not configured' });
-      const already = paidRecordFor(body.ticketId, { amountE8: body.amountE8 });
+      const already = paidRecordFor(body.ticketId, {
+        amountE8: body.amountE8,
+        toAddress: body.toAddress,
+      });
       if (already) return json(200, { ok: true, alreadyPaid: true, ticketId: body.ticketId, ...already });
       const oq = orbitQuorumInfo(body.ticketId);
       if (!oq.ok) return json(403, { error: oq.message, orbit: oq });
@@ -625,8 +1046,18 @@ export async function POST({ request }) {
         });
         return json(200, paid);
       } catch (e) {
-        if (e?.code === 'HASH_MISMATCH') return json(409, { error: e.message });
-        throw e;
+        const msg = e?.message || String(e);
+        try {
+          const { writeFileSync, appendFileSync } = await import('node:fs');
+          appendFileSync(
+            '/opt/cartesi-bridge/cartesi-bridge-frontend/.data/pool-submit-err.log',
+            `${new Date().toISOString()} ${body.ticketId} ${msg}\n`,
+          );
+        } catch {
+          /* */
+        }
+        if (e?.code === 'HASH_MISMATCH') return json(409, { error: msg });
+        return json(400, { ok: false, error: msg });
       }
     }
 
@@ -712,6 +1143,13 @@ export async function POST({ request }) {
     }
 
     if (action === 'resync_nonce' || action === 'nonce_resync') {
+      if (pool3pOn()) {
+        return json(403, {
+          ok: false,
+          error:
+            'resync_nonce (hot) disabled while POOL_3P_MODE=1; use 3P payout',
+        });
+      }
       const gate = allowLabMutation(request, body);
       // Allow ops token OR lab env — same gate as lab mutations
       if (!gate.ok) {
@@ -734,6 +1172,13 @@ export async function POST({ request }) {
     }
 
     if (action === 'sweep_unpaid' || action === 'payout_unpaid') {
+      if (pool3pOn()) {
+        return json(403, {
+          ok: false,
+          error:
+            'sweep_unpaid (hot) disabled while POOL_3P_MODE=1; use 3P payout',
+        });
+      }
       // Paying real WART — require ops token (or lab gate)
       const gate = allowLabMutation(request, body);
       if (!gate.ok) {
@@ -796,20 +1241,20 @@ export async function POST({ request }) {
     }
 
     if (action === 'request_credit' || action === 'credit') {
-      const pub = await getPoolHotPublic();
+      const pool3p = pool3pOn() ? pool3pPublicStatus() : null;
+      const pub = pool3p ? null : await getPoolHotPublic();
       let inspected = null;
       try {
         inspected = await fetchRollupPoolInspect('');
       } catch {
         /* */
       }
-      const pool3p = pool3pOn() ? pool3pPublicStatus() : null;
       const poolAddress =
         pool3p?.address ||
         inspected?.poolAddress ||
         body.poolAddress ||
         FUNGIBLE_POOL.address ||
-        pub.address;
+        pub?.address;
       let verified = null;
       let verifyError = null;
       if (body.txHash) {
@@ -829,7 +1274,7 @@ export async function POST({ request }) {
         poolAddress,
         confirmations: body.confirmations ?? verified?.confirmations,
         source: body.source || 'fe',
-        requireVerified: process.env.POOL_CREDIT_REQUIRE_VERIFY === '1',
+        requireVerified: globalThis.process?.env?.POOL_CREDIT_REQUIRE_VERIFY === '1',
         verified: Boolean(verified),
       });
       return json(200, {

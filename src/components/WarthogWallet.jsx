@@ -5,7 +5,6 @@ import { toast } from 'react-hot-toast';
 import { Settings, LayoutGrid } from 'lucide-react';
 import TransactionHistory from './TransactionHistory';
 import SubWallet from './SubWallet';
-import PersonalVaultMvp from './PersonalVaultMvp';
 import '../styles/warthog.css';
 import '../styles/subWallet.css';
 import {
@@ -18,7 +17,12 @@ import {
   listWethWatch,
   addWethWatch,
   mergeEthWartAssetLinks,
-  listLocalEthWartAssets,
+  fetchLiveL1Epoch,
+  applyLiveEpochToWatch,
+  applyLiveEpochToLinks,
+  partitionWethLinks,
+  untrackWethLink,
+  clearOrphanedWethLinks,
 } from '../utils/mintEthWarthogAsset.js';
 import { getInspectUrl } from '../utils/bridgeConfig.js';
 
@@ -38,17 +42,33 @@ function decodeInspectPayloadLocal(payload) {
 /** Bridge-minted WETH assets watched for this Warthog address (linked to rollup claims). */
 function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Vault }) {
   const [items, setItems] = useState([]);
+  const [orphaned, setOrphaned] = useState([]);
+  const [liveEpoch, setLiveEpoch] = useState(null);
+  const [showOrphaned, setShowOrphaned] = useState(false);
   const [balances, setBalances] = useState({});
   const [refreshing, setRefreshing] = useState(false);
 
-  const loadItems = () => {
+  const applyList = (list, epoch) => {
+    const { current, orphaned: eggs } = partitionWethLinks(list, epoch);
+    setItems(current);
+    setOrphaned(eggs);
+    return [...current, ...eggs];
+  };
+
+  const loadItems = async () => {
     if (!wartAddress) {
       setItems([]);
+      setOrphaned([]);
       return [];
     }
-    const list = listWethWatch(wartAddress);
-    setItems(list);
-    return list;
+    const hit = await fetchLiveL1Epoch();
+    const epoch = hit.ok ? hit.epoch : null;
+    setLiveEpoch(epoch);
+    if (epoch) {
+      if (ownerL1) applyLiveEpochToLinks(ownerL1, epoch);
+      applyLiveEpochToWatch(wartAddress, epoch);
+    }
+    return applyList(listWethWatch(wartAddress), epoch);
   };
 
   const loadBalances = async (list) => {
@@ -129,13 +149,16 @@ function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Va
             ...it,
             ...byHash.get(it.assetHash),
             claimLinked: true,
-            status: it.status === 'released' ? 'released' : 'active',
+            status:
+              it.status === 'released' || it.status === 'orphaned'
+                ? it.status
+                : 'active',
             source: 'rollup',
           });
         }
       }
 
-      const list = loadItems();
+      const list = await loadItems();
       await loadBalances(list);
       if (typeof onRefreshL1Vault === 'function') {
         try {
@@ -144,12 +167,17 @@ function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Va
           /* optional */
         }
       }
-      const active = list.filter((l) => l.status === 'active').length;
-      const pending = list.filter((l) => l.status === 'pending').length;
+      const hit = await fetchLiveL1Epoch();
+      const epoch = hit.ok ? hit.epoch : null;
+      const { current, orphaned: eggs } = partitionWethLinks(list, epoch);
+      const active = current.filter((l) => l.status === 'active').length;
+      const pending = current.filter((l) => l.status === 'pending').length;
       toast.success(
-        pending
-          ? `Bridge WETH · ${active} active, ${pending} still pending`
-          : `Bridge WETH · ${active || list.length} active`,
+        eggs.length
+          ? `Bridge WETH · ${active} backed, ${eggs.length} unbacked (prior L1 session)`
+          : pending
+            ? `Bridge WETH · ${active} active, ${pending} still pending`
+            : `Bridge WETH · ${active || current.length} backed`,
         { id: toastId },
       );
     } catch (e) {
@@ -161,16 +189,17 @@ function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Va
 
   useEffect(() => {
     loadItems();
-  }, [wartAddress]);
+  }, [wartAddress, ownerL1]);
 
   useEffect(() => {
-    if (!wartAddress || !items.length || !selectedNode) return undefined;
+    const allForBal = [...items, ...orphaned];
+    if (!wartAddress || !allForBal.length || !selectedNode) return undefined;
     let cancelled = false;
     (async () => {
       try {
         const api = await createWarthogApi(selectedNode);
         const next = {};
-        for (const it of items.slice(0, 8)) {
+        for (const it of allForBal.slice(0, 8)) {
           if (!it.assetHash) continue;
           try {
             const res = await api.getAccountAssetBalance(wartAddress, it.assetHash);
@@ -190,9 +219,71 @@ function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Va
     return () => {
       cancelled = true;
     };
-  }, [wartAddress, items, selectedNode]);
+  }, [wartAddress, items, orphaned, selectedNode]);
 
-  if (!items.length) return null;
+  if (!items.length && !orphaned.length) return null;
+
+  const renderRow = (it, { unbacked } = {}) => (
+    <li
+      key={it.assetHash}
+      style={{
+        fontSize: '0.78rem',
+        border: '1px solid rgba(148,163,184,0.2)',
+        borderRadius: 6,
+        padding: '0.35rem 0.45rem',
+        opacity: unbacked ? 0.85 : 1,
+      }}
+    >
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+        <strong>{it.assetName || 'WETH'}</strong>
+        <span>{it.amount}</span>
+        {balances[it.assetHash] != null ? (
+          <span style={{ opacity: 0.85 }}>bal {balances[it.assetHash]}</span>
+        ) : null}
+        <span style={{ opacity: 0.75, textTransform: 'uppercase', fontSize: '0.7rem' }}>
+          {unbacked
+            ? 'unbacked — L1 session ended'
+            : it.status === 'pending'
+              ? 'pending'
+              : 'backed'}
+        </span>
+        <button
+          type="button"
+          className="btn secondary small"
+          style={{ marginLeft: 'auto' }}
+          onClick={async () => {
+            try {
+              await navigator.clipboard?.writeText(it.assetHash);
+              toast.success('WETH hash copied');
+            } catch {
+              toast.error('Copy failed');
+            }
+          }}
+        >
+          Copy
+        </button>
+        <button
+          type="button"
+          className="btn secondary small"
+          title="Remove from bridge tracking. The Warthog asset stays in the wallet."
+          onClick={() => {
+            untrackWethLink({
+              ownerL1,
+              wartAddress,
+              assetHash: it.assetHash,
+            });
+            loadItems();
+            toast.success('Untracked — asset stays on Warthog');
+          }}
+        >
+          Untrack
+        </button>
+      </div>
+      <code className="mono" style={{ wordBreak: 'break-all', opacity: 0.85 }}>
+        {it.assetHash.slice(0, 20)}…
+      </code>
+    </li>
+  );
 
   return (
     <div style={{ marginTop: '0.85rem' }}>
@@ -220,47 +311,51 @@ function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Va
         </button>
       </div>
       <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {items.slice(0, 6).map((it) => (
-          <li
-            key={it.assetHash}
-            style={{
-              fontSize: '0.78rem',
-              border: '1px solid rgba(148,163,184,0.2)',
-              borderRadius: 6,
-              padding: '0.35rem 0.45rem',
-            }}
-          >
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-              <strong>{it.assetName || 'WETH'}</strong>
-              <span>{it.amount}</span>
-              {balances[it.assetHash] != null ? (
-                <span style={{ opacity: 0.85 }}>bal {balances[it.assetHash]}</span>
-              ) : null}
-              <span style={{ opacity: 0.75, textTransform: 'uppercase', fontSize: '0.7rem' }}>
-                {it.status || 'active'}
-              </span>
-              <button
-                type="button"
-                className="btn secondary small"
-                style={{ marginLeft: 'auto' }}
-                onClick={async () => {
-                  try {
-                    await navigator.clipboard?.writeText(it.assetHash);
-                    toast.success('WETH hash copied');
-                  } catch {
-                    toast.error('Copy failed');
-                  }
-                }}
-              >
-                Copy
-              </button>
-            </div>
-            <code className="mono" style={{ wordBreak: 'break-all', opacity: 0.85 }}>
-              {it.assetHash.slice(0, 20)}…
-            </code>
-          </li>
-        ))}
+        {items.slice(0, 6).map((it) => renderRow(it))}
       </ul>
+      {orphaned.length > 0 ? (
+        <div style={{ marginTop: '0.55rem' }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <button
+              type="button"
+              className="btn secondary small"
+              onClick={() => setShowOrphaned((v) => !v)}
+            >
+              {showOrphaned ? 'Hide' : 'Show'} previous L1 session ({orphaned.length})
+            </button>
+            <button
+              type="button"
+              className="btn secondary small"
+              title="Drop unbacked links from this filter. Tokens stay on Warthog."
+              onClick={() => {
+                clearOrphanedWethLinks({ ownerL1, wartAddress, liveEpoch });
+                loadItems();
+                toast.success('Cleared unbacked links — tokens stay on Warthog');
+              }}
+            >
+              Clear orphaned
+            </button>
+          </div>
+          {showOrphaned ? (
+            <ul
+              style={{
+                listStyle: 'none',
+                margin: '0.4rem 0 0',
+                padding: 0,
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 6,
+              }}
+            >
+              {orphaned.slice(0, 8).map((it) => renderRow(it, { unbacked: true }))}
+            </ul>
+          ) : null}
+          <p className="wh-hint" style={{ margin: '0.35rem 0 0', fontSize: '0.72rem' }}>
+            Untrack removes the backing claim from this filter. The WETH asset stays
+            on Warthog (no burn).
+          </p>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -278,7 +373,7 @@ import {
   getNextNonceFromAccount,
 } from '../utils/warthogFormat.js';
 import { getSmartNonce, bumpNonceAfterSuccess } from '../utils/cancelLimitOrder.js';
-import { unlockSigningWorker, lockSigningWorker, terminateSigningWorker } from '../utils/signingBridge.js';
+import { unlockSigningWorker, lockSigningWorker, terminateSigningWorker, signMessageInWorker } from '../utils/signingBridge.js';
 import {
   PRESET_NODES,
   MAINNET_NODES,
@@ -394,7 +489,6 @@ const APP_TABS = [
   { id: 'getwwart', label: 'Get wWART' },
   { id: 'subwallets', label: 'Sub wallets' },
   { id: 'send', label: 'Send' },
-  { id: 'vault', label: 'Vault' },
   { id: 'activity', label: 'History' },
 ];
 
@@ -456,7 +550,7 @@ const WarthogWallet = ({
   onOptimisticShareMint,
   /** Notify parent when unlock/lock changes (ETH bridge subs need mnemonic) */
   onSessionChange,
-  /** Parent bridge helpers (Path A pool): { sendTransaction, getWartTxProof, address, selectedNode } */
+  /** Parent bridge helpers (Path A pool): sendTransaction, sendAsset, signMessage, getWartTxProof, address */
   onBridgeApi,
   /** Hide Warthog section (parent toggles showWarthog) */
   onToggleShowWallet,
@@ -1865,21 +1959,61 @@ const WarthogWallet = ({
     }
   };
 
+  /**
+   * Token transfer (wETH → burn bin, etc.). Address-only unlock is not enough —
+   * this is the signer the ETH unwrap path actually calls.
+   */
+  const handleSendAsset = async ({ assetHash, toAddress, amount: amountVal, decimals = 8 }) => {
+    if (!wallet?.address) throw new Error('Unlock Warthog wallet to send the asset');
+    if (!assetHash) throw new Error('assetHash required');
+    if (!toAddress) throw new Error('toAddress required');
+    const amt = String(amountVal ?? '').trim();
+    if (!amt) throw new Error('amount required');
+    const api = await createWarthogApi(selectedNode);
+    const nonceId = getSmartNonce(wallet.address, nextNonce ?? 0);
+    const submitResult = await signAndSubmitTransaction(api, {
+      privateKey: wallet.privateKey,
+      nonceId,
+      buildSpec: {
+        type: 'TRANSFER_ASSET',
+        assetHash,
+        toAddress,
+        amount: amt,
+        decimals,
+      },
+    });
+    bumpNonceAfterSuccess(wallet.address, submitResult.nonce, nextNonce ?? 0);
+    const data = formatSubmitResult(submitResult.data);
+    const txHash =
+      data?.data?.txHash ||
+      data?.txHash ||
+      data?.data?.hash ||
+      data?.hash ||
+      null;
+    return { ...data, txHash };
+  };
+
   // Expose send + proof helpers for Path A fungible pool (no cosigner)
   useEffect(() => {
     if (!onBridgeApi) return;
     if (wallet?.address) {
       onBridgeApi({
         sendTransaction: handleSendTransaction,
+        sendAsset: handleSendAsset,
         getWartTxProof,
+        signMessage: (message) => signMessageInWorker(message),
         address: wallet.address,
         selectedNode,
+        getAccountAssetBalance: async (assetHash) => {
+          const api = await createWarthogApi(selectedNode);
+          return api.getAccountAssetBalance(wallet.address, assetHash);
+        },
       });
     } else {
       onBridgeApi(null);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- stable bridge surface
-  }, [wallet?.address, selectedNode, onBridgeApi]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- sendAsset/sign close over current wallet
+  }, [wallet?.address, wallet?.privateKey, selectedNode, onBridgeApi]);
 
   const handleInstallClick = async () => {
     if (deferredPrompt) {
@@ -3500,26 +3634,6 @@ const WarthogWallet = ({
                   )}
                 </div>
 
-                {wallet.mnemonic && (
-                  <details className="wh-tools-exp">
-                    <summary>Experimental: personal asset vault</summary>
-                    <p className="wh-hint">
-                      Separate from WART multi-sig vaults (use the <strong>Vault</strong> tab for those).
-                    </p>
-                    <PersonalVaultMvp
-                      mainWallet={wallet}
-                      mainMnemonic={wallet.mnemonic}
-                      selectedNode={selectedNode}
-                      l1Address={l1Address}
-                      send={send}
-                      sendTransaction={handleSendTransaction}
-                      getWartTxProof={getWartTxProof}
-                      fetchBalanceAndNonce={fetchBalanceAndNonce}
-                      loading={propLoading}
-                      setLoading={propSetLoading}
-                    />
-                  </details>
-                )}
               </div>
             )}
           </div>
@@ -3602,35 +3716,20 @@ const WarthogWallet = ({
           </div>
         )}
 
-        {(appTab === 'subwallets' || appTab === 'vault') && wallet.mnemonic && (
+        {appTab === 'subwallets' && wallet.mnemonic && (
           <SubWallet
             mainWallet={wallet}
             mainMnemonic={wallet.mnemonic}
             selectedNode={selectedNode}
             fetchBalanceAndNonce={fetchBalanceAndNonce}
             sendTransaction={handleSendTransaction}
-            send={send}
             address={wallet.address}
-            l1Address={l1Address}
             loading={propLoading}
             setLoading={propSetLoading}
             subWallets={subWallets}
             setSubWallets={setSubWallets}
             subIndex={subIndex}
             setSubIndex={setSubIndex}
-            subDepositAmt={subDepositAmt}
-            setSubDepositAmt={setSubDepositAmt}
-            selectedSub={selectedSub}
-            setSelectedSub={setSelectedSub}
-            voucherPayload={voucherPayload}
-            setVoucherPayload={setVoucherPayload}
-            setWartToAddr={setToAddr}
-            setWartAmount={setAmount}
-            setWartFee={setFee}
-            getWartTxProof={getWartTxProof}
-            sentTransactions={sentTransactions}
-            focusMode={appTab === 'vault' ? 'vault' : 'bridge'}
-            onOpenVaultTab={() => setAppTab('vault')}
             l1Vault={l1Vault}
             mmWwartBal={mmWwartBal}
             onRefreshL1Vault={onRefreshL1Vault}
@@ -3655,10 +3754,10 @@ const WarthogWallet = ({
           />
         )}
 
-        {(appTab === 'subwallets' || appTab === 'vault') && !wallet.mnemonic && (
+        {appTab === 'subwallets' && !wallet.mnemonic && (
           <div className="wh-card wh-card--inset">
             <p className="wh-muted" style={{ marginBottom: 0 }}>
-              Bridge vaults need a seed-based wallet. Log in with a seed phrase (not private-key-only
+              Sub-wallets need a seed-based wallet. Log in with a seed phrase (not private-key-only
               import).
             </p>
           </div>

@@ -83,6 +83,28 @@ const ERC20_PORTAL_ADDRESS = _addrs.erc20Portal || LOCAL_ADDRESSES.erc20Portal;
 const _wwart = getWwartToken();
 const WWART_ADDRESS = (_wwart?.address || LOCAL_WWART?.address || '').toLowerCase();
 const ACTIVE_NETWORK_ID = getNetworkId();
+
+function wwartOfferKey(addr) {
+  const a = String(addr || '').toLowerCase();
+  const t = String(WWART_ADDRESS || '').toLowerCase();
+  return `wart.wwart.offered.${ACTIVE_NETWORK_ID}.${a}.${t}`;
+}
+function hasOfferedWwart(addr) {
+  if (!addr || !WWART_ADDRESS) return false;
+  try {
+    return localStorage.getItem(wwartOfferKey(addr)) === '1';
+  } catch {
+    return false;
+  }
+}
+function markOfferedWwart(addr) {
+  if (!addr || !WWART_ADDRESS) return;
+  try {
+    localStorage.setItem(wwartOfferKey(addr), '1');
+  } catch {
+    /* */
+  }
+}
 const CTSI_ADDRESS = "0xae7f61eCf06C65405560166b259C54031428A9C4";
 const USDC_ADDRESS = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
 
@@ -145,7 +167,7 @@ export default function WalletIsland() {
   const [rollupOnline, setRollupOnline] = useState(null);
   /**
    * ETH section tabs — mirrors Warthog section menu:
-   * overview | subwallets | vault | getwweth
+   * overview | subwallets
    */
   const [l1Tab, setL1Tab] = useState('overview');
   const [showEthSectionMenu, setShowEthSectionMenu] = useState(false);
@@ -153,16 +175,17 @@ export default function WalletIsland() {
   const [showEthLayersCard, setShowEthLayersCard] = useState(true);
   const ethSectionMenuRef = useRef(null);
   /** Local Get wWETH burn amount */
-  const [burnWethAmt, setBurnWethAmt] = useState('');
-  const [mintWethAmt, setMintWethAmt] = useState('');
   /**
    * When true (default): mint creates Warthog WETH (createAssets) + rollup claim,
    * linked 1:1 to the amount. Needs unlocked Warthog wallet + locked ETH capacity.
    */
-  const [mintWartEthAsset, setMintWartEthAsset] = useState(true);
   /** Last mint link + full merged list (inspect + localStorage) */
   const [lastEthWartAsset, setLastEthWartAsset] = useState(null);
   const [wethLinks, setWethLinks] = useState([]);
+  const [wethOrphaned, setWethOrphaned] = useState([]);
+  const [wethLiveEpoch, setWethLiveEpoch] = useState(null);
+  const [showWethOrphaned, setShowWethOrphaned] = useState(false);
+  const [wethResetBanner, setWethResetBanner] = useState('');
   /** Warthog session (mnemonic) for ETH bridge sub-wallet derivation */
   const [wartSession, setWartSession] = useState(null);
   /** Path A pool bridge helpers from WarthogWallet */
@@ -474,7 +497,7 @@ export default function WalletIsland() {
             `Auto-connected (${describeProvider(eth)}): ${addr.slice(0, 6)}...${addr.slice(-4)}`,
           );
           refreshVault(addr);
-          importWwartToken({ silent: true }).catch(() => {});
+          importWwartToken({ silent: true, skipIfOffered: true }).catch(() => {});
         }
       } catch (err) {
         console.log('No auto-connect');
@@ -833,12 +856,21 @@ export default function WalletIsland() {
    * token is not added on Ethereum mainnet. Checksum address — some wallets
    * reject lowercase. Object params first, then array (WalletConnect).
    */
-  const importWwartToken = async ({ silent = false } = {}) => {
+  const importWwartToken = async ({ silent = false, skipIfOffered = false } = {}) => {
     const raw = WWART_ADDRESS || LOCAL_WWART?.address || '';
     if (!raw) {
       if (!silent) toast.error('wWART token not configured');
       return false;
     }
+    const who = address || (await (async () => {
+      try {
+        const accs = await (getEip1193() || window.ethereum)?.request?.({ method: 'eth_accounts' });
+        return accs?.[0] || '';
+      } catch {
+        return '';
+      }
+    })());
+    if (skipIfOffered && who && hasOfferedWwart(who)) return true;
     let addr = raw;
     try {
       addr = ethers.getAddress(raw);
@@ -874,6 +906,7 @@ export default function WalletIsland() {
           params: [payload],
         });
       }
+      if (who) markOfferedWwart(who);
       if (added) {
         if (!silent) toast.success(`${symbol} added · ${addr.slice(0, 8)}…`);
         return true;
@@ -888,6 +921,7 @@ export default function WalletIsland() {
       }
       return false;
     } catch (e) {
+      if (silent && who) markOfferedWwart(who);
       if (!silent) {
         try {
           await navigator.clipboard?.writeText(addr);
@@ -1030,8 +1064,6 @@ export default function WalletIsland() {
     });
     setSpoofedWwart({ history: [], burnHistory: [], total: '0', totalBurned: '0' });
     setL1Tab('overview');
-    setBurnWethAmt('');
-    setMintWethAmt('');
     setWithdrawWwartAmt('');
     setWwartDepositAmt('');
   };
@@ -1148,7 +1180,7 @@ export default function WalletIsland() {
       toast.success(`Connected (${label}): ${addr.slice(0, 6)}...${addr.slice(-4)}`);
       refreshVault(addr);
       // Add live wWART on this chain (no-op if the wallet already has it).
-      importWwartToken({ silent: true }).catch(() => {});
+      importWwartToken({ silent: true, skipIfOffered: true }).catch(() => {});
 
       // Keep session in sync for WC disconnects
       if (isWalletConnectProvider(eth) && eth.on) {
@@ -1464,13 +1496,22 @@ export default function WalletIsland() {
 
       // Merge rollup-linked WETH assets with browser registry (works pre-backend-rebuild)
       try {
-        const { mergeEthWartAssetLinks } = await import(
+        const { reconcileWethLinks } = await import(
           '../utils/mintEthWarthogAsset.js'
         );
-        const merged = mergeEthWartAssetLinks(addr, nextVault.ethWartAssets);
-        nextVault.ethWartAssets = merged;
-        setWethLinks(merged);
-        if (merged[0]) setLastEthWartAsset(merged[0]);
+        const rec = await reconcileWethLinks(addr, nextVault.ethWartAssets);
+        nextVault.ethWartAssets = rec.all;
+        setWethLinks(rec.current);
+        setWethOrphaned(rec.orphaned);
+        setWethLiveEpoch(rec.epoch);
+        if (rec.orphaned.length) {
+          setWethResetBanner(
+            `L1 session reset — ${rec.orphaned.length} WETH link(s) are unbacked (prior Anvil session).`,
+          );
+        } else {
+          setWethResetBanner('');
+        }
+        if (rec.current[0]) setLastEthWartAsset(rec.current[0]);
       } catch {
         /* optional */
       }
@@ -1952,238 +1993,11 @@ export default function WalletIsland() {
   const ETH_TABS = [
     { id: 'overview', label: 'Overview' },
     { id: 'subwallets', label: 'Sub wallets' },
-    { id: 'vault', label: 'Vaults' },
-    { id: 'getwweth', label: 'Get wWETH' },
   ];
 
-  const ethCapSummary = (() => {
-    const human = (weiStr) => {
-      try {
-        return ethers.formatEther(BigInt(String(weiStr || '0')));
-      } catch {
-        return '0';
-      }
-    };
-    const pretty = (h) => {
-      const n = Number(h);
-      if (!Number.isFinite(n)) return String(h);
-      return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
-    };
-    const capacityH = human(vault?.ethCapacity18);
-    const usedH = human(vault?.ethClaimed18);
-    const availableH = human(vault?.ethRemaining18);
-    const claimH = human(vault?.l1WethClaim);
-    const portableH = human(vault?.wethPortable);
-    return {
-      capacity: pretty(capacityH),
-      used: pretty(usedH),
-      available: pretty(availableH),
-      claim: pretty(claimH),
-      portable: pretty(portableH),
-      capacityRaw: capacityH,
-      usedRaw: usedH,
-      availableRaw: availableH,
-      claimRaw: claimH,
-      portableRaw: portableH,
-    };
-  })();
 
-  const refreshWethLinks = async (owner = address) => {
-    if (!owner) return;
-    const toastId = toast.loading('Refreshing WETH link status…');
-    try {
-      const { mergeEthWartAssetLinks, listLocalEthWartAssets } = await import(
-        '../utils/mintEthWarthogAsset.js'
-      );
-      // Fresh inspect — do not trust stale React vault state for pending→active
-      let inspectAssets = [];
-      try {
-        const hex = String(owner).replace(/^0x/i, '').toLowerCase();
-        const base = getInspectUrl().replace(/\/$/, '');
-        const res = await fetch(`${base}/vault/${hex}`, { cache: 'no-store' });
-        const data = await res.json();
-        if (data.reports?.length > 0) {
-          const json = decodeInspectPayload(data.reports[0].payload);
-          if (json && !json.error && Array.isArray(json.ethWartAssets)) {
-            inspectAssets = json.ethWartAssets;
-          }
-        }
-      } catch {
-        /* merge local-only below */
-      }
 
-      const finalList = mergeEthWartAssetLinks(owner, inspectAssets);
-      const list = finalList.length ? finalList : listLocalEthWartAssets(owner);
-      setWethLinks(list);
-      setVault((prev) => ({
-        ...prev,
-        ethWartAssets: list,
-        ...(inspectAssets.length
-          ? {}
-          : {}),
-      }));
-      if (list[0]) setLastEthWartAsset(list[0]);
 
-      // Also refresh capacity numbers so Available/Used match rollup
-      await refreshVault(owner);
-
-      const active = list.filter((l) => l.status === 'active').length;
-      const pending = list.filter((l) => l.status === 'pending').length;
-      toast.success(
-        pending
-          ? `Links refreshed · ${active} active, ${pending} pending (rollup has no link for those yet)`
-          : `Links refreshed · ${active || list.length} active`,
-        { id: toastId },
-      );
-    } catch (e) {
-      toast.error(e?.message || 'Refresh failed', { id: toastId });
-    }
-  };
-
-  const mintWethClaim = async () => {
-    const amt = String(mintWethAmt || '').trim();
-    if (!amt) return toast.error('Enter mint amount');
-
-    // Capacity gate: locked ETH must leave Available > 0
-    let remainingWei = 0n;
-    let capacityWei = 0n;
-    try {
-      const { ethCapacityFromVault } = await import(
-        '../utils/mintEthWarthogAsset.js'
-      );
-      const cap = ethCapacityFromVault(vault);
-      remainingWei = cap.remainingWei;
-      capacityWei = cap.capacityWei;
-      if (!cap.hasLocked || capacityWei <= 0n) {
-        return toast.error(
-          'No locked ETH capacity — lock vault ETH under Vaults first',
-        );
-      }
-      if (!cap.hasAvailable || remainingWei <= 0n) {
-        return toast.error(
-          'ETH capacity fully used — burn claims or lock more ETH',
-        );
-      }
-    } catch {
-      /* proceed; rollup still enforces */
-    }
-
-    try {
-      setLoading(true);
-      let assetLink = null;
-      const {
-        createWarthogEthAsset,
-        claimLinkPayload,
-        markLinkClaimed,
-        mergeEthWartAssetLinks,
-      } = await import('../utils/mintEthWarthogAsset.js');
-
-      // Native Warthog WETH (linked to claim amount) when capacity available
-      if (mintWartEthAsset) {
-        if (!wartSession?.address) {
-          return toast.error(
-            'Unlock Warthog wallet first to mint on-chain WETH',
-          );
-        }
-        const toastId = toast.loading(
-          `Creating WETH on Warthog for ${amt}…`,
-        );
-        try {
-          const nodeUrl =
-            wartSession?.selectedNode ||
-            (typeof localStorage !== 'undefined'
-              ? localStorage.getItem('selectedNode')
-              : null);
-          assetLink = await createWarthogEthAsset({
-            amount: amt,
-            wartAddress: wartSession.address,
-            nodeUrl: nodeUrl || undefined,
-            ownerL1: address,
-            remainingWei,
-          });
-          setLastEthWartAsset(assetLink);
-          toast.loading(
-            `WETH ${assetLink.assetHash.slice(0, 12)}… — opening rollup claim…`,
-            { id: toastId },
-          );
-        } catch (e) {
-          toast.error(e?.message || 'Warthog WETH mint failed', {
-            id: toastId,
-            duration: 8000,
-          });
-          return;
-        }
-        toast.dismiss(toastId);
-      }
-
-      await send({
-        type: 'mint_weth_claim',
-        amount: amt,
-        ...claimLinkPayload(assetLink, wartSession?.address),
-      });
-
-      if (assetLink?.assetHash) {
-        markLinkClaimed(address, assetLink.assetHash, {
-          amount: assetLink.amount,
-          wartAddress: wartSession?.address,
-          assetName: assetLink.assetName,
-        });
-        const merged = mergeEthWartAssetLinks(address, [
-          { ...assetLink, claimLinked: true, status: 'active', source: 'local' },
-          ...(vault?.ethWartAssets || []),
-        ]);
-        setWethLinks(merged);
-        setVault((prev) => ({ ...prev, ethWartAssets: merged }));
-        setLastEthWartAsset(merged[0] || assetLink);
-      }
-
-      toast.success(
-        assetLink
-          ? `Linked WETH ${assetLink.assetHash.slice(0, 12)}… · ${amt} claim open`
-          : `Minted ${amt} wETH claim (rollup only)`,
-        { duration: 8000 },
-      );
-      setMintWethAmt('');
-      setTimeout(() => refreshVault(address), 4000);
-    } catch (e) {
-      /* send toasts */
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const burnWethClaim = async () => {
-    const amt = String(burnWethAmt || '').trim();
-    if (!amt) return toast.error('Enter burn amount');
-    try {
-      setLoading(true);
-      await send({ type: 'burn_weth_claim', amount: amt });
-      try {
-        const { markLinksReleasedFifo, mergeEthWartAssetLinks } = await import(
-          '../utils/mintEthWarthogAsset.js'
-        );
-        const { released } = markLinksReleasedFifo(address, amt);
-        const merged = mergeEthWartAssetLinks(address, vault?.ethWartAssets);
-        setWethLinks(merged);
-        setVault((prev) => ({ ...prev, ethWartAssets: merged }));
-        const n = released.length;
-        toast.success(
-          n
-            ? `Burned ${amt} claim — Available ↑ · marked ${n} WETH link(s) released (tokens stay on Warthog)`
-            : `Burned ${amt} wETH claim — Available ↑`,
-          { duration: 7000 },
-        );
-      } catch {
-        toast.success(`Burned ${amt} wETH claim — Available ↑`);
-      }
-      setBurnWethAmt('');
-      setTimeout(() => refreshVault(address), 4000);
-    } catch (e) {
-      /* send toasts */
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const renderPortalAsset = ({
     label,
@@ -2386,7 +2200,7 @@ export default function WalletIsland() {
       {mmTxModal}
 
       <div
-        className="wi-panel"
+        className="wi-panel wi-net-card"
         style={{
           marginBottom: '0.75rem',
           padding: '0.55rem 0.75rem',
@@ -2440,7 +2254,7 @@ export default function WalletIsland() {
         </div>
       </div>
 
-      {/* Path A — fungible shared pool (does not touch cosigner / sub-wallets) */}
+      {/* Path A — fungible shared pool (independent of sub-wallets) */}
       <FungiblePool
         ownerAddress={address}
         send={send}
@@ -2941,12 +2755,8 @@ export default function WalletIsland() {
                               : tab.id === 'overview'
                                 ? 'ETH capacity Overview'
                                 : tab.id === 'subwallets'
-                                  ? 'ETH sub-wallets · fund & create vault'
-                                  : tab.id === 'vault'
-                                    ? 'ETH multi-sig vaults only'
-                                    : tab.id === 'getwweth'
-                                      ? 'Mint / burn wETH claims'
-                                      : undefined
+                                  ? 'ETH sub-wallets · fund from MetaMask'
+                                  : undefined
                           }
                           onClick={() => {
                             if (disabled) return;
@@ -3063,41 +2873,6 @@ export default function WalletIsland() {
                 <div className="sw-meta-row">
                   <span
                     className="sw-meta-k"
-                    title="Locked vault ETH capacity (ETH pool only — not WART)"
-                  >
-                    ETH capacity
-                  </span>
-                  <span className="sw-meta-v">{ethCapSummary.capacity} ETH</span>
-                </div>
-                <div className="sw-meta-row">
-                  <span
-                    className="sw-meta-k"
-                    title="wETH claims using ETH capacity"
-                  >
-                    ETH used (claims)
-                  </span>
-                  <span className="sw-meta-v">{ethCapSummary.used} ETH</span>
-                </div>
-                <div className="sw-meta-row">
-                  <span className="sw-meta-k" title="Remaining ETH mint headroom">
-                    ETH available
-                  </span>
-                  <span className="sw-meta-v">{ethCapSummary.available} ETH</span>
-                </div>
-                <div className="sw-meta-row">
-                  <span
-                    className="sw-meta-k"
-                    title="Rollup wETH claim / portable inventory"
-                  >
-                    wETH claim
-                  </span>
-                  <span className="sw-meta-v">
-                    {ethCapSummary.claim} · port {ethCapSummary.portable}
-                  </span>
-                </div>
-                <div className="sw-meta-row">
-                  <span
-                    className="sw-meta-k"
                     title="ETH deposited via portal (inventory, not mint capacity)"
                   >
                     Rollup portal ETH
@@ -3116,15 +2891,21 @@ export default function WalletIsland() {
                 claim and (default) a linked <strong>WETH</strong> asset on Warthog. Portal ETH
                 is inventory only.
               </p>
-              {wethLinks.length > 0 ? (
+              {wethResetBanner ? (
+                <p className="wh-hint" style={{ margin: '0.4rem 0 0', fontSize: '0.8rem' }}>
+                  {wethResetBanner}
+                </p>
+              ) : null}
+              {wethLinks.length > 0 || wethOrphaned.length > 0 ? (
                 <div className="sw-meta-row" style={{ marginTop: '0.35rem' }}>
-                  <span className="sw-meta-k" title="Warthog WETH linked to claims">
+                  <span className="sw-meta-k" title="Warthog WETH linked to this L1 session">
                     Warthog WETH links
                   </span>
                   <span className="sw-meta-v">
-                    {wethLinks.filter((l) => l.status !== 'released').length} active
+                    {wethLinks.filter((l) => l.status !== 'released').length} backed
+                    {wethOrphaned.length ? ` · ${wethOrphaned.length} unbacked` : ''}
                     {' / '}
-                    {wethLinks.length} total
+                    {wethLinks.length + wethOrphaned.length} tracked
                   </span>
                 </div>
               ) : null}
@@ -3140,24 +2921,7 @@ export default function WalletIsland() {
 
         {l1Tab === 'overview' && (
           <div className="wi-panel eth-overview-panel">
-            {/* 2×2: Available | Used / Capacity | Main L1 ETH (same as Warthog Overview) */}
             <div className="wi-stat-grid wi-stat-grid--focus eth-overview-stats">
-              <div className="wi-stat wi-stat--liquid">
-                <Coins size={18} className="wi-stat-icon" />
-                <span className="wi-stat-k">Available</span>
-                <span className="wi-stat-v">{ethCapSummary.available}</span>
-                <span className="wi-stat-hint">ETH-backed mint headroom</span>
-              </div>
-              <div className="wi-stat">
-                <span className="wi-stat-k">Used</span>
-                <span className="wi-stat-v">{ethCapSummary.used}</span>
-                <span className="wi-stat-hint">wETH claims</span>
-              </div>
-              <div className="wi-stat">
-                <span className="wi-stat-k">Capacity</span>
-                <span className="wi-stat-v">{ethCapSummary.capacity}</span>
-                <span className="wi-stat-hint">locked vault ETH only</span>
-              </div>
               <div className="wi-stat wi-stat--spoof">
                 <span className="wi-stat-k">Main L1 ETH</span>
                 <span className="wi-stat-v">
@@ -3171,26 +2935,15 @@ export default function WalletIsland() {
               </div>
             </div>
             <p className="wi-muted" style={{ marginTop: '0.65rem', marginBottom: 0 }}>
-              <strong>Capacity</strong> = locked ETH in cosigner vaults (separate from WART
-              capacity). <strong>Used</strong> = wETH claims. Mint / burn under{' '}
-              <button
-                type="button"
-                className="wi-linkish"
-                onClick={() => setL1Tab('getwweth')}
-              >
-                Get wWETH
-              </button>
-              . Fund &amp; lock via Sub wallets → Vaults.
+              ETH sub-wallets are plain L1 addresses derived from your seed. To bridge ETH,
+              use the fungible pool.
             </p>
             <ol className="wi-steps">
               <li>
-                <strong>Sub wallets</strong> — generate · fund main → sub · create vault
+                <strong>Sub wallets</strong> — generate · fund main → sub · withdraw back
               </li>
               <li>
-                <strong>Vaults</strong> — sub → vault · lock capacity · release · cosign
-              </li>
-              <li>
-                <strong>Get wWETH</strong> — mint Warthog WETH + rollup claim (linked)
+                <strong>Pool</strong> — deposit ETH to mint wWETH / Warthog WETH
               </li>
             </ol>
             {(getNetworkId() === 'anvil' || ACTIVE_NETWORK?.isDemo) && (
@@ -3238,7 +2991,7 @@ export default function WalletIsland() {
           </div>
         )}
 
-        {(l1Tab === 'subwallets' || l1Tab === 'vault') && (
+        {l1Tab === 'subwallets' && (
           <EthSubWallets
             mainMnemonic={wartSession?.mnemonic || null}
             wartAddress={wartSession?.address || null}
@@ -3255,243 +3008,11 @@ export default function WalletIsland() {
             }}
             confirmMmTx={confirmMmTx}
             hideMainCard
-            focusMode={l1Tab === 'vault' ? 'vaults' : 'subs'}
             hideTopChrome
             hideCapacityTrack
           />
         )}
 
-        {l1Tab === 'getwweth' && (
-          <div className="wi-panel eth-getwweth-panel">
-            <p className="wi-muted wi-claim-lead">
-              Claim: <strong>{ethCapSummary.claim}</strong>
-              {' · '}
-              Portable: <strong>{ethCapSummary.portable}</strong>
-              {' · '}
-              Available: <strong>{ethCapSummary.available}</strong>
-              {' · '}
-              Capacity: <strong>{ethCapSummary.capacity}</strong>
-            </p>
-            <p className="wi-muted" style={{ marginTop: '-0.25rem', marginBottom: '0.75rem' }}>
-              Against <strong>locked vault ETH</strong>: mint opens a rollup claim and (default)
-              creates <strong>WETH</strong> on Warthog for the same amount — hash linked here.
-              Burn frees capacity; Warthog WETH tokens stay in your wallet (no on-chain asset burn
-              yet). Not MetaMask / L1 WETH.
-            </p>
-            <div className="wi-portal-card wi-portal-card--focus" style={{ marginBottom: '0.75rem' }}>
-              <div className="wi-portal-title">Mint WETH (Warthog + claim)</div>
-              <label
-                className="wi-muted"
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.4rem',
-                  marginBottom: '0.55rem',
-                  fontSize: '0.85rem',
-                  cursor: 'pointer',
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={mintWartEthAsset}
-                  onChange={(e) => setMintWartEthAsset(e.target.checked)}
-                  disabled={loading}
-                />
-                Create WETH on Warthog &amp; link to claim (recommended)
-              </label>
-              <div className="wi-portal-row">
-                <input
-                  className="input"
-                  placeholder="Amount"
-                  value={mintWethAmt}
-                  onChange={(e) => setMintWethAmt(e.target.value)}
-                  disabled={loading}
-                />
-                <button
-                  type="button"
-                  className="btn secondary small"
-                  disabled={
-                    loading ||
-                    !ethCapSummary.availableRaw ||
-                    Number(ethCapSummary.availableRaw) <= 0
-                  }
-                  onClick={() => setMintWethAmt(ethCapSummary.availableRaw)}
-                >
-                  Max
-                </button>
-                <button
-                  type="button"
-                  className="btn primary small"
-                  disabled={
-                    loading ||
-                    !mintWethAmt ||
-                    !ethCapSummary.availableRaw ||
-                    Number(ethCapSummary.availableRaw) <= 0
-                  }
-                  onClick={() => mintWethClaim()}
-                  title={
-                    Number(ethCapSummary.availableRaw) > 0
-                      ? 'Mint when ETH capacity is available (locked)'
-                      : 'Lock vault ETH first'
-                  }
-                >
-                  {mintWartEthAsset ? 'Mint WETH + claim' : 'Mint claim only'}
-                </button>
-              </div>
-              {!wartSession?.address && mintWartEthAsset ? (
-                <p className="wi-muted" style={{ margin: '0.45rem 0 0', fontSize: '0.8rem' }}>
-                  Unlock the Warthog wallet above to mint on-chain WETH.
-                </p>
-              ) : null}
-            </div>
-
-            <div className="wi-portal-card wi-portal-card--focus" style={{ marginBottom: '0.75rem' }}>
-              <div className="wi-portal-title">Burn claim (free capacity)</div>
-              <div className="wi-portal-row">
-                <input
-                  className="input"
-                  placeholder="Amount"
-                  value={burnWethAmt}
-                  onChange={(e) => setBurnWethAmt(e.target.value)}
-                  disabled={loading}
-                />
-                <button
-                  type="button"
-                  className="btn secondary small"
-                  disabled={
-                    loading ||
-                    !ethCapSummary.portableRaw ||
-                    Number(ethCapSummary.portableRaw) <= 0
-                  }
-                  onClick={() => setBurnWethAmt(ethCapSummary.portableRaw)}
-                >
-                  Max
-                </button>
-                <button
-                  type="button"
-                  className="btn primary small"
-                  disabled={loading || !burnWethAmt}
-                  onClick={() => burnWethClaim()}
-                >
-                  Burn claim
-                </button>
-              </div>
-              <p className="wi-muted" style={{ margin: '0.45rem 0 0', fontSize: '0.78rem' }}>
-                Releases ETH capacity. Linked WETH is marked released (FIFO) but remains
-                transferable on Warthog until a burn/escrow path exists.
-              </p>
-            </div>
-
-            <div className="wi-portal-card" style={{ marginBottom: '0.75rem' }}>
-              <div
-                className="wi-portal-title"
-                style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  gap: '0.5rem',
-                }}
-              >
-                <span>Linked Warthog WETH</span>
-                <button
-                  type="button"
-                  className="btn secondary small"
-                  disabled={loading}
-                  onClick={() => refreshWethLinks(address)}
-                >
-                  Refresh links
-                </button>
-              </div>
-              {wethLinks.length === 0 ? (
-                <p className="wi-muted" style={{ margin: 0, fontSize: '0.85rem' }}>
-                  No linked WETH yet. Mint with the checkbox on to create &amp; link.
-                </p>
-              ) : (
-                <ul
-                  style={{
-                    listStyle: 'none',
-                    margin: 0,
-                    padding: 0,
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: '0.45rem',
-                  }}
-                >
-                  {wethLinks.slice(0, 12).map((link) => (
-                    <li
-                      key={link.assetHash}
-                      style={{
-                        border: '1px solid rgba(148,163,184,0.25)',
-                        borderRadius: 8,
-                        padding: '0.45rem 0.55rem',
-                        fontSize: '0.8rem',
-                      }}
-                    >
-                      <div
-                        style={{
-                          display: 'flex',
-                          flexWrap: 'wrap',
-                          gap: '0.35rem 0.65rem',
-                          alignItems: 'center',
-                        }}
-                      >
-                        <strong>{link.assetName || 'WETH'}</strong>
-                        <span>{link.amount}</span>
-                        <span
-                          style={{
-                            opacity: 0.85,
-                            textTransform: 'uppercase',
-                            fontSize: '0.72rem',
-                            letterSpacing: '0.03em',
-                          }}
-                        >
-                          {link.status || 'active'}
-                          {link.source === 'rollup' ? ' · rollup' : ' · local'}
-                        </span>
-                        <button
-                          type="button"
-                          className="btn secondary small"
-                          style={{ marginLeft: 'auto' }}
-                          onClick={async () => {
-                            try {
-                              await navigator.clipboard?.writeText(link.assetHash);
-                              toast.success('Asset hash copied');
-                            } catch {
-                              toast.error('Copy failed');
-                            }
-                          }}
-                        >
-                          Copy hash
-                        </button>
-                      </div>
-                      <code
-                        className="mono"
-                        title={link.assetHash}
-                        style={{
-                          display: 'block',
-                          marginTop: 4,
-                          wordBreak: 'break-all',
-                          opacity: 0.9,
-                        }}
-                      >
-                        {link.assetHash}
-                      </code>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {lastEthWartAsset?.assetHash && wethLinks.length === 0 ? (
-                <p className="wi-muted" style={{ margin: '0.45rem 0 0', fontSize: '0.8rem' }}>
-                  Last: {lastEthWartAsset.assetHash.slice(0, 16)}… · {lastEthWartAsset.amount}
-                </p>
-              ) : null}
-            </div>
-
-            <p className="wi-muted" style={{ marginBottom: 0 }}>
-              Lock ETH under <strong>Vaults</strong> first. Subs fund Main → sub → vault.
-            </p>
-          </div>
-        )}
       </section>
       )}
       {/* end eth-section */}

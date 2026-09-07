@@ -1,6 +1,14 @@
 /**
  * V2 — build + sign owner-bound cosigner register auth (EIP-191).
- * Soft path: if no signer, returns {} and cosigner still accepts (requireOwnerSig=false).
+ *
+ * Whether a missing signature is fatal depends on the SERVER, not on this file:
+ * with COSIGNER_REQUIRE_OWNER_SIG=1 the cosigner rejects an unsigned register;
+ * with =0 it soft-accepts. (This VPS runs =1 as of 2026-09-04 — see
+ * cartesi-cosigner.service.d/owner-sig.conf. The documented Mode B default is 0.)
+ *
+ * So on failure we return a `reason` instead of a bare {}, letting the caller say
+ * why — "you declined the signature" and "no wallet connected" need different
+ * messages, and previously both looked identical to the UI.
  */
 
 export function buildRegisterMessage({
@@ -42,9 +50,11 @@ export function buildRegisterMessage({
 export async function attachOwnerRegisterAuth(reg, opts = {}) {
   const owner = String(reg?.owner || '').toLowerCase();
   const vaultAddress = reg?.vaultAddress;
-  if (!owner || !vaultAddress) return {};
+  if (!owner || !vaultAddress) return { reason: 'missing-owner-or-vault' };
 
   let signer = opts.signer;
+  const hadProvider = Boolean(opts.signer)
+    || (typeof window !== 'undefined' && Boolean(window.ethereum));
   if (!signer && typeof window !== 'undefined' && window.ethereum) {
     try {
       const { BrowserProvider } = await import('ethers-v6');
@@ -54,7 +64,9 @@ export async function attachOwnerRegisterAuth(reg, opts = {}) {
       signer = null;
     }
   }
-  if (!signer?.signMessage) return {};
+  if (!signer?.signMessage) {
+    return { reason: hadProvider ? 'wallet-locked' : 'no-wallet' };
+  }
 
   const issuedAt = Math.floor(Date.now() / 1000);
   const allowedTo =
@@ -72,6 +84,6 @@ export async function attachOwnerRegisterAuth(reg, opts = {}) {
     return { ownerSig, issuedAt };
   } catch (e) {
     console.warn('[ownerRegisterAuth] signMessage declined or failed', e);
-    return {};
+    return { reason: 'declined' };
   }
 }

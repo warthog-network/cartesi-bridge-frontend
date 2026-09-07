@@ -17,8 +17,12 @@ import {
   Layers,
   Zap,
   ArrowDownUp,
+  Copy,
+  Check,
+  Flame,
 } from 'lucide-react';
-import { toast } from 'react-hot-toast';
+import { toast } from '../utils/trackedToast.js';
+import { setPipeline } from '../utils/bridgeProgress.js';
 import { ethers } from 'ethers-v6';
 import { FUNGIBLE_POOL } from '../utils/fungiblePoolConfig.js';
 import { LOCAL_WWART } from '../utils/localTokens.js';
@@ -58,6 +62,14 @@ import {
   flowProgress,
 } from '../utils/poolFlowTracker.js';
 import { buildPoolBindMessage } from '../utils/poolBindMessage.js';
+import {
+  createWarthogEthAsset,
+  normalizeEthSupplyAmount,
+  fetchWartAssetHoldings,
+  setWethPoolScope,
+  forgetUnusableWethLinks,
+} from '../utils/mintEthWarthogAsset.js';
+import { depositEthThroughAdapter } from '../utils/eth3pAdapter.js';
 
 function humanFrom18(raw) {
   try {
@@ -80,6 +92,61 @@ function humanFromE8(raw) {
     return frac ? `${whole}.${frac}` : whole.toString();
   } catch {
     return '0';
+  }
+}
+
+/** Inverse of humanFromE8. Throws on anything that is not a plain decimal. */
+function e8FromHuman(raw) {
+  const t = String(raw ?? '').trim();
+  if (!/^\d+(\.\d+)?$/.test(t)) throw new Error(`Not an amount: ${t || '(empty)'}`);
+  const [w, f = ''] = t.split('.');
+  return BigInt(w || '0') * 10n ** 8n + BigInt((f + '00000000').slice(0, 8));
+}
+
+/**
+ * "Deposited 10 WART — 9.99 credited, 0.01 bridge fee held in the Q for payout gas"
+ *
+ * The Q keeps the whole send; only mint headroom pays the fee (WART_FEE_BPS in
+ * the machine), so a bare "Deposited 10" leaves the user to work out on their
+ * own why headroom rose by less than they sent.
+ *
+ * Derived from the headroom delta rather than the pool_deposit notice. The
+ * notice now carries feeE8/creditedE8 too, but notices can be missed, and
+ * inspect is what the credit wait already returned — no extra round trip.
+ * Falls back to the plain line whenever the wait came back without a deposited
+ * figure (the queue-credited-late path) or the fee works out to zero.
+ */
+function depositToastText(amtE8, waitResult, prevDeposited, verb = 'Deposited') {
+  const now = waitResult?.deposited;
+  const plain = `${verb} ${humanFromE8(amtE8)} WART to pool`;
+  if (now == null) return plain;
+  try {
+    const credited = now > prevDeposited ? now - prevDeposited : 0n;
+    const fee = amtE8 > credited ? amtE8 - credited : 0n;
+    if (fee <= 0n || credited <= 0n) return plain;
+    return (
+      `${verb} ${humanFromE8(amtE8)} WART — ${humanFromE8(credited)} credited, ` +
+      `${humanFromE8(fee)} bridge fee held in the Q for payout gas`
+    );
+  } catch {
+    return plain;
+  }
+}
+
+function shortHex(v, head = 8, tail = 6) {
+  const s = String(v || '').replace(/^0x/i, '');
+  if (s.length <= head + tail) return s;
+  return `${s.slice(0, head)}…${s.slice(-tail)}`;
+}
+
+async function copyText(value) {
+  const s = String(value || '');
+  if (!s) return false;
+  try {
+    await navigator.clipboard.writeText(s);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -158,6 +225,72 @@ async function poolApi(path, init) {
   return data;
 }
 
+/**
+ * The WETH asset is already on Warthog L1 by the time we register it — the SPV
+ * claim is only waiting for its block. So TX_UNCONFIRMED is a wait, not a
+ * failure: retry the *register* call, never the mint. A second createAssets
+ * would put a second, separately-backed WETH asset on chain.
+ */
+async function registerWrapWhenMined(send, note) {
+  const deadline = Date.now() + 300000;
+  for (;;) {
+    try {
+      return await send();
+    } catch (e) {
+      const msg = e?.message || String(e);
+      // Same three-layer confirmation vocabulary as the redeem path — a bare
+      // `need N confs, have M` from the claim builder is a wait, not a failure.
+      if (!/TX_UNCONFIRMED|not mined yet|need \d+ confs, have \d+/.test(msg) || Date.now() > deadline) {
+        throw e;
+      }
+      note?.('Waiting for the createAssets block — the receipt is minted, do not mint again…');
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+}
+
+/**
+ * The burn is already on-chain and irreversible; ETH is released only once its
+ * Warthog block is mined. So an unconfirmed burn is a wait, not a failure —
+ * retry rather than surfacing a scary error over a burn the user cannot take
+ * back. A second burn must never be sent.
+ *
+ * Three different messages mean the same "not deep enough yet", from three
+ * layers, and all three must be caught here:
+ *   BURN_UNCONFIRMED         poolEth3p.awaitBurnMined  (node's confirmations)
+ *   TX_UNCONFIRMED           wartSpvHost.awaitMinedLookup
+ *   need N confs, have M     wartSpvHost claim builders (depth past block)
+ * The last one used to escape and toast as a hard failure — the node counts the
+ * containing block while the claim builder counts depth past it, so a burn
+ * mined into the head block satisfied awaitBurnMined and then died one line
+ * later on `need 1 confs, have 0`. Same shape the WART relayer already treats
+ * as transient (see isWaitingConfs in scripts/pool-deposit-relayer.mjs).
+ */
+const REDEEM_WAIT_RE = /BURN_UNCONFIRMED|TX_UNCONFIRMED|need \d+ confs, have \d+|waiting conf/i;
+
+async function openRedeemWhenMined(body, note) {
+  const deadline = Date.now() + 300000;
+  let waited = 0;
+  for (;;) {
+    try {
+      return await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'eth3p_open_redeem', ...body }),
+      });
+    } catch (e) {
+      const msg = e?.message || String(e);
+      if (!REDEEM_WAIT_RE.test(msg) || Date.now() > deadline) throw e;
+      waited += 1;
+      const secs = Math.round((Date.now() - (deadline - 300000)) / 1000);
+      note?.(
+        `Waiting for the burn block on Warthog (~30s each, ${secs}s so far) — ` +
+          'the burn is already sent, no second burn needed…',
+      );
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+}
+
 /** Host-queue bind lookup. Does not throw on conflict (409). */
 async function fetchWartOwnerBind({ fromAddress, owner }) {
   const from = String(fromAddress || '').replace(/^0x/i, '').trim();
@@ -206,7 +339,11 @@ async function ensureWartOwnerBind({
   }
   if (check.status === 'match') return check;
   if (!signWartMessage) {
-    throw new Error('Unlock Warthog to bind this wallet to MetaMask before sending');
+    throw new Error(
+      from
+        ? 'Warthog is unlocked but cannot sign the bind yet — refresh the page, then retry the swap (you will sign once in Warthog and once in MetaMask)'
+        : 'Unlock Warthog to bind this wallet to MetaMask before sending',
+    );
   }
   if (!signer?.signMessage) {
     throw new Error(
@@ -282,14 +419,38 @@ function toastWartSent(msg) {
 }
 
 function toastWartConfirmed(msg) {
-  return toast.success(msg, { id: 'pool', duration: 12000 });
+  return toast.success(msg, {
+    id: 'pool',
+    duration: 12000,
+    iconTheme: { primary: '#22c55e', secondary: '#052e16' },
+    style: {
+      background: 'rgba(6, 46, 22, 0.96)',
+      color: '#bbf7d0',
+      border: '1px solid #22c55e',
+    },
+  });
 }
 
 /**
  * Broadcast tx hash only. On Warthog the signed hashHex equals the txid, but
  * prep.hashHex exists before submit — do not treat that as a send by itself.
  */
-function extractBroadcastTx(st) {
+function payoutMatchesTicket(proof, ticket) {
+  if (!proof || !ticket) return true;
+  const to = String(proof.toAddress || proof.transaction?.toAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  const want = String(ticket.toAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (want && to && to !== want) return false;
+  const amt = Number(proof.amountE8 ?? proof.transaction?.amountE8 ?? 0);
+  const wantAmt = Number(ticket.amountE8 ?? 0);
+  if (wantAmt > 0 && amt > 0 && amt !== wantAmt) return false;
+  return true;
+}
+
+function extractBroadcastTx(st, ticket) {
   if (!st) return null;
   const status = String(st.status || '').toLowerCase();
   const paid =
@@ -299,8 +460,9 @@ function extractBroadcastTx(st) {
     st.payout?.ok === true;
   const raw = st.txHash || st.payout?.txHash || null;
   const hex = raw ? String(raw).replace(/^0x/i, '').toLowerCase() : '';
-  if (WART_TX_HASH_RE.test(hex) && (paid || st.payout?.txHash)) return hex;
-  return null;
+  if (!WART_TX_HASH_RE.test(hex) || !(paid || st.payout?.txHash)) return null;
+  if (ticket && !payoutMatchesTicket(st.payout || st, ticket)) return null;
+  return hex;
 }
 
 async function lookupPayoutTx(txHash) {
@@ -319,6 +481,8 @@ async function lookupPayoutTx(txHash) {
     txHash: tx.txHash || h,
     confirmations: Number(tx.confirmations ?? 0),
     blockHeight: tx.blockHeight ?? null,
+    toAddress: tx.toAddress || null,
+    amountE8: tx.amountE8 ?? null,
   };
 }
 
@@ -963,6 +1127,34 @@ export default function FungiblePool({
 }) {
   const [open, setOpen] = useState(true);
   const [swapDir, setSwapDir] = useState('to_wwart'); // to_wwart | to_wart
+  const [swapAsset, setSwapAsset] = useState('WART'); // WART | ETH
+  const [eth3pSt, setEth3pSt] = useState(null);
+  const [mmEthBal, setMmEthBal] = useState(null);
+  const [ethWartL1E8, setEthWartL1E8] = useState(null);
+  /**
+   * The per-receipt rows behind the WART L1 wETH total, largest first.
+   *
+   * The sum on its own hides the one fact that decides whether an unwrap can
+   * go through: wETH is minted as separate Warthog assets and sendAsset spends
+   * exactly one of them, so a wallet holding 3 + 2 cannot unwrap 5 even though
+   * the total says it can. Same fetch that produces the total — no extra round
+   * trip, we were already throwing the breakdown away.
+   */
+  const [ethReceipts, setEthReceipts] = useState([]);
+
+  /**
+   * ETH manual-steps inputs.
+   *
+   * Deliberately NOT the swap's `amount` / `toAddress`. The swap box takes a
+   * quantity of ETH to move; these take Warthog transaction hashes for work
+   * that is already half-done on chain, and mixing the two invites pasting a
+   * tx hash into a field that then tries to send that much ETH. Separate
+   * state, separate labels, separate placeholders.
+   */
+  const [ethManualAssetTx, setEthManualAssetTx] = useState('');
+  const [ethManualSupply, setEthManualSupply] = useState('');
+  const [ethManualBurnTx, setEthManualBurnTx] = useState('');
+  const [ethMintable, setEthMintable] = useState(null);
   const [swapFlipTick, setSwapFlipTick] = useState(0);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
@@ -1006,6 +1198,8 @@ export default function FungiblePool({
   const [resumeTxHash, setResumeTxHash] = useState('');
   /** Sticky action line — toasts expire; this does not. */
   const [actionStatus, setActionStatus] = useState(null);
+  const [copiedKey, setCopiedKey] = useState('');
+  const [refreshedAt, setRefreshedAt] = useState(null);
   /** Host-queue WART→L1 bind. Conflict means do not send WART. */
   const [wartBind, setWartBind] = useState(null);
   /** Lab mode only when PUBLIC_POOL_LAB=1 or ?lab=1 — public demo hides it. */
@@ -1097,6 +1291,12 @@ export default function FungiblePool({
     [owner, snap, mmWwartBal],
   );
 
+  // Mirror the persistent round-trip rows into the Bridge activity tracker
+  // so the stage rail is visible outside this (collapsed) legacy section.
+  useEffect(() => {
+    setPipeline(openFlows);
+  }, [openFlows]);
+
   useEffect(() => {
     refreshPending();
     refreshFlows();
@@ -1185,6 +1385,81 @@ export default function FungiblePool({
     } catch {
       /* optional */
     }
+    let e3 = null;
+    try {
+      e3 = await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'eth3p_status' }),
+      });
+      if (e3?.ok) setEth3pSt(e3);
+    // Stamp new entries with the live Q. Does not forget anything: receipts
+    // survive rotation, so the Q is provenance, not an expiry date.
+    if (e3?.address) setWethPoolScope(e3.address);
+    } catch {
+      /* optional */
+    }
+    try {
+      if (signer?.provider && owner) {
+        const wei = await signer.provider.getBalance(owner);
+        setMmEthBal(ethers.formatEther(wei));
+      }
+    } catch {
+      /* optional */
+    }
+    try {
+      const wart = String(wartBridgeApi?.address || '')
+        .replace(/^0x/i, '')
+        .toLowerCase();
+      if (wart) {
+        const extra = (e3?.wraps || []).map((w) => w.assetHash);
+        const hold = await fetchWartAssetHoldings(
+          wart,
+          extra,
+          wartBridgeApi?.selectedNode,
+        );
+        let sum = 0n;
+        const rows = [];
+        for (const h of hold) {
+          const name = String(h.name || '').toUpperCase();
+          if (name !== 'WETH' && !extra.includes(h.hash)) continue;
+          const e8 = BigInt(h.e8 || 0);
+          sum += e8;
+          if (e8 > 0n) {
+            const wrap = (e3?.wraps || []).find((w) => w.assetHash === h.hash);
+            rows.push({
+              hash: h.hash,
+              name: name || 'WETH',
+              e8: e8.toString(),
+              // Only set for receipts this pool minted; a receipt someone sent
+              // us from another Q is still spendable and still ours to show.
+              mine: !!wrap && String(wrap.issuerWart || '').toLowerCase() === wart,
+              lockTx: wrap?.ethTxHash || null,
+            });
+          }
+        }
+        rows.sort((a, b) => (BigInt(a.e8) < BigInt(b.e8) ? 1 : BigInt(a.e8) > BigInt(b.e8) ? -1 : 0));
+        /**
+         * Now that we know what is actually held and what the coordinator still
+         * lists, drop the local entries that are neither. This runs here rather
+         * than on the status read because those two lists are the only evidence
+         * that separates a dead receipt from one that simply outlived its Q.
+         */
+        const gone = forgetUnusableWethLinks({
+          heldHashes: rows.map((r) => r.hash),
+          knownHashes: extra,
+        });
+        if (gone.forgotten) {
+          console.info(`[eth3p] forgot ${gone.forgotten} unusable WETH link(s)`);
+        }
+        setEthReceipts(rows);
+        setEthWartL1E8(sum.toString());
+      } else {
+        setEthReceipts([]);
+        setEthWartL1E8(null);
+      }
+    } catch {
+      /* optional */
+    }
     // Prefer rollup inspect
     try {
       const base = getInspectUrl().replace(/\/$/, '');
@@ -1240,6 +1515,7 @@ export default function FungiblePool({
             recentTickets: json.recentTickets || [],
             source: 'rollup',
           });
+          setRefreshedAt(Date.now());
           return;
         }
       }
@@ -1276,10 +1552,11 @@ export default function FungiblePool({
         recentEvents: s.recentEvents,
         source: s.mode || 'api',
       });
+      setRefreshedAt(Date.now());
     } catch (e) {
       console.warn('[FungiblePool] api', e?.message || e);
     }
-  }, [owner]);
+  }, [owner, signer, wartBridgeApi?.address, wartBridgeApi?.selectedNode]);
 
   useEffect(() => {
     refresh();
@@ -1323,7 +1600,7 @@ export default function FungiblePool({
     return last || wartBridgeApi.getWartTxProof(txHash);
   };
 
-  const pollPayoutConfirm = async (txHash, { timeoutMs = 180000 } = {}) => {
+  const pollPayoutConfirm = async (txHash, { timeoutMs = 180000, expect } = {}) => {
     const deadline = Date.now() + timeoutMs;
     let last = null;
     while (Date.now() < deadline) {
@@ -1336,46 +1613,66 @@ export default function FungiblePool({
               proof?.confirmations ?? proof?.transaction?.confirmations ?? 0,
             ),
             blockHeight: proof?.transaction?.blockHeight ?? null,
+            toAddress: proof?.transaction?.toAddress || null,
+            amountE8: proof?.transaction?.amountE8 ?? null,
           };
         } else {
           last = await lookupPayoutTx(txHash);
         }
-        if (Number(last?.confirmations || 0) >= 1) return last;
+        if (expect && last && !payoutMatchesTicket(last, expect)) {
+          last = { ...last, confirmations: 0, mismatch: true };
+        } else if (Number(last?.confirmations || 0) >= 1) {
+          return last;
+        }
       } catch {
         try {
           last = await lookupPayoutTx(txHash);
-          if (Number(last?.confirmations || 0) >= 1) return last;
+          if (expect && last && !payoutMatchesTicket(last, expect)) {
+            last = { ...last, confirmations: 0, mismatch: true };
+          } else if (Number(last?.confirmations || 0) >= 1) {
+            return last;
+          }
         } catch {
           /* retry */
         }
       }
       await sleep(3000);
     }
-    if (Number(last?.confirmations || 0) < 1) {
+    if (Number(last?.confirmations || 0) < 1 && !last?.mismatch) {
       last = (await lookupPayoutTx(txHash).catch(() => null)) || last;
+      if (expect && last && !payoutMatchesTicket(last, expect)) {
+        last = { ...last, confirmations: 0, mismatch: true };
+      }
     }
     return last;
   };
 
-  const finishPayoutToast = async (txHash, label) => {
+  const finishPayoutToast = async (txHash, label, expect) => {
     const amt = label ? `${label} ` : '';
     const hash = WART_TX_HASH_RE.test(String(txHash || '').replace(/^0x/i, ''))
       ? String(txHash).replace(/^0x/i, '').toLowerCase()
       : null;
     if (!hash) {
-      toastWartConfirmed(`Released ${amt}WART`);
-      return;
+      toastWartSent(`Released ${amt}WART — waiting for broadcast hash…`);
+      return { confirmations: 0, missingHash: true };
     }
     toastWartSent(`Sent ${amt}WART · ${shortTx(hash)} — waiting for block…`);
-    const proof = await pollPayoutConfirm(hash);
+    const proof = await pollPayoutConfirm(hash, { expect });
+    if (proof?.mismatch) {
+      toastWartSent(
+        `Coordinator cited a previous tx for this ticket id — waiting for this ${amt}payout. Do not retry.`,
+      );
+      return { confirmations: 0, mismatch: true, txHash: hash };
+    }
     const conf = Number(proof?.confirmations || 0);
     if (conf >= 1) {
       toastWartConfirmed(`Confirmed ${amt}WART · ${shortTx(hash)} · ${conf} conf`);
-    } else {
-      toastWartSent(
-        `Sent ${amt}WART · ${shortTx(hash)} — still unconfirmed. Do not retry.`,
-      );
+      return { confirmations: conf, txHash: hash, ...proof };
     }
+    toastWartSent(
+      `Sent ${amt}WART · ${shortTx(hash)} — still unconfirmed. Do not retry.`,
+    );
+    return { confirmations: 0, txHash: hash, ...proof };
   };
 
   /** Enqueue server credit + local pending (relayer posts InputBox). */
@@ -1811,7 +2108,7 @@ export default function FungiblePool({
     refreshPending();
     refreshFlows();
     toast.success(
-      `Credited ${humanFromE8(amtE8)} WART to pool`,
+      depositToastText(amtE8, result, prevDeposited, 'Credited'),
       { id: 'pool' },
     );
   };
@@ -2066,7 +2363,7 @@ export default function FungiblePool({
             });
             refreshPending();
             refreshFlows();
-            toast.success(`Deposited ${humanFromE8(amtE8)} WART to pool`, {
+            toast.success(depositToastText(amtE8, again, prevDeposited), {
               id: 'pool',
             });
             return { amountE8: amtE8, txHash, source: 'optional-wallet' };
@@ -2096,7 +2393,7 @@ export default function FungiblePool({
     });
     refreshPending();
     refreshFlows();
-    toast.success(`Deposited ${humanFromE8(amtE8)} WART to pool`, { id: 'pool' });
+    toast.success(depositToastText(amtE8, result, prevDeposited), { id: 'pool' });
     return { amountE8: amtE8, txHash, source: result.source || 'inspect' };
   };
 
@@ -2634,10 +2931,10 @@ export default function FungiblePool({
     await liveMint();
 
     const minInputIndex = await maxOwnerVoucherInputIndex(owner);
-    toast.loading('Atomic: withdraw voucher…', { id: 'pool', duration: Infinity });
+    toast.loading('WART → wWART: withdraw voucher…', { id: 'pool', duration: Infinity });
     const w = await liveWithdraw({ silentSuccess: true, minInputIndex });
 
-    toast.loading('Atomic: execute voucher → MetaMask wWART…', {
+    toast.loading('WART → wWART: execute voucher…', {
       id: 'pool',
       duration: Infinity,
     });
@@ -2650,12 +2947,9 @@ export default function FungiblePool({
       });
       setActionStatus({
         kind: 'ok',
-        text: `Atomic WART → wWART ${amt} landed on MetaMask.`,
+        text: `WART → wWART ${amt} landed on MetaMask.`,
       });
-      toast.success(
-        `Atomic WART → wWART · execute ${String(hash).slice(0, 10)}…`,
-        { id: 'pool', duration: 10000 },
-      );
+      toast.success(`WART → wWART ${amt}`, { id: 'pool', duration: 10000 });
       onRefreshMmWwart?.();
     } catch (e) {
       throw new Error(
@@ -2689,7 +2983,7 @@ export default function FungiblePool({
     refreshFlows();
     setActionStatus({
       kind: 'info',
-      text: `Atomic wWART → WART ${amt} (portal + burn + 3P pay)…`,
+      text: `wWART → WART ${amt}…`,
     });
 
     await confirmStyled({
@@ -2714,7 +3008,7 @@ export default function FungiblePool({
     });
     await portalDepositPoolWwart(signer, amt);
 
-    toast.loading(`Atomic: burn ${amt} and 3P-pay WART…`, {
+    toast.loading(`wWART → WART: burn ${amt} and pay…`, {
       id: 'pool',
       duration: Infinity,
     });
@@ -2722,10 +3016,267 @@ export default function FungiblePool({
 
     setActionStatus({
       kind: 'ok',
-      text: `Atomic wWART → WART ${amt} submitted to ${String(to).slice(0, 12)}…`,
+      text: `wWART → WART ${amt} submitted to ${String(to).slice(0, 12)}…`,
     });
-    toast.success(`Atomic wWART → WART ${amt}`, { id: 'pool', duration: 10000 });
+    toast.success(`wWART → WART ${amt}`, { id: 'pool', duration: 10000 });
     onRefreshMmWwart?.();
+  };
+
+  const liveAtomicToWeth = async () => {
+    if (!owner) throw new Error('Connect L1 wallet');
+    if (!signer) throw new Error('Connect MetaMask to send Anvil ETH');
+    const q = eth3pSt?.address;
+    if (!q) throw new Error('ETH 3P Q not sealed — turn e1 and e2 Signing ON');
+    if (!wartFrom) throw new Error('Unlock Warthog wallet to mint the receipt');
+    const amt = String(amount || '').trim();
+    if (!amt) throw new Error('Enter amount');
+    const wei = ethers.parseEther(amt);
+    if (wei <= 0n) throw new Error('Amount must be > 0');
+
+    setActionStatus({ kind: 'info', text: `ETH → wETH ${amt}…` });
+    toast.loading(`Sending ${amt} ETH through the deposit adapter…`, { id: 'pool', duration: Infinity });
+    const adapter = eth3pSt?.adapter;
+    if (!adapter?.address) {
+      throw new Error('ETH deposit adapter is not live — cannot lock');
+    }
+    const sent = await depositEthThroughAdapter({
+      signer,
+      adapter: { address: adapter.address, pool: q },
+      wartAddress: wartFrom,
+      value: wei,
+    });
+    const credited = await poolApi('/api/pool', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'eth3p_credit',
+        ethTxHash: sent.hash,
+        amountWei: wei.toString(),
+        wartAddress: wartFrom,
+        fromEth: owner,
+      }),
+    });
+    await poolApi('/api/pool', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'eth3p_bind',
+        wartAddress: wartFrom,
+        ethAddress: owner,
+      }),
+    }).catch(() => null);
+
+    toast.loading('Minting Warthog WETH receipt…', { id: 'pool', duration: Infinity });
+    /**
+     * Mint what the credit backs, not what was sent.
+     *
+     * The bridge fee stays in the Q to pay redeem gas (see ETH3P_FEE_BPS in
+     * poolEth3p.mjs), so creditEthLock records remainingE8 = amount − fee and
+     * registerEthWrap only matches a credit with remainingE8 >= supply.
+     * Minting the gross figure makes it reject — but only *after* createAssets
+     * has already put a brand-new WETH asset on Warthog L1, where it sits
+     * orphaned and unbacked with no way to burn it for ETH.
+     *
+     * Prefer the credit we just created; fall back to the server's quota when
+     * the credit was a replay (`already`) or the response shape surprises us.
+     */
+    let e8 = BigInt(credited?.credit?.remainingE8 || '0');
+    if (e8 <= 0n) {
+      const quota = await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'eth3p_mintable', issuerWart: wartFrom }),
+      });
+      e8 = BigInt(quota?.mintableE8 || '0');
+    }
+    if (e8 <= 0n) {
+      throw new Error(
+        `ETH is locked on the Q (tx ${String(sent.hash).slice(0, 12)}…) but the mintable quota is 0 — do not send ETH again; unwrap an existing receipt or contact ops.`,
+      );
+    }
+    const supply = humanFromE8(e8);
+    const minted = await createWarthogEthAsset({
+      amount: supply,
+      wartAddress: wartFrom,
+      ownerL1: owner,
+    });
+    const hash = minted?.assetHash || minted?.hash;
+    if (!hash) throw new Error('createAssets returned no assetHash');
+    await registerWrapWhenMined(
+      () =>
+        poolApi('/api/pool', {
+          method: 'POST',
+          body: JSON.stringify({
+            action: 'eth3p_register_wrap',
+            assetHash: hash,
+            supplyE8: e8.toString(),
+            issuerWart: wartFrom,
+            assetTxHash: minted?.txHash,
+            assetName: 'WETH',
+          }),
+        }),
+      (text) => {
+        toast.loading(text, { id: 'pool', duration: Infinity });
+        setActionStatus({ kind: 'info', text });
+      },
+    );
+    const feeHuman = humanFromE8(BigInt(credited?.credit?.feeE8 || '0'));
+    setActionStatus({
+      kind: 'ok',
+      text: `ETH → wETH ${supply} (${feeHuman} bridge fee held in the Q for redeem gas). Receipt ${String(hash).slice(0, 12)}… on Warthog.`,
+    });
+    toast.success(`ETH → wETH ${supply}`, { id: 'pool', duration: 10000 });
+  };
+
+  /**
+   * Burn one wETH receipt into the 3P burn bin. Returns the burn hash.
+   *
+   * Split out of liveAtomicToEth so the step-by-step row can burn without
+   * opening the redeem — the burn is the irreversible half, so its hash must
+   * reach the caller (and the recover input) the moment it exists.
+   */
+  const burnWethToBin = async () => {
+    if (!wartFrom) throw new Error('Unlock Warthog (burner of the receipt)');
+    const amt = String(amount || '').trim();
+    if (!amt) throw new Error('Enter amount');
+    const wraps = eth3pSt?.wraps || [];
+    const hold = await fetchWartAssetHoldings(
+      wartFrom,
+      wraps.map((w) => w.assetHash),
+      wartBridgeApi?.selectedNode,
+    );
+    const supply = normalizeEthSupplyAmount(amt);
+    const [w, f = ''] = String(supply).split('.');
+    const e8 = BigInt(w || '0') * 10n ** 8n + BigInt((f + '00000000').slice(0, 8));
+    const holdings = (hold || [])
+      .map((h) => ({ assetHash: h.hash, e8: BigInt(h.e8 || 0) }))
+      .filter((h) => h.e8 > 0n)
+      .sort((a, b) => (a.e8 < b.e8 ? 1 : a.e8 > b.e8 ? -1 : 0));
+    const covering = holdings.find((h) => h.e8 >= e8);
+    const largest = holdings[0];
+    const mine = covering || largest;
+    if (!mine?.assetHash) {
+      throw new Error('No wETH on this Warthog address to unwrap');
+    }
+    if (mine.e8 < e8) {
+      throw new Error(
+        `WETH is split across receipts. Largest free receipt is ${humanFromE8(mine.e8)}; you asked for ${amt}. Unwrap that amount first.`,
+      );
+    }
+    const bin = eth3pSt?.burnBin;
+    if (!bin) throw new Error('ETH 3P burn bin missing');
+    if (!wartBridgeApi?.sendAsset) {
+      throw new Error(
+        wartFrom
+          ? 'Warthog is unlocked for viewing but cannot sign a token send yet — refresh, then unlock again in this tab'
+          : 'Unlock Warthog wallet (sendAsset) to burn the receipt',
+      );
+    }
+    /**
+     * Precheck BEFORE signing. sendAsset to the burn bin is irreversible; this
+     * is the only point an orphaned/unbacked hash can still be refused for free.
+     */
+    const pre = await fetch('/api/pool', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        action: 'eth3p_precheck_burn',
+        assetHash: mine.assetHash,
+        amountE8: e8.toString(),
+      }),
+    })
+      .then((r) => r.json().catch(() => ({})))
+      .catch((e) => ({ ok: false, message: e?.message || String(e) }));
+    if (!pre?.ok || !pre.redeemable) {
+      throw new Error(
+        pre?.message || pre?.error || `This WETH is not redeemable (${pre?.reason || 'unknown'})`,
+      );
+    }
+    if (owner) {
+      await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({
+          action: 'eth3p_bind',
+          wartAddress: wartFrom,
+          ethAddress: owner,
+        }),
+      }).catch(() => null);
+    }
+    toast.loading(`Sending wETH to burn bin…`, { id: 'pool', duration: Infinity });
+    let sent;
+    try {
+      sent = await wartBridgeApi.sendAsset({
+        assetHash: mine.assetHash,
+        toAddress: bin,
+        amount: supply,
+        decimals: 8,
+      });
+    } catch (e) {
+      const msg = e?.message || String(e);
+      if (/insufficient\s+(token\s+)?balance/i.test(msg)) {
+        throw new Error(
+          `Only ${humanFromE8(mine.e8)} free on this WETH receipt (WART L1 is the sum of separate receipts).`,
+        );
+      }
+      throw e;
+    }
+    const wartTx =
+      sent?.txHash ||
+      sent?.hash ||
+      sent?.data?.txHash ||
+      sent?.data?.hash;
+    if (!wartTx) throw new Error('Burn tx submitted but no hash returned');
+    return { wartTx, assetHash: mine.assetHash, e8, supply, amt };
+  };
+
+  /** wETH → ETH in one press: burn the receipt, then open and watch the redeem. */
+  const liveAtomicToEth = async () => {
+    const { wartTx, assetHash, e8, amt } = await burnWethToBin();
+    setEthManualBurnTx(wartTx);
+    toast.loading('Opening ETH 3P redeem…', { id: 'pool', duration: Infinity });
+    const opened = await openRedeemWhenMined(
+      {
+        wartTxHash: wartTx,
+        assetHash,
+        amountE8: e8.toString(),
+        burnerWart: wartFrom,
+        ethAddress: owner,
+      },
+      (m) => toast.loading(m, { id: 'pool', duration: Infinity }),
+    );
+    const ticketId = opened.ticketId;
+    toast.loading(`ETH 3P: waiting for e1 + e2 on ${ticketId}…`, {
+      id: 'pool',
+      duration: Infinity,
+    });
+    const deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+      const t = await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'eth3p_ticket', ticketId }),
+      });
+      if (t?.status === 'paid' && t.txHash) {
+        setEthManualBurnTx('');
+        setActionStatus({
+          kind: 'ok',
+          text: `wETH → ETH ${amt}. Paid ${t.txHash.slice(0, 12)}… to ${owner?.slice(0, 10)}…`,
+        });
+        toast.success(`wETH → ETH ${amt}`, { id: 'pool', duration: 10000 });
+        return;
+      }
+      const st = await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'eth3p_status' }),
+      }).catch(() => null);
+      const wait = [
+        st?.e1Live ? 'e1 live' : 'e1 missing — ETH Signing ON on the original e1 tab',
+        st?.e2Live ? 'e2 live' : 'e2 missing — ETH Signing ON on the original e2 tab',
+        t?.haveR1 ? 'R1 in' : 'waiting R1',
+        t?.haveD2 ? 'Enc(e2) in' : 'waiting Enc(e2)',
+      ].join(' · ');
+      toast.loading(`ETH 3P ${ticketId}: ${wait}`, { id: 'pool', duration: Infinity });
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    throw new Error(
+      'ETH 3P redeem still open — original e1 and e2 tabs must have ETH Signing ON (not WART d1/d2)',
+    );
   };
 
   /**
@@ -2751,25 +3302,32 @@ export default function FungiblePool({
       }),
     });
 
-    // Immediate single-key (toggle OFF) or already paid
-    if (pay.txHash || pay.alreadyPaid || pay.skipped || pay.mode === 'hot-wallet') {
-      if (pay.skipped) {
-        toast.success(`Payout skipped: ${pay.skipReason || 'policy'}`, {
-          id: 'pool',
-          duration: 10000,
-        });
-      } else {
-        await finishPayoutToast(
-          pay.txHash || pay.payout?.txHash,
-          pay.amountHuman || amtLabel,
-        );
-      }
+    const expect = { toAddress: to, amountE8: ticket.amountE8 };
+    const ticketId = pay.ticketId || ticket.ticketId;
+    const label = pay.amountHuman || amtLabel || humanFromE8(ticket.amountE8);
+    const finishThis = async (hash, extra = {}) => {
+      const done = await finishPayoutToast(hash, label, expect);
+      if (done?.mismatch || done?.missingHash) return null;
+      await refresh();
+      return { ok: true, ticketId, txHash: hash, ...extra, ...done };
+    };
+
+    if (pay.skipped) {
+      toast.success(`Payout skipped: ${pay.skipReason || 'policy'}`, {
+        id: 'pool',
+        duration: 10000,
+      });
       await refresh();
       return pay;
     }
 
+    const firstHash = extractBroadcastTx(pay, ticket);
+    if (firstHash && (pay.alreadyPaid || pay.mode === 'hot-wallet' || pay.txHash)) {
+      const finished = await finishThis(firstHash, pay);
+      if (finished) return finished;
+    }
+
     // Path A4: 3P Lindell — poll pool3p_ticket until paid
-    const ticketId = pay.ticketId || ticket.ticketId;
     if (pay.mode === 'pool-3p' || pay.custody === '3p-d1-d2') {
       toast.loading(`3P pool: waiting for d1 + d2 on ${ticketId}…`, { id: 'pool' });
       const deadline = Date.now() + 180000;
@@ -2787,26 +3345,37 @@ export default function FungiblePool({
           continue;
         }
         const status = String(st.status || '');
-        const realTx = extractBroadcastTx(st);
-        if (realTx || status === 'paid' || st.payout?.ok || st.alreadyPaid) {
-          const hash = realTx || st.txHash || st.payout?.txHash || null;
-          await finishPayoutToast(
-            hash,
-            amtLabel || humanFromE8(ticket.amountE8),
+        const realTx = extractBroadcastTx(st, ticket);
+        if (realTx) {
+          const finished = await finishThis(realTx, { mode: 'pool-3p', ...st });
+          if (finished) return finished;
+          continue;
+        }
+        if (status === 'paid' || st.payout?.ok || st.alreadyPaid) {
+          toast.loading(
+            `3P Lindell · ignored old ${ticketId} hash — waiting for this payout…`,
+            { id: 'pool' },
           );
-          await refresh();
-          return { ok: true, ticketId, mode: 'pool-3p', txHash: hash, ...st };
+          continue;
         }
         const wait = (st.waitingOn || []).join('+') || (status || 'signing');
-        const line = `3P Lindell · ${wait} · d1 ${st.haveR1 ? 'in' : '…'} · d2 ${st.haveD2 ? 'in' : '…'}`;
+        const d2Who = st.members?.d2?.signerId
+          ? `${String(st.members.d2.signerId).slice(0, 12)}…`
+          : 'no holder';
+        const line = `3P Lindell · ${wait} · d1 ${st.haveR1 ? 'in' : '…'} · d2 ${st.haveD2 ? 'in' : `… (${d2Who})`}`;
         if ((st.waitingOn || []).includes('notice-proof')) {
           toastWartSent(`${line} — waiting for Cartesi notice proof`);
+        } else if ((st.waitingOn || []).includes('d2-holder')) {
+          toast.loading(
+            `${line} — d2 vacant; reopen the original d2 tab (orbit extras cannot fill it)`,
+            { id: 'pool' },
+          );
         } else {
           toast.loading(line, { id: 'pool' });
         }
       }
       throw new Error(
-        `3P payout timeout for ${ticketId} — keep both browser d1 and d2 tabs signed in`,
+        `3P payout timeout for ${ticketId} — d2 is vacant. Extra signers are orbit-only; reopen the browser profile that birthed d2 (or one that still has that hex / orbit pack).`,
       );
     }
 
@@ -2849,9 +3418,9 @@ export default function FungiblePool({
       }
       if (st.status === 'paid' || st.paid?.txHash) {
         const tx = st.paid?.txHash || st.payout?.txHash;
-        await finishPayoutToast(tx, amtLabel || humanFromE8(ticket.amountE8));
-        await refresh();
-        return { ok: true, ...st.paid, ticketId, mode: 'threshold-3of4', txHash: tx };
+        const finished = await finishThis(tx, { mode: 'threshold-3of4', ...st.paid });
+        if (finished) return finished;
+        continue;
       }
       if (st.status === 'lab_paid') {
         toast.success(`Lab 3-of-4 complete (no chain transfer)`, {
@@ -2987,15 +3556,23 @@ export default function FungiblePool({
       advanceFlowForOwner(owner, 'payout_pending', { ticketId: ticket.ticketId });
       refreshFlows();
       const paid = await payoutTicket(ticket, to, humanFromE8(ticket.amountE8) || amt);
-      advanceFlowForOwner(owner, 'complete', {
-        ticketId: ticket.ticketId,
-        note: 'WART payout submitted',
-      });
-      listOpenFlows(owner).forEach((f) => {
-        if (f.step === 'complete' || f.ticketId === ticket.ticketId) {
-          completeFlow(f.id, { payoutTxHash: paid?.txHash || null });
-        }
-      });
+      if (Number(paid?.confirmations || 0) >= 1) {
+        advanceFlowForOwner(owner, 'complete', {
+          ticketId: ticket.ticketId,
+          note: 'WART payout confirmed',
+        });
+        listOpenFlows(owner).forEach((f) => {
+          if (f.step === 'complete' || f.ticketId === ticket.ticketId) {
+            completeFlow(f.id, { payoutTxHash: paid?.txHash || null });
+          }
+        });
+      } else {
+        advanceFlowForOwner(owner, 'payout_pending', {
+          ticketId: ticket.ticketId,
+          payoutTxHash: paid?.txHash || null,
+          note: 'waiting for Warthog confirmation',
+        });
+      }
       refreshFlows();
       return paid;
     }
@@ -3104,8 +3681,18 @@ export default function FungiblePool({
     if (ticket?.ticketId) {
       advanceFlowForOwner(owner, 'payout_pending', { ticketId: ticket.ticketId });
       refreshFlows();
-      await payoutTicket(ticket, to, amt);
-      listOpenFlows(owner).forEach((f) => completeFlow(f.id, { ticketId: ticket.ticketId }));
+      const paid = await payoutTicket(ticket, to, amt);
+      if (Number(paid?.confirmations || 0) >= 1) {
+        listOpenFlows(owner).forEach((f) =>
+          completeFlow(f.id, { ticketId: ticket.ticketId, payoutTxHash: paid?.txHash || null }),
+        );
+      } else {
+        advanceFlowForOwner(owner, 'payout_pending', {
+          ticketId: ticket.ticketId,
+          payoutTxHash: paid?.txHash || null,
+          note: 'waiting for Warthog confirmation',
+        });
+      }
       refreshFlows();
       return;
     }
@@ -3142,6 +3729,335 @@ export default function FungiblePool({
     toast.success(`Lab ${action} ok`, { id: 'pool' });
   };
 
+  /**
+   * Unwrapped ETH credit, per deposit.
+   *
+   * `mintableE8` is the LARGEST single credit, not the sum — registerEthWrap
+   * decrements one credit whose remainder covers the supply, so a receipt has
+   * to be minted per deposit. `totalRemainingE8` is the real stuck total, and
+   * showing only the former is why a stuck balance reads smaller than it is.
+   */
+  const refreshEthMintable = useCallback(async () => {
+    if (!wartFrom) {
+      setEthMintable(null);
+      return;
+    }
+    try {
+      const m = await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'eth3p_mintable', issuerWart: wartFrom }),
+      });
+      setEthMintable(m?.ok ? m : null);
+    } catch {
+      setEthMintable(null);
+    }
+  }, [wartFrom]);
+
+  useEffect(() => {
+    void refreshEthMintable();
+  }, [refreshEthMintable, eth3pSt?.address]);
+
+  /**
+   * Step 2 of a deposit whose receipt is already minted: SPV-prove the
+   * createAssets to the machine. Safe to retry — the machine keys the wrap on
+   * the asset hash, so a second call cannot double-credit. Never re-mint.
+   */
+  const ethRegisterReceipt = async () => {
+    const tx = String(ethManualAssetTx || '').replace(/^0x/i, '').trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(tx)) {
+      throw new Error('Paste the createAssets transaction hash (64 hex)');
+    }
+    if (!wartFrom) throw new Error('Unlock Warthog wallet (the receipt issuer)');
+    const amt = String(ethManualSupply || '').trim();
+    if (!amt) throw new Error('Enter the receipt amount in wETH');
+    const e8v = e8FromHuman(amt);
+    if (e8v <= 0n) throw new Error('Receipt amount must be > 0');
+    setActionStatus({ kind: 'info', text: `Registering ${amt} wETH receipt…` });
+    toast.loading('Proving the receipt to the machine…', { id: 'pool', duration: Infinity });
+    await registerWrapWhenMined(
+      () =>
+        poolApi('/api/pool', {
+          method: 'POST',
+          body: JSON.stringify({
+            action: 'eth3p_register_wrap',
+            assetHash: tx,
+            assetTxHash: tx,
+            supplyE8: e8v.toString(),
+            issuerWart: wartFrom,
+            assetName: 'WETH',
+          }),
+        }),
+      (text) => {
+        toast.loading(text, { id: 'pool', duration: Infinity });
+        setActionStatus({ kind: 'info', text });
+      },
+    );
+    setEthManualAssetTx('');
+    setEthManualSupply('');
+    await refreshEthMintable();
+    setActionStatus({ kind: 'ok', text: `wETH receipt ${amt} registered.` });
+    toast.success(`Registered ${amt} wETH`, { id: 'pool', duration: 8000 });
+  };
+
+  /**
+   * Recover a burn that reached the burn bin but never released its ETH.
+   *
+   * liveAtomicToEth() burns first and opens the redeem second, so anything that
+   * throws in between leaves the wETH gone with no ETH and no record. Pressing
+   * wETH -> ETH again would burn MORE; this claims the burn that already
+   * happened. Idempotent — the ticket id derives from the burn tx hash.
+   */
+  const ethRecoverBurn = async () => {
+    const tx = String(ethManualBurnTx || '').replace(/^0x/i, '').trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(tx)) {
+      throw new Error('Paste the burn transaction hash (64 hex)');
+    }
+    if (!owner) throw new Error('Connect L1 wallet — ETH is paid to it');
+    setActionStatus({ kind: 'info', text: 'Recovering stranded burn…' });
+    toast.loading('Claiming the burn…', { id: 'pool', duration: Infinity });
+    const opened = await openRedeemWhenMined(
+      { wartTxHash: tx, burnerWart: wartFrom || undefined, ethAddress: owner },
+      (m) => toast.loading(m, { id: 'pool', duration: Infinity }),
+    );
+    const ticketId = opened.ticketId;
+    if (opened.alreadyPaid) {
+      setActionStatus({ kind: 'ok', text: `Already paid (${ticketId}).` });
+      toast.success('Already paid', { id: 'pool', duration: 6000 });
+      return;
+    }
+    const deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+      const t = await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'eth3p_ticket', ticketId }),
+      });
+      if (t?.status === 'paid' && (t.txHash || t.payout?.txHash)) {
+        const h = t.txHash || t.payout?.txHash;
+        setEthManualBurnTx('');
+        setActionStatus({
+          kind: 'ok',
+          text: `Recovered. ETH paid ${String(h).slice(0, 12)}… to ${String(owner).slice(0, 10)}…`,
+        });
+        toast.success('Stranded burn recovered', { id: 'pool', duration: 10000 });
+        void refresh();
+        return;
+      }
+      toast.loading(
+        `Ticket ${ticketId}: waiting for e1 + e2 signing…`,
+        { id: 'pool', duration: Infinity },
+      );
+      await new Promise((r) => setTimeout(r, 2500));
+    }
+    throw new Error(
+      `Ticket ${ticketId} is open and safe — turn ETH Signing ON in the original e1 and e2 tabs to finish it.`,
+    );
+  };
+
+  /**
+   * Open credits for this Warthog address, read fresh.
+   *
+   * Not the `ethMintable` state: the steps below chain inside one click
+   * (lock → mint → register) and setState is not visible to the next line.
+   */
+  const fetchEthOpenCredits = async () => {
+    if (!wartFrom) throw new Error('Unlock Warthog wallet (the receipt issuer)');
+    const m = await poolApi('/api/pool', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'eth3p_mintable', issuerWart: wartFrom }),
+    });
+    setEthMintable(m?.ok ? m : null);
+    return (m?.credits || [])
+      .map((c) => ({ ...c, e8: BigInt(c.remainingE8 || '0') }))
+      .filter((c) => c.e8 > 0n)
+      .sort((a, b) => (a.e8 < b.e8 ? 1 : a.e8 > b.e8 ? -1 : 0));
+  };
+
+  /**
+   * One whole credit, exactly — never a sum and never a part.
+   *
+   * registerEthWrap decrements a SINGLE credit whose remainder covers the
+   * supply, while the machine checks the issuer's aggregate. So a receipt
+   * minted across two deposits is accepted in-machine and then matches no host
+   * credit: nothing decrements and the quota keeps being offered for ETH that
+   * is already spent. By the time register can complain the WETH is on Warthog
+   * L1 for good, so the refusal has to happen here, before the mint.
+   */
+  const pickEthCredit = (open, wantE8) => {
+    if (!open.length) {
+      throw new Error(
+        'No unwrapped ETH credit for this Warthog address — nothing to finish. Lock ETH first.',
+      );
+    }
+    if (wantE8 == null) return open[0];
+    const exact = open.find((c) => c.e8 === wantE8);
+    if (!exact) {
+      throw new Error(
+        `No open credit of exactly ${humanFromE8(wantE8)} wETH — press "use" on one of the ` +
+          'amounts listed above. A receipt spanning two deposits mints WETH nothing can back.',
+      );
+    }
+    return exact;
+  };
+
+  /** Amount the receipt steps act on: the typed one, else the largest credit. */
+  const ethWantedE8 = () => {
+    const typed = String(ethManualSupply || '').trim();
+    return typed ? e8FromHuman(typed) : null;
+  };
+
+  /** Stage 3: createAssets WETH for exactly `credit`, from the user's own wallet. */
+  const ethMintFor = async (credit) => {
+    const supply = humanFromE8(credit.e8);
+    toast.loading(`Minting ${supply} wETH receipt on Warthog…`, { id: 'pool', duration: Infinity });
+    const minted = await createWarthogEthAsset({
+      amount: supply,
+      wartAddress: wartFrom,
+      ownerL1: owner,
+    });
+    const assetHash = minted?.assetHash || minted?.hash;
+    if (!assetHash) throw new Error('createAssets returned no assetHash');
+    const txHash = minted?.txHash || assetHash;
+    setEthManualAssetTx(txHash);
+    setEthManualSupply(supply);
+    return { assetHash, txHash, supply };
+  };
+
+  /** Stage 4: SPV-prove a minted receipt. Safe to retry; keyed on the asset hash. */
+  const ethRegisterMinted = async ({ assetHash, txHash, e8 }) =>
+    registerWrapWhenMined(
+      () =>
+        poolApi('/api/pool', {
+          method: 'POST',
+          body: JSON.stringify({
+            action: 'eth3p_register_wrap',
+            assetHash,
+            assetTxHash: txHash,
+            supplyE8: e8.toString(),
+            issuerWart: wartFrom,
+            assetName: 'WETH',
+          }),
+        }),
+      (text) => {
+        toast.loading(text, { id: 'pool', duration: Infinity });
+        setActionStatus({ kind: 'info', text });
+      },
+    );
+
+  /**
+   * Step 1 alone: lock ETH on the Q and credit it — no receipt.
+   *
+   * The only step here that moves new money. Stops one short of the mint so a
+   * deposit can be made from a tab that cannot sign Warthog; the credit waits.
+   */
+  const ethLock = async () => {
+    if (!owner) throw new Error('Connect L1 wallet');
+    if (!signer) throw new Error('Connect MetaMask to send Anvil ETH');
+    if (!wartFrom) throw new Error('Unlock Warthog wallet — the credit is keyed to it');
+    const q = eth3pSt?.address;
+    if (!q) throw new Error('ETH 3P Q not sealed — turn e1 and e2 Signing ON');
+    const adapter = eth3pSt?.adapter;
+    if (!adapter?.address) throw new Error('ETH deposit adapter is not live — cannot lock');
+    const amt = String(amount || '').trim();
+    if (!amt) throw new Error('Enter amount');
+    const wei = ethers.parseEther(amt);
+    if (wei <= 0n) throw new Error('Amount must be > 0');
+
+    setActionStatus({ kind: 'info', text: `Locking ${amt} ETH on the 3P Q…` });
+    toast.loading(`Sending ${amt} ETH through the deposit adapter…`, {
+      id: 'pool',
+      duration: Infinity,
+    });
+    const sent = await depositEthThroughAdapter({
+      signer,
+      adapter: { address: adapter.address, pool: q },
+      wartAddress: wartFrom,
+      value: wei,
+    });
+    const credited = await poolApi('/api/pool', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'eth3p_credit',
+        ethTxHash: sent.hash,
+        amountWei: wei.toString(),
+        wartAddress: wartFrom,
+        fromEth: owner,
+      }),
+    });
+    await poolApi('/api/pool', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'eth3p_bind', wartAddress: wartFrom, ethAddress: owner }),
+    }).catch(() => null);
+    const e8 = BigInt(credited?.credit?.remainingE8 || '0');
+    // Pre-fill what the receipt must be: the credit backs amount − bridge fee,
+    // and minting the gross figure is the one mistake that cannot be undone.
+    if (e8 > 0n) setEthManualSupply(humanFromE8(e8));
+    await refreshEthMintable();
+    const label = e8 > 0n ? humanFromE8(e8) : '?';
+    setActionStatus({
+      kind: 'ok',
+      text: `Locked ${amt} ETH (tx ${String(sent.hash).slice(0, 12)}…). Next: mint a ${label} wETH receipt.`,
+    });
+    toast.success(`Locked ${amt} ETH — receipt not minted yet`, { id: 'pool', duration: 10000 });
+  };
+
+  /**
+   * Step 2 alone: mint the receipt, leave it unregistered.
+   *
+   * Fills the register input with the hash it just created, so the half-done
+   * state is on screen rather than only on chain.
+   */
+  const ethMintReceiptOnly = async () => {
+    const open = await fetchEthOpenCredits();
+    const credit = pickEthCredit(open, ethWantedE8());
+    const { txHash, supply } = await ethMintFor(credit);
+    await refreshEthMintable();
+    setActionStatus({
+      kind: 'ok',
+      text: `Minted ${supply} wETH receipt ${String(txHash).slice(0, 12)}… — not proved yet. Press Register wrap.`,
+    });
+    toast.success(`Receipt minted — now Register wrap`, { id: 'pool', duration: 10000 });
+  };
+
+  /**
+   * Steps 2 + 3 for one credit: the ETH twin of Get wWART (1-click).
+   *
+   * Sends no ETH — it finishes a deposit already locked on the Q, which is the
+   * state a closed tab leaves behind. A failure after the mint is safe: the
+   * hash is in the register input and re-registering cannot double-credit.
+   */
+  const ethFinishWrap = async () => {
+    const open = await fetchEthOpenCredits();
+    const credit = pickEthCredit(open, ethWantedE8());
+    setActionStatus({ kind: 'info', text: `Finishing ${humanFromE8(credit.e8)} wETH…` });
+    const { assetHash, txHash, supply } = await ethMintFor(credit);
+    await ethRegisterMinted({ assetHash, txHash, e8: credit.e8 });
+    setEthManualAssetTx('');
+    setEthManualSupply('');
+    await refreshEthMintable();
+    setActionStatus({
+      kind: 'ok',
+      text: `wETH ${supply} finished — receipt ${String(assetHash).slice(0, 12)}… registered.`,
+    });
+    toast.success(`Deposit finished · ${supply} wETH`, { id: 'pool', duration: 10000 });
+  };
+
+  /**
+   * Step 4 alone: burn a receipt into the bin without opening the redeem.
+   *
+   * The burn is irreversible, so the hash goes straight into the recover input
+   * — that field plus Redeem ETH is the whole recovery, and pressing burn twice
+   * is what it exists to prevent.
+   */
+  const ethBurnReceipt = async () => {
+    const { wartTx, supply } = await burnWethToBin();
+    setEthManualBurnTx(wartTx);
+    setActionStatus({
+      kind: 'ok',
+      text: `Burned ${supply} wETH (${String(wartTx).slice(0, 12)}…). No ETH yet — press Redeem ETH. Do not burn again.`,
+    });
+    toast.success('wETH burned — now Redeem ETH', { id: 'pool', duration: 12000 });
+  };
+
   const run = async (action) => {
     setBusy(true);
     try {
@@ -3151,13 +4067,46 @@ export default function FungiblePool({
           action === 'atomic_to_wwart' ||
           action === 'atomic_to_wart'
         ) {
-          throw new Error('Atomic / 1-click is live-only (real WART ↔ real wWART)');
+          throw new Error('Swap is live-only');
+        }
+        // The ETH bridge has no lab twin — labAction would answer "unknown
+        // action" for every step in that block. Say why instead.
+        if (action.startsWith('eth_')) {
+          throw new Error('ETH · wETH steps are live-only');
         }
         await labAction(action);
       } else if (action === 'one_click_wwart') await liveOneClickToWwart();
       else if (action === 'atomic_to_wwart') await liveAtomicToWwart();
       else if (action === 'atomic_to_wart') await liveAtomicToWart();
-      else if (action === 'deposit') await liveDeposit();
+      else if (action === 'atomic_to_weth') await liveAtomicToWeth();
+      else if (action === 'atomic_to_eth') await liveAtomicToEth();
+      else if (action === 'eth_lock') await ethLock();
+      else if (action === 'eth_mint_receipt') await ethMintReceiptOnly();
+      else if (action === 'eth_finish_wrap') await ethFinishWrap();
+      else if (action === 'eth_register_receipt') await ethRegisterReceipt();
+      else if (action === 'eth_burn') await ethBurnReceipt();
+      else if (action === 'eth_recover_burn') await ethRecoverBurn();
+      else if (action === 'bind') {
+        if (!wartFrom) throw new Error('Unlock Warthog first');
+        if (!owner) throw new Error('Connect MetaMask first');
+        toast.loading('Sign Warthog + MetaMask to bind…', { id: 'pool' });
+        const bound = await ensureWartOwnerBind({
+          fromAddress: wartFrom,
+          owner,
+          signer,
+          signWartMessage: wartBridgeApi?.signMessage,
+        });
+        setWartBind(bound);
+        const ok = bound?.status === 'match' || bound?.ok;
+        setActionStatus({
+          kind: ok ? 'ok' : 'err',
+          text: ok
+            ? `Bound ${String(wartFrom).slice(0, 12)}… → ${String(owner).slice(0, 10)}…`
+            : bound?.error || 'Bind failed',
+        });
+        if (ok) toast.success('WART↔ETH bound', { id: 'pool' });
+        else throw new Error(bound?.error || 'Bind failed');
+      } else if (action === 'deposit') await liveDeposit();
       else if (action === 'credit_resume') {
         const h = String(resumeTxHash || '').trim();
         if (!h) throw new Error('Paste Warthog tx hash to resume credit');
@@ -3197,6 +4146,204 @@ export default function FungiblePool({
   };
 
   const u = snap?.user;
+  const flashCopy = async (key, value) => {
+    const ok = await copyText(value);
+    if (!ok) {
+      toast.error('Copy failed');
+      return;
+    }
+    setCopiedKey(key);
+    toast.success('Copied', { id: 'fp-copy', duration: 1400 });
+    setTimeout(() => setCopiedKey((k) => (k === key ? '' : k)), 1600);
+  };
+  const ethUnwrapMaxE8 = (() => {
+    let m = 0n;
+    const wartKey = String(wartFrom || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    for (const w of eth3pSt?.wraps || []) {
+      if (wartKey && String(w.issuerWart || '').toLowerCase() !== wartKey) continue;
+      const o = BigInt(w.outstandingE8 || 0);
+      if (o > m) m = o;
+    }
+    return m;
+  })();
+  const maxPay =
+    swapAsset === 'ETH'
+      ? swapDir === 'to_wwart' && mmEthBal != null && Number(mmEthBal) > 0
+        ? String(mmEthBal).trim()
+        : swapDir === 'to_wart' && ethUnwrapMaxE8 > 0n
+          ? humanFromE8(ethUnwrapMaxE8)
+          : ''
+      : swapDir === 'to_wart' && mmWwartBal != null && Number(mmWwartBal) > 0
+        ? String(mmWwartBal).trim()
+        : '';
+  const payAsset =
+    swapAsset === 'ETH'
+      ? swapDir === 'to_wwart'
+        ? 'ETH'
+        : 'wETH'
+      : swapDir === 'to_wwart'
+        ? 'WART'
+        : 'wWART';
+  const recvAsset =
+    swapAsset === 'ETH'
+      ? swapDir === 'to_wwart'
+        ? 'wETH'
+        : 'ETH'
+      : swapDir === 'to_wwart'
+        ? 'wWART'
+        : 'WART';
+  const swapTitle =
+    swapAsset === 'ETH'
+      ? swapDir === 'to_wwart'
+        ? 'ETH → wETH'
+        : 'wETH → ETH'
+      : swapDir === 'to_wwart'
+        ? 'WART → wWART'
+        : 'wWART → WART';
+  const ethQ = eth3pSt?.address || '';
+  /** Is there ETH locked on the Q that never became a receipt? Gates the mint steps. */
+  const ethOpenCredit = (ethMintable?.credits || []).some(
+    (c) => BigInt(c.remainingE8 || '0') > 0n,
+  );
+  const ethLedger = (() => {
+    const empty = {
+      availableHuman: '0',
+      lockedHuman: '0',
+      usedHuman: '0',
+      wartL1Human: '0',
+    };
+    const ownerEth = String(owner || '').toLowerCase();
+    const wartKey = String(wartFrom || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    if (!ownerEth && !wartKey) return empty;
+    const credits = (eth3pSt?.credits || []).filter((c) => {
+      const from = String(c.fromEth || '').toLowerCase();
+      const wart = String(c.wartAddress || '').toLowerCase();
+      if (ownerEth && from && from === ownerEth) return true;
+      if (wartKey && wart === wartKey) return true;
+      return false;
+    });
+    const wartSet = new Set(
+      credits.map((c) => String(c.wartAddress || '').toLowerCase()).filter(Boolean),
+    );
+    if (wartKey) wartSet.add(wartKey);
+    const wraps = (eth3pSt?.wraps || []).filter((w) =>
+      wartSet.has(String(w.issuerWart || '').toLowerCase()),
+    );
+    let available = 0n;
+    for (const c of credits) {
+      available += BigInt(c.remainingE8 || 0);
+    }
+    let used = 0n;
+    for (const w of wraps) used += BigInt(w.outstandingE8 || 0);
+    // Same shape as WART inspect: Locked = unused lock + still-minted claim.
+    // Redeem/burn drops outstandingE8, so Locked and Used fall together.
+    const locked = available + used;
+    let wartL1 = used;
+    if (ethWartL1E8 != null && ethWartL1E8 !== '') {
+      try {
+        wartL1 = BigInt(ethWartL1E8);
+      } catch {
+        /* keep wrap sum */
+      }
+    }
+    return {
+      availableHuman: humanFromE8(available),
+      lockedHuman: humanFromE8(locked),
+      usedHuman: humanFromE8(used),
+      wartL1Human: humanFromE8(wartL1),
+    };
+  })();
+  /**
+   * Count and largest-single-receipt, for the line under the wETH total.
+   *
+   * Largest is the number that actually bounds an unwrap — liveAtomicToEth
+   * picks one receipt and spends it, so anything above this figure fails no
+   * matter what the total reads. Showing it next to the total is what turns
+   * "insufficient balance" from a surprise into something you saw coming.
+   */
+  const ethReceiptSummary = (() => {
+    if (!ethReceipts.length) return null;
+    let largest = 0n;
+    let total = 0n;
+    for (const r of ethReceipts) {
+      const e8 = BigInt(r.e8 || 0);
+      total += e8;
+      if (e8 > largest) largest = e8;
+    }
+    return {
+      count: ethReceipts.length,
+      totalHuman: humanFromE8(total),
+      largestHuman: humanFromE8(largest),
+      split: ethReceipts.length > 1,
+    };
+  })();
+  /**
+   * What this Warthog wallet has already put in the burn bin, and how far each
+   * burn got.
+   *
+   * The bin is keyless: once a receipt lands there it is gone whether or not
+   * the ETH leg ever finishes. From the wallet's side a burn waiting on an
+   * owner bind, a burn waiting on e1/e2, and a burn that already paid out look
+   * identical — the receipt is simply missing. Separating them is the
+   * difference between "my ETH is on the way" and "my ETH is stuck and here is
+   * on what".
+   *
+   * Sourced from the status payload, which returns the last 20 burns. When we
+   * are sitting on exactly that many the history is probably clipped, so the
+   * totals get flagged as partial rather than quietly under-reporting.
+   */
+  const ethBinLedger = (() => {
+    const wartKey = String(wartFrom || '')
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    if (!wartKey) return null;
+    const burns = (eth3pSt?.burns || []).filter(
+      (b) => String(b.burnerWart || '').toLowerCase() === wartKey,
+    );
+    const open = (eth3pSt?.open || []).filter(
+      (t) => String(t.burnerWart || '').toLowerCase() === wartKey,
+    );
+    if (!burns.length && !open.length) return null;
+    let binned = 0n;
+    let needBind = 0n;
+    let needBindCount = 0;
+    for (const b of burns) {
+      const e8 = BigInt(b.amountE8 || 0);
+      binned += e8;
+      if (b.status === 'need-bind') {
+        needBind += e8;
+        needBindCount += 1;
+      }
+    }
+    let pending = 0n;
+    for (const t of open) pending += BigInt(t.amountE8 || 0);
+    // A blocked seat is why an open ticket is not moving; ticketView already
+    // works it out per ticket, so surface the first one rather than a count.
+    const blocked = open.find((t) => t.blockedOn);
+    return {
+      count: burns.length,
+      binnedHuman: humanFromE8(binned),
+      pendingCount: open.length,
+      pendingHuman: humanFromE8(pending),
+      needBindCount,
+      needBindHuman: humanFromE8(needBind),
+      blockedOn: blocked?.blockedOn || null,
+      blockedFault: blocked?.blockedFault || null,
+      partial: (eth3pSt?.burns || []).length >= 20,
+      rows: burns.slice(-6).reverse(),
+    };
+  })();
+  const ageLabel = (() => {
+    if (!refreshedAt) return null;
+    const sec = Math.max(0, Math.round((Date.now() - refreshedAt) / 1000));
+    if (sec < 8) return 'just now';
+    if (sec < 60) return `${sec}s ago`;
+    return `${Math.round(sec / 60)}m ago`;
+  })();
 
   return (
     <section
@@ -3234,20 +4381,41 @@ export default function FungiblePool({
               fontWeight: 700,
             }}
           >
-            Path A · real WART
+            Path A · {swapAsset === 'ETH' ? 'ETH 3P' : 'real WART'}
           </span>
           <span
-            title="Release needs d_dapp + browser d1 + browser d2 (3P ECDSA). Hot key retired."
+            title={
+              swapAsset === 'ETH'
+                ? 'ETH lock needs d_dapp + e1 + e2. Receipt is Warthog WETH you mint.'
+                : 'Release needs d_dapp + browser d1 + browser d2 (3P ECDSA). Hot key retired.'
+            }
             style={{
               fontSize: '0.68rem',
               padding: '0.12rem 0.4rem',
               borderRadius: 6,
-              background: 'rgba(253,185,19,0.22)',
-              color: '#FDB913',
+              background:
+                swapAsset === 'ETH'
+                  ? 'rgba(88,166,255,0.22)'
+                  : 'rgba(253,185,19,0.22)',
+              color: swapAsset === 'ETH' ? '#58a6ff' : '#FDB913',
               fontWeight: 700,
             }}
           >
-            3P pool · d_dapp + d1 + d2
+            {swapAsset === 'ETH' ? '3P pool · e1 + e2' : '3P pool · d_dapp + d1 + d2'}
+          </span>
+          <span style={{ display: 'inline-flex', gap: 4, marginLeft: 4 }}>
+            {['WART', 'ETH'].map((a) => (
+              <button
+                key={a}
+                type="button"
+                className={`fp-amt${swapAsset === a ? ' is-on' : ''}`}
+                disabled={busy}
+                onClick={() => setSwapAsset(a)}
+                title={a === 'ETH' ? 'Swap Anvil ETH ↔ Warthog wETH receipt' : 'Swap WART ↔ wWART'}
+              >
+                {a}
+              </button>
+            ))}
           </span>
         </div>
         <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }}>
@@ -3287,17 +4455,78 @@ export default function FungiblePool({
       </header>
 
       <p className="fp-status-line">
-        1:1 reserved mint path. Until you hold wWART, only you can mint/withdraw your deposit.
-        After you have wWART it is unbound — anyone you send it to can redeem WART from the pool.
-        {pool3pSt?.configured ? (
+        {swapAsset === 'ETH'
+          ? '1:1 ETH lock in the e1/e2 3P. You mint the Warthog wETH receipt; anyone holding it can redeem ETH.'
+          : '1:1 reserved mint. Until you hold wWART, only you can mint or withdraw your deposit. After that, anyone holding the token can redeem WART.'}
+        {ageLabel ? <span className="fp-status-age"> · pool {ageLabel}</span> : null}
+      </p>
+      <div className="fp-chip-row" aria-label="Pool status">
+        <button
+          type="button"
+          className="fp-chip fp-chip-q"
+          title={(swapAsset === 'ETH' ? ethQ : poolAddr) || 'pool address'}
+          disabled={!(swapAsset === 'ETH' ? ethQ : poolAddr)}
+          onClick={() => flashCopy('q', swapAsset === 'ETH' ? ethQ : poolAddr)}
+        >
+          {copiedKey === 'q' ? <Check size={12} /> : <Copy size={12} />}
+          Q{' '}
+          {swapAsset === 'ETH'
+            ? ethQ
+              ? shortHex(ethQ, 6, 4)
+              : 'unsealed'
+            : poolAddr
+              ? shortHex(poolAddr, 6, 4)
+              : '…'}
+        </button>
+        <span
+          className={`fp-chip${wartBind?.status === 'match' ? ' is-ok' : bindBlocked ? ' is-bad' : ' is-wait'}`}
+        >
+          {wartBind?.status === 'match'
+            ? 'Bound'
+            : bindBlocked
+              ? 'Bind clash'
+              : owner && wartFrom
+                ? 'Bind needed'
+                : 'Unbound'}
+        </span>
+        {swapAsset === 'ETH' && eth3pSt?.ok ? (
           <>
-            {' '}
-            Signers {pool3pSt.d1Live ? 'd1 live' : 'd1 waiting'} ·{' '}
-            {pool3pSt.d2Live ? 'd2 live' : 'd2 waiting'}
-            {pool3pSt.orbit ? ` · orbit ${pool3pSt.orbit.liveCount || 0}` : ''}.
+            <span className={`fp-chip${eth3pSt.e1Live ? ' is-ok' : ' is-wait'}`}>
+              {eth3pSt.e1Live ? 'e1 live' : 'e1 wait'}
+            </span>
+            <span className={`fp-chip${eth3pSt.e2Live ? ' is-ok' : ' is-wait'}`}>
+              {eth3pSt.e2Live ? 'e2 live' : 'e2 vacant'}
+            </span>
+            <span className={`fp-chip${eth3pSt.adapter?.ok && eth3pSt.adapter?.poolMatch ? ' is-ok' : ' is-wait'}`}>
+              {eth3pSt.adapter?.ok && eth3pSt.adapter?.poolMatch
+                ? 'adapter'
+                : eth3pSt.adapter?.deployed
+                  ? 'adapter sync'
+                  : 'no adapter'}
+            </span>
+          </>
+        ) : pool3pSt?.configured ? (
+          <>
+            <span className={`fp-chip${pool3pSt.d1Live ? ' is-ok' : ' is-wait'}`}>
+              {pool3pSt.d1Live ? 'd1 live' : 'd1 wait'}
+            </span>
+            <span className={`fp-chip${pool3pSt.d2Live ? ' is-ok' : ' is-wait'}`}>
+              {pool3pSt.d2Live ? 'd2 live' : 'd2 vacant'}
+            </span>
+            {pool3pSt.orbit ? (
+              <span className={`fp-chip${Number(pool3pSt.orbit.liveCount) >= 4 ? ' is-ok' : ' is-wait'}`}>
+                orbit {pool3pSt.orbit.liveCount || 0}
+              </span>
+            ) : null}
           </>
         ) : null}
-      </p>
+        {spv ? (
+          <span className={`fp-chip${spv.bootstrapped ? ' is-ok' : ' is-wait'}`}>
+            SPV {spv.bootstrapped ? 'on' : 'off'}
+            {spv.bestHeight != null ? ` · ${spv.bestHeight}` : ''}
+          </span>
+        ) : null}
+      </div>
 
       {open && (
         <>
@@ -3308,43 +4537,228 @@ export default function FungiblePool({
             <div className="wi-stat wi-stat--liquid">
               <Layers size={16} className="wi-stat-icon" />
               <span className="wi-stat-k">Available</span>
-              <span className="wi-stat-v">{snap?.availableHuman ?? '…'}</span>
-              <span className="wi-stat-hint">your unused deposit</span>
+              <span className="wi-stat-v">
+                {swapAsset === 'ETH'
+                  ? ethLedger.availableHuman
+                  : (snap?.availableHuman ?? '…')}
+              </span>
+              <span className="wi-stat-hint">
+                {swapAsset === 'ETH' ? 'your unused ETH lock' : 'your unused deposit'}
+              </span>
             </div>
             <div className="wi-stat">
               <span className="wi-stat-k">Locked</span>
-              <span className="wi-stat-v">{snap?.lockedHuman ?? '…'}</span>
-              <span className="wi-stat-hint">your WART credited</span>
+              <span className="wi-stat-v">
+                {swapAsset === 'ETH'
+                  ? ethLedger.lockedHuman
+                  : (snap?.lockedHuman ?? '…')}
+              </span>
+              <span className="wi-stat-hint">
+                {swapAsset === 'ETH' ? 'your ETH still in 3P' : 'your WART credited'}
+              </span>
             </div>
             <div className="wi-stat">
               <span className="wi-stat-k">Used</span>
-              <span className="wi-stat-v">{snap?.claimedHuman ?? '…'}</span>
-              <span className="wi-stat-hint">your minted claim</span>
+              <span className="wi-stat-v">
+                {swapAsset === 'ETH'
+                  ? ethLedger.usedHuman
+                  : (snap?.claimedHuman ?? '…')}
+              </span>
+              <span className="wi-stat-hint">
+                {swapAsset === 'ETH' ? 'your unburned wETH' : 'your minted claim'}
+              </span>
             </div>
             <div className="wi-stat wi-stat--spoof">
-              <span className="wi-stat-k">MetaMask wWART</span>
-              <span className="wi-stat-v">{mmWwartLabel}</span>
-              <span className="wi-stat-hint">your L1 token</span>
+              <span className="wi-stat-k">
+                {swapAsset === 'ETH' ? 'WART L1 wETH' : 'MetaMask wWART'}
+              </span>
+              <span className="wi-stat-v">
+                {swapAsset === 'ETH'
+                  ? ethLedger.wartL1Human
+                  : mmWwartLabel}
+              </span>
+              <span className="wi-stat-hint">
+                {swapAsset === 'ETH'
+                  ? ethReceiptSummary
+                    ? `${ethReceiptSummary.count} receipt${ethReceiptSummary.count === 1 ? '' : 's'}` +
+                      (ethReceiptSummary.split
+                        ? ` · largest ${ethReceiptSummary.largestHuman} (unwrap cap)`
+                        : ' · unwrap one at a time')
+                    : 'no receipts on this Warthog address'
+                  : 'your L1 token'}
+              </span>
             </div>
           </div>
+
+          {swapAsset === 'ETH' && (ethReceiptSummary || ethBinLedger) ? (
+            <div className="fp-receipts">
+              <div className="fp-receipts-head">
+                <span className="fp-receipts-title">
+                  <Layers size={13} aria-hidden /> wETH receipts
+                </span>
+                <span className="fp-receipts-total">
+                  {ethReceiptSummary ? `${ethReceiptSummary.totalHuman} wETH` : '0 wETH'}
+                  <em>
+                    {ethReceiptSummary
+                      ? `across ${ethReceiptSummary.count}`
+                      : 'none held'}
+                  </em>
+                </span>
+              </div>
+              {ethReceiptSummary ? (
+                <ul className="fp-receipts-list">
+                  {ethReceipts.map((r) => (
+                    <li key={r.hash} className="fp-receipt-row">
+                      <button
+                        type="button"
+                        className="fp-pending-hash"
+                        title={`Asset ${r.hash}${r.lockTx ? ` · lock tx ${r.lockTx}` : ''}`}
+                        onClick={() => flashCopy(`rcpt-${r.hash}`, r.hash)}
+                      >
+                        {copiedKey === `rcpt-${r.hash}` ? (
+                          <Check size={12} />
+                        ) : (
+                          <Copy size={12} />
+                        )}
+                        {shortHex(r.hash, 8, 6)}
+                      </button>
+                      {r.mine ? null : (
+                        <span className="fp-chip" title="Minted by another Warthog address and sent to you — still yours to burn">
+                          received
+                        </span>
+                      )}
+                      <span className="fp-receipt-amt">{humanFromE8(r.e8)}</span>
+                      <button
+                        type="button"
+                        className="fp-max"
+                        disabled={busy || !owner}
+                        title="Unwrap exactly this receipt"
+                        onClick={() => {
+                          setSwapAsset('ETH');
+                          setSwapDir('to_wart');
+                          setAmount(humanFromE8(r.e8));
+                        }}
+                      >
+                        UNWRAP
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="fp-receipts-empty">
+                  Nothing on {wartFrom ? shortHex(wartFrom, 8, 6) : 'this Warthog address'} yet
+                  — lock ETH and mint a receipt to see it here.
+                </p>
+              )}
+              {ethReceiptSummary?.split ? (
+                <p className="fp-receipts-note">
+                  Separate Warthog assets, not one balance. A single unwrap spends one
+                  receipt, so {ethReceiptSummary.largestHuman} is the most you can redeem in
+                  one go.
+                </p>
+              ) : null}
+              {ethBinLedger ? (
+                <div className="fp-bin">
+                  <div className="fp-bin-head">
+                    <span className="fp-bin-title">
+                      <Flame size={13} aria-hidden /> In the burn bin
+                    </span>
+                    <span className="fp-bin-total">
+                      {ethBinLedger.binnedHuman} wETH
+                      <em>
+                        {ethBinLedger.count} burn{ethBinLedger.count === 1 ? '' : 's'}
+                        {ethBinLedger.partial ? ' (recent)' : ''}
+                      </em>
+                    </span>
+                  </div>
+                  <div className="fp-chip-row fp-bin-chips">
+                    {ethBinLedger.pendingCount ? (
+                      <span className="fp-chip is-wait">
+                        {ethBinLedger.pendingHuman} awaiting ETH
+                        {ethBinLedger.blockedOn ? ` · blocked on e${ethBinLedger.blockedOn}` : ''}
+                      </span>
+                    ) : (
+                      <span className="fp-chip is-ok">no redeem in flight</span>
+                    )}
+                    {ethBinLedger.needBindCount ? (
+                      <span
+                        className="fp-chip is-bad"
+                        title="These burns have no 0x bound to this Warthog address, so there is nowhere to pay the ETH. Connect the wallet you want paid."
+                      >
+                        {ethBinLedger.needBindHuman} needs a bound 0x
+                      </span>
+                    ) : null}
+                  </div>
+                  {ethBinLedger.blockedFault ? (
+                    <p className="fp-receipts-note">
+                      e{ethBinLedger.blockedOn} reported: {String(ethBinLedger.blockedFault)}
+                    </p>
+                  ) : null}
+                  {ethBinLedger.rows.length ? (
+                    <ul className="fp-receipts-list fp-bin-list">
+                      {ethBinLedger.rows.map((b) => (
+                        <li key={b.wartTxHash || `${b.assetHash}-${b.at}`} className="fp-receipt-row">
+                          <button
+                            type="button"
+                            className="fp-pending-hash"
+                            title={`Burn tx ${b.wartTxHash || '—'} · asset ${b.assetHash}`}
+                            onClick={() =>
+                              flashCopy(`burn-${b.wartTxHash}`, b.wartTxHash || b.assetHash)
+                            }
+                          >
+                            {copiedKey === `burn-${b.wartTxHash}` ? (
+                              <Check size={12} />
+                            ) : (
+                              <Copy size={12} />
+                            )}
+                            {shortHex(b.wartTxHash || b.assetHash, 8, 6)}
+                          </button>
+                          <span
+                            className={`fp-chip fp-chip-status is-${b.status === 'need-bind' ? 'pending' : 'credited'}`}
+                          >
+                            {b.status}
+                          </span>
+                          <span className="fp-receipt-amt">{humanFromE8(b.amountE8)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
 
           {mode === 'live' && (
             <div className={`fp-swap${swapFlipTick ? ' is-flipping' : ''}`}>
               <div className="fp-swap-head">
-                <span className="fp-swap-title">
-                  {swapDir === 'to_wwart' ? 'WART → wWART' : 'wWART → WART'}
-                </span>
+                <span className="fp-swap-title">{swapTitle}</span>
                 <span className="fp-swap-peg">1 = 1</span>
               </div>
               <div className="fp-swap-leg">
                 <div className="fp-swap-leg-top">
                   <span>You pay</span>
-                  <span>
-                    {swapDir === 'to_wwart'
-                      ? 'from Warthog'
-                      : mmWwartLabel
-                        ? `wallet ${mmWwartLabel}`
-                        : 'from MetaMask'}
+                  <span className="fp-swap-leg-meta">
+                    {swapAsset === 'ETH'
+                      ? swapDir === 'to_wwart'
+                        ? mmEthBal
+                          ? `wallet ${Number(mmEthBal).toLocaleString(undefined, { maximumFractionDigits: 4 })} ETH`
+                          : 'from MetaMask'
+                        : 'from Warthog receipt'
+                      : swapDir === 'to_wwart'
+                        ? 'from Warthog'
+                        : mmWwartLabel
+                          ? `wallet ${mmWwartLabel}`
+                          : 'from MetaMask'}
+                    {maxPay ? (
+                      <button
+                        type="button"
+                        className="fp-max"
+                        disabled={busy || !owner}
+                        onClick={() => setAmount(maxPay)}
+                      >
+                        MAX
+                      </button>
+                    ) : null}
                   </span>
                 </div>
                 <div className="fp-swap-row">
@@ -3354,14 +4768,28 @@ export default function FungiblePool({
                     className="fp-swap-input"
                     value={amount}
                     onChange={(e) => setAmount(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !busy && owner) {
+                        e.preventDefault();
+                        run(
+                          swapAsset === 'ETH'
+                            ? swapDir === 'to_wwart'
+                              ? 'atomic_to_weth'
+                              : 'atomic_to_eth'
+                            : swapDir === 'to_wwart'
+                              ? 'atomic_to_wwart'
+                              : 'atomic_to_wart',
+                        );
+                      }
+                    }}
                     placeholder="0.0"
                     disabled={busy || !owner}
                     aria-label="Amount you pay"
                   />
                   <span
-                    className={`fp-swap-asset${swapDir === 'to_wwart' ? ' is-wart' : ''}`}
+                    className={`fp-swap-asset${payAsset === 'WART' || payAsset === 'ETH' ? (payAsset === 'ETH' ? ' is-eth' : ' is-wart') : ''}`}
                   >
-                    {swapDir === 'to_wwart' ? 'WART' : 'wWART'}
+                    {payAsset}
                   </span>
                 </div>
               </div>
@@ -3388,7 +4816,13 @@ export default function FungiblePool({
                 <div className="fp-swap-leg-top">
                   <span>You receive</span>
                   <span>
-                    {swapDir === 'to_wwart' ? 'to MetaMask' : 'to Warthog'}
+                    {swapAsset === 'ETH'
+                      ? swapDir === 'to_wwart'
+                        ? 'to Warthog'
+                        : 'to MetaMask'
+                      : swapDir === 'to_wwart'
+                        ? 'to MetaMask'
+                        : 'to Warthog'}
                   </span>
                 </div>
                 <div className="fp-swap-row">
@@ -3403,27 +4837,112 @@ export default function FungiblePool({
                     aria-label="Amount you receive"
                   />
                   <span
-                    className={`fp-swap-asset${swapDir === 'to_wart' ? ' is-wart' : ''}`}
+                    className={`fp-swap-asset${recvAsset === 'WART' || recvAsset === 'ETH' ? (recvAsset === 'ETH' ? ' is-eth' : ' is-wart') : ''}`}
                   >
-                    {swapDir === 'to_wwart' ? 'wWART' : 'WART'}
+                    {recvAsset}
                   </span>
                 </div>
               </div>
               {swapDir === 'to_wart' ? (
-                <input
-                  type="text"
-                  className="fp-swap-to"
-                  value={toAddress}
-                  onChange={(e) => setToAddress(e.target.value)}
-                  placeholder={
-                    wartBridgeApi?.address
-                      ? `WART pays to ${String(wartBridgeApi.address).slice(0, 12)}… (or paste another)`
-                      : 'Warthog address to receive WART'
-                  }
-                  disabled={busy || !owner}
-                  aria-label="Warthog address for WART payout"
-                />
+                <div className="fp-swap-to-wrap">
+                  <input
+                    type="text"
+                    className="fp-swap-to"
+                    value={
+                      swapAsset === 'ETH'
+                        ? eth3pSt?.burnBin || ''
+                        : toAddress
+                    }
+                    onChange={(e) => {
+                      if (swapAsset !== 'ETH') setToAddress(e.target.value);
+                    }}
+                    readOnly={swapAsset === 'ETH'}
+                    placeholder={
+                      swapAsset === 'ETH'
+                        ? 'Burn bin (Warthog, no key) — send the receipt here to redeem ETH'
+                        : wartBridgeApi?.address
+                          ? `WART pays to ${shortHex(wartBridgeApi.address, 10, 6)} (or paste another)`
+                          : 'Warthog address to receive WART'
+                    }
+                    disabled={busy || !owner}
+                    aria-label="Warthog address for WART payout"
+                  />
+                  {wartBridgeApi?.address ? (
+                    <button
+                      type="button"
+                      className="fp-icon-btn"
+                      title="Use unlocked Warthog address"
+                      onClick={() => {
+                        setToAddress(String(wartBridgeApi.address));
+                        void flashCopy('to', wartBridgeApi.address);
+                      }}
+                    >
+                      {copiedKey === 'to' ? <Check size={14} /> : <Copy size={14} />}
+                    </button>
+                  ) : null}
+                </div>
               ) : null}
+              {swapDir === 'to_wart' && swapAsset === 'ETH' ? (
+                <p className="fp-burn-ctx">
+                  {ethBinLedger ? (
+                    <>
+                      <strong>{wartFrom ? shortHex(wartFrom, 6, 4) : 'This wallet'}</strong> has
+                      put <strong>{ethBinLedger.binnedHuman} wETH</strong> in this bin over{' '}
+                      {ethBinLedger.count} burn{ethBinLedger.count === 1 ? '' : 's'}
+                      {ethBinLedger.partial ? ' (recent history)' : ''}
+                      {ethBinLedger.pendingCount
+                        ? ` · ${ethBinLedger.pendingHuman} still awaiting ETH`
+                        : ' · all settled'}
+                      .
+                    </>
+                  ) : wartFrom ? (
+                    <>
+                      <strong>{shortHex(wartFrom, 6, 4)}</strong> has not burned anything into
+                      this bin yet.
+                    </>
+                  ) : (
+                    <>Unlock a Warthog wallet to see what it has burned here.</>
+                  )}
+                  {ethReceiptSummary?.split ? (
+                    <> Max in one burn is {ethReceiptSummary.largestHuman} (largest receipt).</>
+                  ) : null}
+                </p>
+              ) : null}
+              <div className="fp-amt-chips" aria-label="Quick amounts">
+                {['1', '5', '15'].map((n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    className={`fp-amt${amount === n ? ' is-on' : ''}`}
+                    disabled={busy || !owner}
+                    onClick={() => setAmount(n)}
+                  >
+                    {n}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                className="btn secondary fp-swap-go"
+                disabled={busy || !owner || !signer || !wartFrom || bindBlocked}
+                onClick={() => run('bind')}
+                title="Dual-sign: bind this Warthog address to the connected MetaMask account. Required before deposit/withdraw on a fresh stack."
+              >
+                {wartBind?.status === 'match'
+                  ? `Bound ${String(wartFrom).slice(0, 8)}… → ${String(owner).slice(0, 8)}…`
+                  : 'Bind WART ↔ ETH'}
+              </button>
+              <p className="fp-swap-hint" style={{ marginTop: '-0.2rem' }}>
+                {!owner
+                  ? 'Connect MetaMask to bind.'
+                  : !wartFrom
+                    ? 'Unlock Warthog to bind.'
+                    : bindBlocked
+                      ? wartBind?.error || 'This Warthog wallet is bound to another L1 account.'
+                      : wartBind?.status === 'match'
+                        ? 'This pair is bound. You can swap.'
+                        : 'Bind once (Warthog sig + MetaMask sig), then deposit or withdraw.'}
+              </p>
               <button
                 type="button"
                 className="btn primary fp-swap-go"
@@ -3431,12 +4950,22 @@ export default function FungiblePool({
                   busy ||
                   !owner ||
                   !signer ||
-                  (swapDir === 'to_wwart'
-                    ? !wartBridgeApi?.sendTransaction || bindBlocked
-                    : !(toAddress || wartBridgeApi?.address))
+                  (swapAsset === 'ETH'
+                    ? !wartFrom || (swapDir === 'to_wwart' && !ethQ)
+                    : swapDir === 'to_wwart'
+                      ? !wartBridgeApi?.sendTransaction || bindBlocked
+                      : !(toAddress || wartBridgeApi?.address))
                 }
                 onClick={() =>
-                  run(swapDir === 'to_wwart' ? 'atomic_to_wwart' : 'atomic_to_wart')
+                  run(
+                    swapAsset === 'ETH'
+                      ? swapDir === 'to_wwart'
+                        ? 'atomic_to_weth'
+                        : 'atomic_to_eth'
+                      : swapDir === 'to_wwart'
+                        ? 'atomic_to_wwart'
+                        : 'atomic_to_wart',
+                  )
                 }
                 title={
                   bindBlocked && swapDir === 'to_wwart'
@@ -3458,31 +4987,7 @@ export default function FungiblePool({
           {actionStatus ? (
             <div
               role="status"
-              style={{
-                margin: '0 0 0.65rem',
-                padding: '0.5rem 0.65rem',
-                borderRadius: 8,
-                fontSize: '0.78rem',
-                lineHeight: 1.4,
-                border:
-                  actionStatus.kind === 'err'
-                    ? '1px solid rgba(255,120,100,0.55)'
-                    : actionStatus.kind === 'ok'
-                      ? '1px solid rgba(0,255,204,0.45)'
-                      : '1px solid rgba(240,198,116,0.5)',
-                background:
-                  actionStatus.kind === 'err'
-                    ? 'rgba(60,16,12,0.85)'
-                    : actionStatus.kind === 'ok'
-                      ? 'rgba(0,40,36,0.85)'
-                      : 'rgba(40,30,0,0.85)',
-                color:
-                  actionStatus.kind === 'err'
-                    ? '#ffb4a2'
-                    : actionStatus.kind === 'ok'
-                      ? '#7dffa3'
-                      : '#ffe6a8',
-              }}
+              className={`fp-banner fp-banner-${actionStatus.kind || 'info'}`}
             >
               {actionStatus.text}
             </div>
@@ -3519,9 +5024,17 @@ export default function FungiblePool({
 
           <details className="fp-legacy">
             <summary>
-              Legacy paths
-              <span className="fp-legacy-tag">pending removal</span>
+              Legacy paths · {swapAsset === 'ETH' ? 'ETH' : 'WART'}
+              <span className="fp-legacy-tag">manual steps</span>
             </summary>
+          {/*
+            Recovery steps follow the asset toggle in the header: the WART
+            block below (deposit → mint → withdraw → burn/redeem) and the ETH
+            block after it are different bridges with different half-done
+            states, so only the selected one is shown. Pressing a WART step
+            while thinking in ETH is the mistake this guards against.
+          */}
+          {swapAsset !== 'ETH' && (
           <div>
           <div
             className="sw-card-meta"
@@ -3944,21 +5457,26 @@ export default function FungiblePool({
                   }}
                 >
                   {pendingList.map((p) => (
-                    <li
-                      key={p.txHash}
-                      style={{
-                        display: 'flex',
-                        flexWrap: 'wrap',
-                        gap: '0.35rem',
-                        alignItems: 'center',
-                        marginBottom: '0.3rem',
-                        fontFamily: 'monospace',
-                      }}
-                    >
-                      <span title={p.txHash}>
-                        {String(p.txHash).slice(0, 12)}… · {p.status}
-                        {p.amountHuman ? ` · ${p.amountHuman}` : ''}
+                    <li key={p.txHash} className="fp-pending-row">
+                      <button
+                        type="button"
+                        className="fp-pending-hash"
+                        title={p.txHash}
+                        onClick={() => flashCopy(`tx-${p.txHash}`, p.txHash)}
+                      >
+                        {copiedKey === `tx-${p.txHash}` ? (
+                          <Check size={12} />
+                        ) : (
+                          <Copy size={12} />
+                        )}
+                        {shortHex(p.txHash, 10, 6)}
+                      </button>
+                      <span className={`fp-chip fp-chip-status is-${String(p.status || 'pending')}`}>
+                        {p.status}
                       </span>
+                      {p.amountHuman ? (
+                        <span className="fp-pending-amt">{p.amountHuman} WART</span>
+                      ) : null}
                       <button
                         type="button"
                         className="btn secondary small"
@@ -3999,6 +5517,260 @@ export default function FungiblePool({
             </p>
           )}
           </div>
+          )}
+          {/*
+            ETH manual steps.
+
+            Kept in ETH vocabulary throughout — ETH, wETH, receipt, burn bin —
+            because the WART block above talks about claims, portals and
+            vouchers, and the two are different bridges. Its inputs are its own:
+            these take Warthog tx hashes for work already half-done on chain,
+            not a quantity to send like the swap box does.
+
+            The step row mirrors the WART one above (1-click first, then each
+            stage on its own), but the stages are the ETH tunnel's four, not
+            WART's: lock → mint receipt → register wrap → burn → redeem. Only
+            Lock ETH moves new money; every other step finishes something the
+            chain already holds.
+          */}
+          {swapAsset === 'ETH' && (
+          <div className="fp-eth-manual">
+            <div className="fp-eth-manual-head">
+              ETH · wETH manual steps
+              <span className="wi-muted" style={{ fontWeight: 500, marginLeft: 6 }}>
+                (finish a half-done deposit or unwrap — never repeats an on-chain step)
+              </span>
+            </div>
+            <p className="wi-muted" style={{ fontSize: '0.72rem', margin: '0 0 0.5rem' }}>
+              <b>Finish wETH (1-click)</b> sends no ETH — it mints and proves the receipt for
+              a deposit already locked on the Q, which is what a closed tab leaves behind.
+              Starting a <i>new</i> deposit is <b>ETH → wETH</b> in the swap box above, or
+              Lock ETH here.
+            </p>
+
+            <div
+              style={{
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: '0.4rem',
+                alignItems: 'center',
+                marginBottom: '0.55rem',
+              }}
+            >
+              <span
+                className="wi-muted"
+                style={{
+                  fontSize: '0.68rem',
+                  fontWeight: 700,
+                  letterSpacing: '0.04em',
+                  textTransform: 'uppercase',
+                  width: '100%',
+                  marginBottom: '0.1rem',
+                }}
+              >
+                Recovery / step-by-step
+              </span>
+              <button
+                type="button"
+                className="btn secondary small"
+                disabled={busy || !wartFrom || !ethOpenCredit}
+                onClick={() => run('eth_finish_wrap')}
+                title={
+                  ethOpenCredit
+                    ? 'Mint the receipt for one credited deposit and SPV-prove it. Sends no ETH; never mints twice for the same credit.'
+                    : 'Nothing to finish — no ETH locked on the Q without a receipt'
+                }
+              >
+                <Zap size={14} aria-hidden style={{ verticalAlign: -2 }} /> Finish wETH (1-click)
+              </button>
+              <button
+                type="button"
+                className="btn primary small"
+                disabled={busy || !owner || !signer || !wartFrom || !eth3pSt?.adapter?.address}
+                onClick={() => run('eth_lock')}
+                title={`Sends ${amount || '0'} ETH to the 3P Q and credits it — the only step here that moves new money. Stops before the receipt.`}
+              >
+                Lock ETH
+              </button>
+              <button
+                type="button"
+                className="btn secondary small"
+                disabled={busy || !wartFrom || !ethOpenCredit}
+                onClick={() => run('eth_mint_receipt')}
+                title="createAssets WETH for one credit, exactly. Leaves it unregistered and fills the hash in below."
+              >
+                Mint receipt
+              </button>
+              <button
+                type="button"
+                className="btn secondary small"
+                disabled={busy || !wartFrom || !ethManualAssetTx || !ethManualSupply}
+                onClick={() => run('eth_register_receipt')}
+                title="SPV-prove the receipt in step 1 below to the machine. Safe to retry."
+              >
+                Register wrap
+              </button>
+              <button
+                type="button"
+                className="btn secondary small"
+                disabled={busy || !wartFrom || !eth3pSt?.burnBin || !wartBridgeApi?.sendAsset}
+                onClick={() => run('eth_burn')}
+                title={`Sends ${amount || '0'} wETH to the burn bin without opening the redeem. Irreversible — the hash lands in step 2 below.`}
+              >
+                Burn wETH
+              </button>
+              <button
+                type="button"
+                className="btn danger small"
+                disabled={busy || !owner || !ethManualBurnTx}
+                onClick={() => run('eth_recover_burn')}
+                title="Open (or re-open) the redeem for the burn hash in step 2 below and wait for e1 + e2. Cannot pay twice."
+              >
+                Redeem ETH
+              </button>
+              <span className="wi-muted" style={{ fontSize: '0.68rem', width: '100%' }}>
+                Lock ETH and Burn wETH use the swap-box amount above
+                {amount ? ` (${amount})` : ''}; the receipt steps always use one whole credit.
+              </span>
+            </div>
+
+            <div className="sw-card-meta" style={{ marginBottom: '0.6rem', fontSize: '0.78rem' }}>
+              <div className="sw-meta-row">
+                <span className="sw-meta-k">ETH 3P pool (Q)</span>
+                <span
+                  className="sw-meta-v"
+                  style={{ fontFamily: 'monospace', fontSize: '0.7rem', wordBreak: 'break-all', color: '#FDB913' }}
+                  title={eth3pSt?.address || ''}
+                >
+                  {eth3pSt?.address || '—'}
+                </span>
+              </div>
+              <div className="sw-meta-row">
+                <span className="sw-meta-k">wETH burn bin</span>
+                <span
+                  className="sw-meta-v"
+                  style={{ fontFamily: 'monospace', fontSize: '0.7rem', wordBreak: 'break-all' }}
+                  title={eth3pSt?.burnBin || ''}
+                >
+                  {eth3pSt?.burnBin || '—'}
+                </span>
+              </div>
+              <div className="sw-meta-row">
+                <span className="sw-meta-k">Signers</span>
+                <span
+                  className="sw-meta-v"
+                  style={{ color: eth3pSt?.e1Live && eth3pSt?.e2Live ? '#7dffa3' : '#f0c674' }}
+                >
+                  {eth3pSt?.e1Live ? 'e1 live' : 'e1 missing'} · {eth3pSt?.e2Live ? 'e2 live' : 'e2 missing'}
+                </span>
+              </div>
+              {ethMintable && BigInt(ethMintable.totalRemainingE8 || '0') > 0n ? (
+                <div className="sw-meta-row">
+                  <span className="sw-meta-k">Deposited ETH not yet wrapped</span>
+                  <span className="sw-meta-v" style={{ color: '#f0c674' }}>
+                    {humanFromE8(BigInt(ethMintable.totalRemainingE8))} ETH
+                  </span>
+                </div>
+              ) : null}
+            </div>
+
+            {ethMintable && (ethMintable.credits || []).some((c) => BigInt(c.remainingE8) > 0n) ? (
+              <div className="fp-eth-manual-note">
+                One receipt per deposit — mint each amount exactly, not the total:
+                <ul style={{ margin: '0.3rem 0 0', paddingLeft: '1.1rem' }}>
+                  {(ethMintable.credits || [])
+                    .filter((c) => BigInt(c.remainingE8) > 0n)
+                    .map((c) => (
+                      <li key={c.id} style={{ fontSize: '0.75rem' }}>
+                        <button
+                          type="button"
+                          className="btn secondary small"
+                          style={{ padding: '0 6px', marginRight: 6 }}
+                          disabled={busy}
+                          title="Use this amount for the receipt below"
+                          onClick={() => setEthManualSupply(humanFromE8(BigInt(c.remainingE8)))}
+                        >
+                          use
+                        </button>
+                        <b>{humanFromE8(BigInt(c.remainingE8))} wETH</b>
+                        <span className="wi-muted"> — from ETH deposit {String(c.ethTxHash || '').slice(0, 12)}…</span>
+                      </li>
+                    ))}
+                </ul>
+              </div>
+            ) : null}
+
+            <div className="fp-eth-manual-step">
+              <div className="fp-eth-manual-step-title">1 · Register a minted wETH receipt</div>
+              <p className="wi-muted" style={{ fontSize: '0.75rem', margin: '0 0 0.4rem' }}>
+                Your ETH is locked and credited but the receipt was never proved to the
+                machine. Mint WETH (decimals 8) for one deposit amount in your Warthog
+                wallet, then paste that createAssets hash here. Safe to retry —
+                <b> never mint a second time</b>, each mint is a new unbacked asset.
+              </p>
+              <input
+                type="text"
+                className="input wi-portal-input"
+                style={{ width: '100%', marginBottom: '0.4rem', fontSize: '0.8rem' }}
+                value={ethManualAssetTx}
+                onChange={(e) => setEthManualAssetTx(e.target.value)}
+                placeholder="createAssets tx hash (Warthog, 64 hex)"
+                disabled={busy}
+              />
+              <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  className="input wi-portal-input"
+                  style={{ flex: '1 1 9rem', fontSize: '0.8rem' }}
+                  value={ethManualSupply}
+                  onChange={(e) => setEthManualSupply(e.target.value)}
+                  placeholder="receipt amount in wETH"
+                  disabled={busy}
+                />
+                <button
+                  type="button"
+                  className="btn primary small"
+                  disabled={busy || !wartFrom || !ethManualAssetTx || !ethManualSupply}
+                  onClick={() => run('eth_register_receipt')}
+                  title="SPV-prove the createAssets to the machine and consume the ETH credit"
+                >
+                  Register wETH receipt
+                </button>
+              </div>
+            </div>
+
+            <div className="fp-eth-manual-step">
+              <div className="fp-eth-manual-step-title">2 · Recover a stranded wETH burn</div>
+              <p className="wi-muted" style={{ fontSize: '0.75rem', margin: '0 0 0.4rem' }}>
+                Your wETH reached the burn bin but no ETH came back — the unwrap failed
+                after the burn. Paste that burn hash to claim the ETH.
+                <b> Do not press wETH → ETH again</b>, that burns more.
+              </p>
+              <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                <input
+                  type="text"
+                  className="input wi-portal-input"
+                  style={{ flex: '1 1 14rem', fontSize: '0.8rem' }}
+                  value={ethManualBurnTx}
+                  onChange={(e) => setEthManualBurnTx(e.target.value)}
+                  placeholder="burn tx hash (Warthog, 64 hex)"
+                  disabled={busy}
+                />
+                <button
+                  type="button"
+                  className="btn danger small"
+                  disabled={busy || !owner || !ethManualBurnTx}
+                  onClick={() => run('eth_recover_burn')}
+                  title="Re-open the redeem for a burn already on chain — idempotent, cannot pay twice"
+                >
+                  Recover burn → ETH
+                </button>
+              </div>
+            </div>
+          </div>
+          )}
+
           </details>
         </>
       )}

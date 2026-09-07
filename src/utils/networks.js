@@ -43,6 +43,8 @@ export const ANVIL = {
      * Updated by deploy-minter-wwart.mjs; zero means not deployed yet.
      */
     minterWwart: '0xBc174Ba3265e5E0FbdEFa2A8c9FDa5F334471287',
+    /** ETH 3P deposit adapter. Filled by deploy-eth3p-adapter.mjs --promote. */
+    eth3pAdapter: '0x2E983A1Ba5e8b38AAAeC4B440B9dDcFBf72E15d1',
   },
   tokens: {
     wwart: {

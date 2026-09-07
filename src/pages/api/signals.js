@@ -62,7 +62,7 @@ export async function GET({ request }) {
         service: 'cartesi-bridge-signals',
         ...store.stats(),
         requireSignals:
-          process.env.COSIGNER_REQUIRE_SIGNALS === '1' ? true : false,
+          globalThis.process?.env?.COSIGNER_REQUIRE_SIGNALS === '1' ? true : false,
         note: 'POST envelope or GET ?vault=0x… ; quorum via &policyDigest=&quorum=1',
       });
     }

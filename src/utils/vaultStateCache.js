@@ -11,8 +11,20 @@
 
 import { LOCAL_WWART } from './localTokens.js';
 
-// v2: key includes live wWART so redeploys drop stale capacity cache
-const PREFIX = 'cartesi-l1-vault-cache-v2:';
+// v3: key includes live wWART so redeploys drop stale capacity cache.
+// Bumped v2→v3 2026-08-23: invalidate pre-ledger-wipe snapshots that survived
+// the 19:20 fresh-ledger run and were being served as the last-resort fallback
+// while the validator was down (GraphQL 502).
+// Bumped v3→v4 2026-08-28: the WART-fee machine re-bake wiped Anvil, and
+// anvil-bootstrap redeployed MinterWWART to the SAME deterministic address
+// (0xBc174Ba3…). The wWART component of the key is therefore unchanged, so it
+// invalidates nothing on its own — only the prefix drops the pre-wipe balances.
+// Bumped v4→v5 2026-08-28: second re-bake the same evening (fee-notice fields),
+// another Anvil wipe, same deterministic wWART address. Same reasoning.
+// Bumped v6→v7 2026-09-02: SPV wrap-register machine rebake + Anvil wipe.
+// Bumped v8→v9 2026-09-06: Mode A full ledger wipe; wWART redeploys to the same address.
+// Bumped v9→v10 2026-09-07: rebake to clear stale inspect poolAccountId on unproven set_address.
+const PREFIX = 'cartesi-l1-vault-cache-v10:';
 
 export function vaultCacheKey(l1Address) {
   const wwart = String(LOCAL_WWART?.address || '')

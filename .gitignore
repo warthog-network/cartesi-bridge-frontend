@@ -37,3 +37,11 @@ pool-ops.token
 .data/
 fungible-pool-nonce.json
 fungible-pool-paid.json
+
+# ad-hoc deploy backups (git is the backup now)
+*.bak
+*.bak-*
+*.bak.*
+dist.*/
+dist-*/
+*.tmp-*

@@ -16,6 +16,7 @@
 import { createWarthogApi, signAndSubmitTransaction } from './warthogClient.js';
 import { getSmartNonce, bumpNonceAfterSuccess } from './cancelLimitOrder.js';
 import { DEFAULT_NODE_URL } from './presetNodes.js';
+import { getNetwork } from './networks.js';
 
 export const WARTHOG_ETH_ASSET_NAME = 'WETH';
 /** 8-dec matches WART funds scale; larger amounts fit in u64 vs 18-dec. */
@@ -64,13 +65,170 @@ function normEntry(raw) {
       ? String(raw.wartAddress).replace(/^0x/i, '').toLowerCase()
       : null,
     ownerL1: raw.ownerL1 ? ownerKey(raw.ownerL1) : null,
-    /** active = claim still open · released = capacity burned · pending = asset only */
+    /** active/pending = this L1 session · released = capacity burned · orphaned = prior Anvil session */
     status: raw.status || (raw.claimLinked === false ? 'pending' : 'active'),
     claimLinked: raw.claimLinked !== false,
     releasedAmount: raw.releasedAmount != null ? String(raw.releasedAmount) : '0',
     createdAt: raw.createdAt || raw.timestamp || Date.now(),
     source: raw.source || 'local',
+    /** Anvil genesis block hash at mint. Missing = pre-stamp (treated as orphaned once live epoch is known). */
+    l1Epoch: normEpoch(raw.l1Epoch),
   };
+}
+
+function normEpoch(h) {
+  if (!h) return null;
+  const s = String(h).toLowerCase();
+  return /^0x[0-9a-f]{64}$/.test(s) ? s : null;
+}
+
+/** Module cache so a failed RPC does not flip links to orphaned. */
+let epochCache = { at: 0, epoch: null, ok: false };
+
+/**
+ * Live L1 session id = Anvil genesis (`eth_getBlockByNumber('0x0')`).
+ * `{ ok:false }` on RPC failure — callers must not orphan on that.
+ */
+export async function fetchLiveL1Epoch({ rpcUrl, force } = {}) {
+  const now = Date.now();
+  if (!force && epochCache.ok && epochCache.epoch && now - epochCache.at < 30_000) {
+    return epochCache;
+  }
+  try {
+    const rpc =
+      rpcUrl ||
+      getNetwork()?.rpcUrl ||
+      'https://cartesi-bridge.duckdns.org/rpc';
+    const res = await fetch(rpc, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'eth_getBlockByNumber',
+        params: ['0x0', false],
+      }),
+    });
+    const j = await res.json();
+    const hash = normEpoch(j?.result?.hash);
+    if (!hash) throw new Error('no genesis hash');
+    epochCache = { at: now, epoch: hash, ok: true };
+    return epochCache;
+  } catch {
+    return { at: now, epoch: epochCache.epoch, ok: false };
+  }
+}
+
+export function cachedLiveL1Epoch() {
+  return epochCache.ok ? epochCache.epoch : null;
+}
+
+/**
+ * Backing label for a link given a successfully-read live epoch.
+ * Unknown live epoch → leave status unchanged (do not orphan on RPC fail).
+ * No l1Epoch on the row (pre-stamp) → orphaned once live epoch is known.
+ */
+export function linkBackingStatus(entry, liveEpoch) {
+  if (!entry) return 'active';
+  if (entry.status === 'released') return 'released';
+  if (entry.status === 'orphaned') return 'orphaned';
+  const live = normEpoch(liveEpoch);
+  if (!live) return entry.status || 'active';
+  const stamped = normEpoch(entry.l1Epoch);
+  if (!stamped || stamped !== live) return 'orphaned';
+  return entry.status || 'active';
+}
+
+export function partitionWethLinks(links, liveEpoch) {
+  const current = [];
+  const orphaned = [];
+  for (const e of Array.isArray(links) ? links : []) {
+    const st = linkBackingStatus(e, liveEpoch);
+    if (st === 'orphaned') orphaned.push({ ...e, status: 'orphaned' });
+    else current.push(e);
+  }
+  return { current, orphaned };
+}
+
+function persistStatus(list, liveEpoch) {
+  const live = normEpoch(liveEpoch);
+  if (!live) return list;
+  return list.map((e) => {
+    const st = linkBackingStatus(e, live);
+    if (st === 'orphaned' && e.status !== 'orphaned' && e.status !== 'released') {
+      return { ...e, status: 'orphaned' };
+    }
+    return e;
+  });
+}
+
+/** Mark local owner links orphaned when genesis mismatches. No-op if liveEpoch missing. */
+export function applyLiveEpochToLinks(ownerL1, liveEpoch) {
+  if (!ownerL1 || !normEpoch(liveEpoch)) return listLocalEthWartAssets(ownerL1);
+  const list = persistStatus(listLocalEthWartAssets(ownerL1), liveEpoch);
+  saveLocalLinks(ownerL1, list);
+  return list;
+}
+
+export function applyLiveEpochToWatch(wartAddress, liveEpoch) {
+  const w = String(wartAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (!w || !normEpoch(liveEpoch)) return listWethWatch(wartAddress);
+  const all = readStore(LS_WATCH);
+  const list = persistStatus(
+    (Array.isArray(all[w]) ? all[w] : []).map(normEntry).filter(Boolean),
+    liveEpoch,
+  );
+  all[w] = list;
+  writeStore(LS_WATCH, all);
+  return list;
+}
+
+/** Remove a hash from bridge tracking only — does not burn Warthog WETH. */
+export function untrackWethLink({ ownerL1, wartAddress, assetHash } = {}) {
+  const h = normHash(assetHash);
+  if (!h) return;
+  if (ownerL1) {
+    saveLocalLinks(
+      ownerL1,
+      listLocalEthWartAssets(ownerL1).filter((e) => e.assetHash !== h),
+    );
+  }
+  if (wartAddress) {
+    const w = String(wartAddress)
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    const all = readStore(LS_WATCH);
+    const list = (Array.isArray(all[w]) ? all[w] : []).filter(
+      (e) => normHash(e.assetHash || e.hash) !== h,
+    );
+    all[w] = list;
+    writeStore(LS_WATCH, all);
+  }
+}
+
+export function clearOrphanedWethLinks({ ownerL1, wartAddress, liveEpoch } = {}) {
+  const live = normEpoch(liveEpoch) || cachedLiveL1Epoch();
+  if (ownerL1) {
+    saveLocalLinks(
+      ownerL1,
+      listLocalEthWartAssets(ownerL1).filter(
+        (e) => linkBackingStatus(e, live) !== 'orphaned',
+      ),
+    );
+  }
+  if (wartAddress) {
+    const w = String(wartAddress)
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    const all = readStore(LS_WATCH);
+    const list = (Array.isArray(all[w]) ? all[w] : [])
+      .map(normEntry)
+      .filter((e) => e && linkBackingStatus(e, live) !== 'orphaned');
+    all[w] = list;
+    writeStore(LS_WATCH, all);
+  }
 }
 
 function readStore(key) {
@@ -120,7 +278,12 @@ function saveLocalLinks(ownerL1, list) {
 
 export function saveLocalLink(ownerL1, entry) {
   if (!ownerL1) return;
-  const e = normEntry({ ...entry, source: entry.source || 'local' });
+  const stamped = {
+    ...entry,
+    source: entry.source || 'local',
+    l1Epoch: entry.l1Epoch || cachedLiveL1Epoch(),
+  };
+  const e = normEntry(stamped);
   if (!e) return;
   const list = listLocalEthWartAssets(ownerL1).filter(
     (x) => x.assetHash !== e.assetHash,
@@ -136,7 +299,10 @@ export function addWethWatch(wartAddress, entry) {
     .replace(/^0x/i, '')
     .toLowerCase();
   if (!w) return;
-  const e = normEntry(entry);
+  const e = normEntry({
+    ...entry,
+    l1Epoch: entry.l1Epoch || cachedLiveL1Epoch(),
+  });
   if (!e) return;
   const all = readStore(LS_WATCH);
   const list = Array.isArray(all[w]) ? all[w] : [];
@@ -176,12 +342,16 @@ export function mergeEthWartAssetLinks(ownerL1, inspectList) {
     });
     if (!e) continue;
     const prev = byHash.get(e.assetHash);
+    const keep =
+      prev?.status === 'released' || prev?.status === 'orphaned'
+        ? prev.status
+        : 'active';
     byHash.set(e.assetHash, {
       ...prev,
       ...e,
+      l1Epoch: prev?.l1Epoch || e.l1Epoch || cachedLiveL1Epoch(),
       claimLinked: true,
-      // Keep released if user already burned; otherwise rollup link = active
-      status: prev?.status === 'released' ? 'released' : 'active',
+      status: keep,
       releasedAmount: prev?.releasedAmount || e.releasedAmount || '0',
       source: 'rollup',
     });
@@ -238,7 +408,7 @@ export function markLinksReleasedFifo(ownerL1, burnAmountHuman) {
   let left = burn;
   const released = [];
   const list = listLocalEthWartAssets(ownerL1).map((e) => {
-    if (left <= 0 || e.status === 'released') return e;
+    if (left <= 0 || e.status === 'released' || e.status === 'orphaned') return e;
     const amt = Number(e.amount) || 0;
     const already = Number(e.releasedAmount) || 0;
     const open = Math.max(0, amt - already);
@@ -403,6 +573,7 @@ export async function createWarthogEthAsset({
     );
   }
 
+  const epochHit = await fetchLiveL1Epoch();
   const entry = {
     assetHash,
     assetName: WARTHOG_ETH_ASSET_NAME,
@@ -415,6 +586,7 @@ export async function createWarthogEthAsset({
     status: 'pending',
     claimLinked: false,
     source: 'local',
+    l1Epoch: epochHit.ok ? epochHit.epoch : null,
   };
   if (ownerL1) saveLocalLink(ownerL1, entry);
   else addWethWatch(wartAddress, entry);
@@ -443,6 +615,7 @@ export function summarizeLinkedWeth(links, claimHuman) {
   for (const e of list) {
     const amt = Number(e.amount) || 0;
     const rel = Number(e.releasedAmount) || 0;
+    if (e.status === 'orphaned') continue;
     if (e.status === 'released') released += amt;
     else active += Math.max(0, amt - rel);
   }
@@ -452,9 +625,160 @@ export function summarizeLinkedWeth(links, claimHuman) {
     releasedLinked: released,
     claim,
     linkCount: list.length,
-    activeCount: list.filter((e) => e.status !== 'released').length,
+    activeCount: list.filter(
+      (e) => e.status !== 'released' && e.status !== 'orphaned',
+    ).length,
   };
+}
+
+/** Merge inspect + local, then orphan rows whose l1Epoch ≠ live Anvil genesis. */
+export async function reconcileWethLinks(ownerL1, inspectList) {
+  const hit = await fetchLiveL1Epoch();
+  const epoch = hit.ok ? hit.epoch : null;
+  let list = mergeEthWartAssetLinks(ownerL1, inspectList);
+  if (epoch && ownerL1) list = applyLiveEpochToLinks(ownerL1, epoch);
+  const { current, orphaned } = partitionWethLinks(list, epoch);
+  return { current, orphaned, epoch, all: list };
 }
 
 // Back-compat aliases
 export const listLocalWethLinks = listLocalEthWartAssets;
+
+/** ETH Q stamp for VPS FungiblePool (stamp only — receipts survive rotation). */
+const LS_POOL = 'cartesiWethWartPool';
+let currentPoolAddress = null;
+function normEthAddr(v) {
+  const s = String(v || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  return /^[0-9a-f]{40}$/.test(s) || /^[0-9a-f]{48}$/.test(s) ? s : null;
+}
+export function setWethPoolScope(poolAddress) {
+  const q = normEthAddr(poolAddress);
+  if (!q) return { changed: false, forgotten: 0 };
+  currentPoolAddress = q;
+  if (typeof localStorage === 'undefined') return { changed: false, forgotten: 0 };
+  let seen = null;
+  try {
+    seen = normEthAddr(localStorage.getItem(LS_POOL));
+  } catch {
+    /* */
+  }
+  try {
+    localStorage.setItem(LS_POOL, q);
+  } catch {
+    /* */
+  }
+  return { changed: seen !== q, forgotten: 0 };
+}
+/** Drop local WETH links that are neither held nor listed by the coordinator. */
+export function forgetUnusableWethLinks({ heldHashes = [], knownHashes = [] } = {}) {
+  const keep = new Set();
+  for (const h of [...heldHashes, ...knownHashes]) {
+    const n = normHash(h);
+    if (n) keep.add(n);
+  }
+  let forgotten = 0;
+  if (typeof localStorage === 'undefined') return { forgotten: 0 };
+  for (const key of [LS_LINKS, LS_WATCH]) {
+    const all = readStore(key);
+    let touched = false;
+    for (const [owner, list] of Object.entries(all)) {
+      if (!Array.isArray(list)) continue;
+      const kept = list.filter((x) => {
+        const n = normHash(x?.assetHash || x?.hash);
+        return n && keep.has(n);
+      });
+      forgotten += list.length - kept.length;
+      if (kept.length !== list.length) {
+        all[owner] = kept;
+        touched = true;
+      }
+    }
+    if (touched) writeStore(key, all);
+  }
+  return { forgotten };
+}
+function e8FromBalance(bal) {
+  const e8 = bal?.total?.E8 ?? bal?.available?.E8;
+  if (e8 != null && e8 !== '') {
+    try {
+      return BigInt(String(e8));
+    } catch {
+      /* */
+    }
+  }
+  const str = String(bal?.total?.str ?? bal?.available?.str ?? '0');
+  const [w, f = ''] = str.split('.');
+  try {
+    return BigInt(w || '0') * 10n ** 8n + BigInt((f + '00000000').slice(0, 8));
+  } catch {
+    return 0n;
+  }
+}
+function collectHistoryAssetHashes(histPayload) {
+  const out = [];
+  const rows =
+    histPayload?.history ||
+    histPayload?.transactions ||
+    histPayload?.txs ||
+    (Array.isArray(histPayload) ? histPayload : []);
+  for (const tx of rows) {
+    const type = String(tx?.type || tx?.txType || tx?.kind || '').toLowerCase();
+    const name = String(tx?.assetName || tx?.tokenName || tx?.asset || '').toUpperCase();
+    let h = tx?.assetHash || tx?.tokenHash || tx?.asset_id || tx?.token?.hash;
+    if (!h && (type.includes('asset') || name === 'WETH')) {
+      h = tx?.txHash || tx?.hash;
+    }
+    const n = normHash(h);
+    if (n) out.push(n);
+  }
+  return out;
+}
+export async function fetchWartAssetHoldings(wartAddress, extraHashes = [], nodeUrl) {
+  const addr = String(wartAddress || '')
+    .replace(/^0x/i, '')
+    .toLowerCase();
+  if (!/^[0-9a-f]{48}$/.test(addr)) return [];
+  const api = await createWarthogApi(nodeUrl || DEFAULT_NODE_URL);
+  const hashes = new Set();
+  for (const h of extraHashes || []) {
+    const n = normHash(h);
+    if (n) hashes.add(n);
+  }
+  for (const it of listWethWatch(addr)) {
+    if (it.assetHash) hashes.add(it.assetHash);
+  }
+  try {
+    const hist = await api.getAccountHistory(addr);
+    if (hist.success) {
+      for (const h of collectHistoryAssetHashes(hist.data)) hashes.add(h);
+    }
+  } catch {
+    /* optional */
+  }
+  const holdings = [];
+  for (const hash of hashes) {
+    try {
+      const res = await api.getAccountAssetBalance(addr, hash);
+      if (!res.success) continue;
+      const bal = res.data?.balance;
+      const e8 = e8FromBalance(bal);
+      if (e8 <= 0n) continue;
+      const token = res.data?.token || {};
+      holdings.push({
+        hash,
+        name: String(token.name || 'WETH')
+          .toUpperCase()
+          .slice(0, 8),
+        available: bal?.available?.str ?? bal?.total?.str ?? '0',
+        total: bal?.total?.str ?? '0',
+        locked: bal?.locked?.str ?? '0',
+        e8: e8.toString(),
+      });
+    } catch {
+      /* skip */
+    }
+  }
+  return holdings;
+}

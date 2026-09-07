@@ -5,7 +5,7 @@
  */
 export const FUNGIBLE_POOL = {
   poolId: 'wart-pool-0',
-  address: 'd6d1d6e9c86c5b06014a12e6c2fd05e00b5de88e876c9982',
+  address: '8676b914aa1ff0c5719efd6fdf64cfdd89b1dd5c649083f8',
   scheme: 'wart-fungible-pool-v0',
   /** Lab hot-wallet custody; payouts via /api/pool after rollup ticket */
   custody: '3p-lindell',
