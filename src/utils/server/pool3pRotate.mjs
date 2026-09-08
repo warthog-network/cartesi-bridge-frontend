@@ -896,7 +896,9 @@ async function tickRotationInner() {
   }
 
   if (r.phase === 'cutover' && machineReady && next?.address) {
-    await cutOver(r, next);
+    if (!(await restartSweepIfRefunded(r))) {
+      await cutOver(r, next);
+    }
   }
 
   return rotationView(loadRotate(), block, { machineReady });
@@ -922,6 +924,29 @@ function reservedUnpaidLiveE8(snap, liveAddr) {
   return n;
 }
 
+/**
+ * Reachable from `cutover` as well as `sweeping`: a deposit that lands after
+ * the sweep but before cutover used to leave cutOver() throwing "refunded
+ * after sweep" on every tick with nothing to walk the phase back — rotation
+ * wedged for 9h on 2026-09-08 behind a 150 WART test deposit. See the
+ * comment above the caller in maybeOpenOrAdvanceSweep for why a confirmed
+ * sweep next to a funded live Q must reopen the sweep, not retire the Q.
+ */
+async function restartSweepIfRefunded(r) {
+  if (!r.sweepTxHash) return false;
+  const st = await wartTxStatus(r.sweepTxHash).catch(() => null);
+  const settled = !!st?.mined && Number(st.confirmations || 0) >= SWEEP_MIN_CONF;
+  if (!settled || !(await liveQFunded())) return false;
+  const stale = String(r.sweepTxHash).slice(0, 12);
+  r.sweepTxHash = null;
+  r.sweepTicketId = null;
+  r.phase = 'sweeping';
+  r.lastError = `sweep restart: live Q refunded after ${stale}\u2026 confirmed`;
+  await saveRotate(r);
+  console.warn(`[pool3pRotate] ${r.lastError}`);
+  return true;
+}
+
 async function maybeOpenOrAdvanceSweep(r, next) {
   const snap = await inspectPoolSnap().catch(() => null);
   if (!snap) {
@@ -937,18 +962,7 @@ async function maybeOpenOrAdvanceSweep(r, next) {
    * a balance behind it. liveQFunded() is dust-aware: a drained Q holds less
    * than one min fee.
    */
-  if (r.sweepTxHash) {
-    const st = await wartTxStatus(r.sweepTxHash).catch(() => null);
-    const settled = !!st?.mined && Number(st.confirmations || 0) >= SWEEP_MIN_CONF;
-    if (settled && (await liveQFunded())) {
-      const stale = String(r.sweepTxHash).slice(0, 12);
-      r.sweepTxHash = null;
-      r.sweepTicketId = null;
-      r.lastError = `sweep restart: live Q refunded after ${stale}\u2026 confirmed`;
-      await saveRotate(r);
-      return;
-    }
-  }
+  if (await restartSweepIfRefunded(r)) return;
   const nextIsLive = normQ(snap.poolAddress) === normQ(next.address);
   if (nextIsLive) {
     // Inspect already moved, so this is normally cutover. But if the outgoing Q
