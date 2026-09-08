@@ -8,6 +8,7 @@
  * A3 request-store field it used to carry is gone with A3.
  */
 import nodeProcess from 'node:process';
+import { getInspect, machineView } from './inspectHub.mjs';
 
 function env(key, fallback = '') {
   try {
@@ -72,21 +73,10 @@ function extractWartHead(j) {
 }
 
 
-let inspectLocalCache = { at: 0, value: null };
-const INSPECT_LOCAL_TTL_MS = 8000;
-
 async function fetchInspectPoolLocal() {
-  if (inspectLocalCache.value && Date.now() - inspectLocalCache.at < INSPECT_LOCAL_TTL_MS) {
-    return inspectLocalCache.value;
-  }
-  const res = await fetch(INSPECT_POOL_URL, { cache: 'no-store' });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`inspect HTTP ${res.status}`);
-  const pool = decodeInspectBody(body);
-  if (!pool?.ok) throw new Error('inspect/pool not ok');
-  const value = { raw: body, pool };
-  inspectLocalCache = { at: Date.now(), value };
-  return value;
+  const r = await getInspect('pool');
+  if (!r.decoded?.ok) throw new Error('inspect/pool not ok');
+  return { raw: r.raw, pool: r.decoded, stale: r.stale, ageMs: r.ageMs };
 }
 
 async function fetchReleaseNoticeLocal(ticketId) {
@@ -244,5 +234,7 @@ export async function getTicketVerifySnapshot(ticketId) {
     inspectTicket,
     wartHead: wartHead?.error ? { error: wartHead.error } : wartHead,
     voucherCount: 0,
+    // Browser signers must not verify against a ledger that is hours behind.
+    machine: machineView(),
   };
 }

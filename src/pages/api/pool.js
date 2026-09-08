@@ -95,6 +95,7 @@ import { preparePool3pTransfer, submitPool3pTransfer } from '../../utils/server/
 import { assertPayoutMatchesTicket } from '../../utils/server/poolTicketVerify.mjs';
 import { getTicketVerifySnapshot } from '../../utils/server/poolVerifySnapshot.mjs';
 import { notePackReport } from '../../utils/server/packReports.mjs';
+import { getInspect, machineView, isReplaying } from '../../utils/server/inspectHub.mjs';
 
 export const prerender = false;
 
@@ -136,41 +137,13 @@ function decodeInspectHex(payload) {
   }
 }
 
-/** Coalesce / TTL-cache inspect/pool. Concurrent inspect+advance kills the validator. */
-const INSPECT_TTL_MS = Number(globalThis.process?.env?.POOL_INSPECT_TTL_MS || 1500) || 1500;
-const inspectCache = new Map();
-
+/** Inspect through the hub — one cached machine read per TTL for the whole fleet. */
 async function fetchRollupPoolInspect(owner) {
-  const base = String(
-    globalThis.process?.env?.CARTESI_INSPECT_URL || 'http://127.0.0.1:8080/inspect',
-  ).replace(/\/$/, '');
-  const path = owner
-    ? `${base}/pool/${String(owner).replace(/^0x/i, '').toLowerCase()}`
-    : `${base}/pool`;
-  const now = Date.now();
-  const hit = inspectCache.get(path);
-  if (hit?.value && now - hit.at < INSPECT_TTL_MS) return hit.value;
-  if (hit?.inflight) return hit.inflight;
-  const inflight = (async () => {
-    const res = await fetch(path, { cache: 'no-store' });
-    if (!res.ok) {
-      throw new Error(`inspect HTTP ${res.status}`);
-    }
-    const data = await res.json();
-    const decoded = decodeInspectHex(data?.reports?.[0]?.payload);
-    if (!decoded || decoded.error) {
-      throw new Error(decoded?.error || 'inspect returned no pool report');
-    }
-    inspectCache.set(path, { at: Date.now(), value: decoded });
-    return decoded;
-  })();
-  inspectCache.set(path, { ...(hit || {}), inflight });
-  try {
-    return await inflight;
-  } finally {
-    const cur = inspectCache.get(path);
-    if (cur?.inflight === inflight) delete cur.inflight;
+  const r = await getInspect('pool', { owner: owner || null });
+  if (!r.decoded || r.decoded.error) {
+    throw new Error(r.decoded?.error || 'inspect returned no pool report');
   }
+  return r.decoded;
 }
 
 /**
@@ -406,8 +379,12 @@ export async function POST({ request }) {
       try {
         const inspected = await fetchRollupPoolInspect('');
         const recent = inspected?.recentTickets || [];
-        rememberInspectTickets(recent);
-        await reopenAbandonedAuthorizedTickets(recent);
+        // A replaying machine reports yesterday's tickets as authorized —
+        // reopening rooms off that ledger would re-pay them.
+        if (!isReplaying()) {
+          rememberInspectTickets(recent);
+          await reopenAbandonedAuthorizedTickets(recent);
+        }
       } catch (e) {
         console.warn('[pool3p] inspect/reopen', e?.message || e);
       }
@@ -435,6 +412,7 @@ export async function POST({ request }) {
         orbit: wartOrbit,
         orbitKeys: wartSealedPreshare.orbitKeys(wartOrbit?.live),
         rotation,
+        machine: machineView(),
       });
     }
 
@@ -442,7 +420,7 @@ export async function POST({ request }) {
       if (!eth3pOn()) return json(200, { ok: false, configured: false, error: 'ETH 3P off' });
       const st = await publicEth3pStatus();
       const rotation = await tickEthRotation().catch((e) => ({ lastError: String(e?.message || e) }));
-      return json(200, { ...st, rotation });
+      return json(200, { ...st, rotation, machine: machineView() });
     }
     if (action === 'eth3p_enroll') {
       return json(200, await enrollEth3pSigner({ signerId: body.signerId }));

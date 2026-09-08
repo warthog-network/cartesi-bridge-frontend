@@ -31,6 +31,7 @@ import {
   recoverabilityView,
   paidRecordFor,
 } from './pool3p.mjs';
+import { getInspect, invalidateInspect, isReplaying, machineView } from './inspectHub.mjs';
 import { assertPaillierModulus, seatPokContext } from '../twoPartyEcdsa.js';
 import { writeJsonAtomic } from './jsonStore.mjs';
 import {
@@ -119,111 +120,11 @@ export async function anvilBlockNumber() {
   return Number(BigInt(hex));
 }
 
-function decodeInspectPayload(payload) {
-  if (payload == null) return null;
-  if (typeof payload === 'object') return payload;
-  const s = String(payload);
-  try {
-    if (s.startsWith('0x')) {
-      return JSON.parse(Buffer.from(s.slice(2), 'hex').toString('utf8'));
-    }
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
-}
-
-let inspectSnapCache = { at: 0, value: null, inflight: null };
-
-async function fetchInspectPool(base, timeoutMs) {
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
-  try {
-    const res = await fetch(`${String(base).replace(/\/$/, '')}/pool`, {
-      cache: 'no-store',
-      signal: ac.signal,
-    });
-    if (!res.ok) throw new Error(`inspect HTTP ${res.status}`);
-    const data = await res.json();
-    const decoded = decodeInspectPayload(data?.reports?.[0]?.payload);
-    if (!decoded) throw new Error('inspect returned no pool report');
-    return decoded;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Is this failure the serialize proxy being ABSENT, as opposed to the node being
- * unwell behind a proxy that is up and answering?
- *
- * Only a connection-level failure to :18080 means cartesi-sm-serialize itself is
- * down. An HTTP 5xx or an AbortError timeout means the proxy is up and forwarding
- * — the node is the slow/broken part.
- */
-function proxyIsDown(err) {
-  const code = String(err?.cause?.code || err?.code || '');
-  return code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'EHOSTUNREACH';
-}
-
-/**
- * Direct :8080 base, bypassing cartesi-sm-serialize.
- *
- * DANGER: this is only ever safe when the proxy is genuinely down (see
- * proxyIsDown). Bypassing because the node returned 5xx or timed out sends an
- * UNSERIALIZED InspectState at a server-manager that is already contended, which
- * is precisely the InspectState-vs-AdvanceState collision the proxy exists to
- * prevent — advance-runner treats the Aborted as fatal and the validator dies.
- * The old code fell back on ANY error, so the bypass fired hardest exactly when
- * it was most likely to kill the node: a retry storm into its own failure mode.
- * Driven every 60s by cartesi-bridge-pool-rotate-unstick.timer, that is the
- * mechanism behind the repeated watchdog recoveries (each of which wipes Anvil).
- *
- * POOL_INSPECT_DIRECT_FALLBACK=0 disables the bypass outright.
- */
-function inspectFallbackBase(primary) {
-  if (!envOn('POOL_INSPECT_DIRECT_FALLBACK', true)) return null;
-  const s = String(primary || '');
-  if (s.includes(':18080')) return s.replace(':18080', ':8080');
-  return null;
-}
-
+/** Inspect through the hub; the fallback / proxy rules live there now. */
 export async function inspectPoolSnap() {
-  const now = Date.now();
-  const ttl = Number(env('POOL_INSPECT_TTL_MS', '4000')) || 4000;
-  const staleMs = Number(env('POOL_INSPECT_STALE_MS', '60000')) || 60000;
-  if (inspectSnapCache.value && now - inspectSnapCache.at < ttl) {
-    return inspectSnapCache.value;
-  }
-  if (inspectSnapCache.inflight) return inspectSnapCache.inflight;
-  inspectSnapCache.inflight = (async () => {
-    try {
-      const decoded = await fetchInspectPool(INSPECT, 8000);
-      inspectSnapCache = { at: Date.now(), value: decoded, inflight: null };
-      return decoded;
-    } catch (e) {
-      // Never bypass the serializer just because the node is struggling.
-      const fb = proxyIsDown(e) ? inspectFallbackBase(INSPECT) : null;
-      if (fb) {
-        try {
-          const decoded = await fetchInspectPool(fb, 5000);
-          inspectSnapCache = { at: Date.now(), value: decoded, inflight: null };
-          return decoded;
-        } catch {
-          /* serialize down and direct inspect failed — try stale */
-        }
-      }
-      if (inspectSnapCache.value && Date.now() - inspectSnapCache.at < staleMs) {
-        return inspectSnapCache.value;
-      }
-      throw e;
-    }
-  })();
-  try {
-    return await inspectSnapCache.inflight;
-  } finally {
-    inspectSnapCache.inflight = null;
-  }
+  const r = await getInspect('pool');
+  if (!r.decoded) throw new Error('inspect returned no pool report');
+  return r.decoded;
 }
 
 export async function machineSupportsSetAddress() {
@@ -294,7 +195,7 @@ export async function syncInspectToLiveCoordinator(opts = {}) {
         poolAddress: addr,
         destAccountId: chainId,
       });
-      inspectSnapCache = { at: 0, value: null, inflight: null };
+      invalidateInspect('pool');
       const after = await waitInspect(
         (s) => Number(s?.poolAccountId || 0) === chainId,
         2,
@@ -329,7 +230,7 @@ export async function syncInspectToLiveCoordinator(opts = {}) {
       address: addr,
       publicKey: dapp.publicKey || dapp.seal?.publicKey || null,
     });
-    inspectSnapCache = { at: 0, value: null, inflight: null };
+    invalidateInspect('pool');
     snap = await waitInspect(
       (s) => normQ(s?.pendingNext?.address || s?.pendingNext) === addr,
       waitTries,
@@ -349,7 +250,7 @@ export async function syncInspectToLiveCoordinator(opts = {}) {
     type: 'pool_set_address',
     address: addr,
   });
-  inspectSnapCache = { at: 0, value: null, inflight: null };
+  invalidateInspect('pool');
   const after = await inspectPoolSnap();
   return {
     ok: normQ(after?.poolAddress) === addr,
@@ -787,6 +688,16 @@ async function tickRotationInner() {
 
   const auto = envOn('POOL_3P_AUTO_ROTATE', true);
   const elapsed = Math.max(0, block - Number(r.anchorBlock));
+  // Everything below reads inspect and posts inputs against what it sees. A
+  // replaying machine reports a Q retired hours ago: inspect-sync would
+  // re-announce/re-set addresses and cutover would refuse or misjudge. Hold.
+  if (isReplaying()) {
+    const m = machineView();
+    r.lastError = `rotate wait: machine replaying ${m.processed}/${m.total} inputs` +
+      (m.etaMinutes != null ? ` (eta ${m.etaMinutes} min)` : '');
+    await saveRotate(r);
+    return rotationView(r, block, { machineReady: null });
+  }
   await expireStaleUserRooms().catch(() => ({ closed: [] }));
   if (r.phase === 'idle') {
     await syncInspectToLiveCoordinator().catch((e) => {
@@ -1222,7 +1133,7 @@ function normQ(a) {
 async function waitInspect(pred, tries = 6, ms = 1500) {
   let last = null;
   for (let i = 0; i < tries; i += 1) {
-    inspectSnapCache = { at: 0, value: null, inflight: null };
+    invalidateInspect('pool');
     last = await inspectPoolSnap().catch(() => null);
     if (last && pred(last)) return last;
     await new Promise((res) => setTimeout(res, ms));

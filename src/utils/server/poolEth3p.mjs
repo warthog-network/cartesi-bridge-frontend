@@ -35,6 +35,7 @@ import {
 } from '../lindellZk.js';
 import { createSealedPreshareStore } from './sealedPreshare.mjs';
 import { latestPackReport } from './packReports.mjs';
+import { getInspect } from './inspectHub.mjs';
 import { ETH3P_ADAPTER_ABI } from '../eth3pAdapter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -2264,16 +2265,9 @@ export async function creditEthLock({
   return { ok: true, credit };
 }
 
-async function inspectEth3pSnap() {
-  const res = await fetch(`${INSPECT.replace(/\/$/, '')}/eth3p`);
-  if (!res.ok) throw new Error(`inspect/eth3p HTTP ${res.status}`);
-  const j = await res.json();
-  const p = j?.reports?.[0]?.payload;
-  if (!p) return null;
-  const text = String(p).startsWith('0x')
-    ? Buffer.from(String(p).slice(2), 'hex').toString('utf8')
-    : String(p);
-  return JSON.parse(text);
+async function inspectEth3pSnap({ maxAgeMs = null } = {}) {
+  const r = await getInspect('eth3p', { maxAgeMs });
+  return r.decoded ?? null;
 }
 
 async function waitMachineWrap(assetHash, tries = 24, ms = 1500) {
@@ -2281,7 +2275,7 @@ async function waitMachineWrap(assetHash, tries = 24, ms = 1500) {
     .replace(/^0x/i, '')
     .toLowerCase();
   for (let i = 0; i < tries; i += 1) {
-    const snap = await inspectEth3pSnap().catch(() => null);
+    const snap = await inspectEth3pSnap({ maxAgeMs: 2000 }).catch(() => null);
     const hit = (snap?.wraps || []).find(
       (w) => String(w.assetHash || '').toLowerCase() === want,
     );
@@ -2297,7 +2291,7 @@ async function waitMachineBurn(assetHash, outstandingMax, tries = 24, ms = 1500)
     .toLowerCase();
   const cap = BigInt(String(outstandingMax));
   for (let i = 0; i < tries; i += 1) {
-    const snap = await inspectEth3pSnap().catch(() => null);
+    const snap = await inspectEth3pSnap({ maxAgeMs: 2000 }).catch(() => null);
     const hit = (snap?.wraps || []).find(
       (w) => String(w.assetHash || '').toLowerCase() === want,
     );
