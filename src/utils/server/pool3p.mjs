@@ -1331,6 +1331,29 @@ function holderStale(rec, now = nowMs()) {
  * holder that missed a single beat was "vacant" to one path and "live" to the
  * next, and every other tab looped on collect → 400.
  */
+/**
+ * Seat allowlist. POOL_3P_SEAT_ALLOWLIST = comma-separated signer ids (or
+ * id prefixes). Empty = open participation (anyone live may birth/claim a seat).
+ * When set, unlisted nodes stay orbit voters: they attest tickets and hold
+ * sealed pack pieces, but cannot hold d1/d2 — and a holder that is not listed
+ * is vacated on its next heartbeat so a listed tab can rebuild the seat from
+ * the orbit pack. Added 2026-09-09 after an anonymous participant running the
+ * wrong network (Official1, not DeFi) birthed d1 of the live Q and every
+ * rotation sweep and withdrawal then hung on a tab that could never verify.
+ */
+function seatAllowlist() {
+  return String(env('POOL_3P_SEAT_ALLOWLIST', ''))
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+function seatAllowed(sid) {
+  const list = seatAllowlist();
+  if (!list.length) return true;
+  const id = String(sid || '');
+  return list.some((entry) => id === entry || id.startsWith(entry));
+}
+
 function seatOccupant(role) {
   const rec = loadHolders().roles?.[String(role)] || null;
   const occupant = rec?.signerId || null;
@@ -1987,6 +2010,14 @@ export async function heartbeatPool3p({ signerId, seatEpoch, clientVersion } = {
     }
     return mine;
   });
+  if (role > 0 && !seatAllowed(sid)) {
+    // A holder that is no longer on the allowlist gives the seat up here, so a
+    // listed tab can rebuild it from the orbit pack. Its share is unchanged
+    // (client-born Q) but it cannot claim the seat back.
+    logShareEvent('seat vacated', { ticketId: '-', signerId: sid, reason: `d${role} holder is not on the seat allowlist` });
+    await refreshSeat(role, 'allowlist');
+    role = 0;
+  }
 
   // Vacant / ghost pickup. Open rooms must not block claim_born — the room
   // is waiting on the missing holder. Do not birth a new share during a room
@@ -2233,6 +2264,7 @@ export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
     for (const r of ['1', '2']) {
       const bornSid = dapp.seats?.[r]?.signerId || dapp.seats?.[Number(r)]?.signerId;
       if (bornSid && bornSid === sid) {
+        if (!seatAllowed(sid)) break;
         // Born identity wins over a *swapped* lease, not over a live holder that
         // rebuilt this seat from the orbit pack. Evicting that holder on every
         // beat of a throttled dealer tab is what flapped d2 (and refused the
@@ -2279,6 +2311,7 @@ export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
   }
 
   async function claim(role) {
+    if (!seatAllowed(sid)) return null;
     const key = String(role);
     const occupant = loadHolders().roles?.[key]?.signerId;
     const bornSid =
@@ -2389,6 +2422,9 @@ export async function claimBornSeat({ signerId, role, shareHex, pok }) {
   if (r !== 1 && r !== 2) throw new Error('role must be 1 or 2');
   const sid = String(signerId || '').trim();
   if (sid.length < 16) throw new Error('signerId required');
+  if (!seatAllowed(sid)) {
+    throw new Error('claim denied — signer is not on the seat allowlist (orbit-only)');
+  }
   const dapp = loadDapp();
   if (!dapp?.clientBorn && !clientBornOn()) throw new Error('not client-born');
   const want = String(dapp.seats?.[String(r)]?.P || dapp.seal?.[r === 1 ? 'P1' : 'P2'] || '')
@@ -2492,6 +2528,7 @@ export function publicStatus() {
     d1Live: !!(currentHolderId(1) && liveOrbitMembers().includes(currentHolderId(1))),
     d2Live: !!(currentHolderId(2) && liveOrbitMembers().includes(currentHolderId(2))),
     ...recoverVacantView(),
+    seatAllowlist: seatAllowlist().length ? seatAllowlist().map((x) => x.slice(0, 20)) : null,
     hasDappShare: !!d.dappShareHex,
     hasCkeyD1: !!d.ckeyD1,
     hasD1: false,
