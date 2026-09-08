@@ -29,6 +29,7 @@ import {
   ORBIT_VPS_ID,
   loadHolders,
   recoverabilityView,
+  paidRecordFor,
 } from './pool3p.mjs';
 import { assertPaillierModulus, seatPokContext } from '../twoPartyEcdsa.js';
 import { writeJsonAtomic } from './jsonStore.mjs';
@@ -908,13 +909,23 @@ function openRotateRooms() {
   return listOpenPool3pTickets().filter((t) => /^wart-pool-rotate-/.test(String(t.ticketId || '')));
 }
 
-/** Authorized unpaid burns on the live Q — leave that e8 behind so sweep cannot drain redeem funds. */
+/**
+ * Authorized burns on the live Q that the coordinator has NOT paid — leave
+ * that e8 behind so a sweep cannot drain redeem funds.
+ *
+ * "Unpaid" is the coordinator's paid ledger, not the machine's ticket status:
+ * the rollup never learns a payout happened, so every ticket stays
+ * `authorized` there forever. Reserving for those left 28 WART behind on
+ * 2026-09-08 (tickets 0:4-0:6, all paid hours earlier), which then read as a
+ * "refunded" live Q and the sweep waited on its own reservation.
+ */
 function reservedUnpaidLiveE8(snap, liveAddr) {
   const live = normQ(liveAddr);
   let n = 0n;
   for (const t of snap?.recentTickets || []) {
     if (String(t?.status || '') !== 'authorized') continue;
     if (normQ(t.poolAddress) !== live) continue;
+    if (paidRecordFor(t.ticketId, { amountE8: t.amountE8, toAddress: t.toAddress })) continue;
     try {
       n += BigInt(t.amountE8 || 0);
     } catch {
