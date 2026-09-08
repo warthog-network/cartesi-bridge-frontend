@@ -341,6 +341,11 @@ export async function POST({ request }) {
   try {
     const body = await request.json().catch(() => ({}));
     const action = String(body?.action || '').toLowerCase();
+    try {
+      request.__bodyForLog = { action, signerId: body?.signerId, ticketId: body?.ticketId };
+    } catch {
+      /* Request may be frozen; logging then falls back to '?' */
+    }
 
     if (RETIRED_ACTIONS.has(action)) {
       return json(410, {
@@ -1086,6 +1091,35 @@ export async function POST({ request }) {
     const msg = e?.message || String(e);
     const status =
       /Unauthorized|No pool_release|mismatch|disabled/i.test(msg) ? 403 : 400;
+    noteActionError(request, status, msg);
     return json(status, { ok: false, error: msg });
   }
+}
+
+/**
+ * A thrown action used to die in the 4xx body and nowhere else: nginx showed
+ * "400 ×130 per 5 min" and nothing said which action, which signer, or why.
+ * Journal one line per (action, message, signer) per minute.
+ */
+const actionErrSeen = new Map();
+function noteActionError(request, status, msg) {
+  let action = '?';
+  let signer = '?';
+  let ticket = '';
+  try {
+    const b = request?.__bodyForLog || {};
+    action = String(b.action || '?');
+    signer = String(b.signerId || '?').slice(0, 20);
+    ticket = b.ticketId ? ` ticket=${String(b.ticketId).slice(0, 40)}` : '';
+  } catch {
+    /* */
+  }
+  const key = `${action}|${signer}|${msg}`;
+  const now = Date.now();
+  if (now - (actionErrSeen.get(key) || 0) < 60000) return;
+  actionErrSeen.set(key, now);
+  if (actionErrSeen.size > 512) {
+    for (const [k, at] of actionErrSeen) if (now - at > 600000) actionErrSeen.delete(k);
+  }
+  console.warn(`[pool] ${status} action=${action} signer=${signer}${ticket}: ${msg}`);
 }
