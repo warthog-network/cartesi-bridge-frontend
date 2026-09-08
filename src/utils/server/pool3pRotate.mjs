@@ -938,6 +938,9 @@ async function restartSweepIfRefunded(r) {
   const settled = !!st?.mined && Number(st.confirmations || 0) >= SWEEP_MIN_CONF;
   if (!settled || !(await liveQFunded())) return false;
   const stale = String(r.sweepTxHash).slice(0, 12);
+  // Remember it, or the paid-ticket fallback below re-adopts this very sweep
+  // (same next Q) on the next tick and the phase ping-pongs cutover/sweeping.
+  r.restartedSweeps = [...(r.restartedSweeps || []), String(r.sweepTxHash)].slice(-8);
   r.sweepTxHash = null;
   r.sweepTicketId = null;
   r.phase = 'sweeping';
@@ -1031,11 +1034,13 @@ async function maybeOpenOrAdvanceSweep(r, next) {
     return;
   }
 
+  const restarted = new Set((r.restartedSweeps || []).map(String));
   const paid = listPaidPool3pTickets(48).find(
     (p) =>
-      p.ticketId === r.sweepTicketId ||
-      (/^wart-pool-rotate-/.test(String(p.ticketId || '')) &&
-        String(p.toAddress || '').toLowerCase() === String(next.address).toLowerCase()),
+      !restarted.has(String(p.txHash || '')) &&
+      (p.ticketId === r.sweepTicketId ||
+        (/^wart-pool-rotate-/.test(String(p.ticketId || '')) &&
+          String(p.toAddress || '').toLowerCase() === String(next.address).toLowerCase())),
   );
   if (paid?.txHash) {
     r.sweepTxHash = paid.txHash;
