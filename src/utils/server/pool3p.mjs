@@ -1729,6 +1729,7 @@ export function orbitSnapshot() {
         lastSeen: m.lastSeen || null,
         ageMs: Number.isFinite(seen) ? now - seen : null,
         live: live.includes(id),
+        version: m.version || null,
       };
     })
     .sort((a, b) => a.id.localeCompare(b.id));
@@ -1954,11 +1955,24 @@ export function recoverabilityView(packs = packSnapshot()) {
   };
 }
 
-export async function heartbeatPool3p({ signerId, seatEpoch } = {}) {
+/** Journal a member's build once per change — the fleet's version spread is an ops question. */
+const lastVersionById = new Map();
+function noteClientVersion(sid, version) {
+  const v = version ? String(version).slice(0, 40) : null;
+  if (!v) return null;
+  if (lastVersionById.get(sid) !== v) {
+    lastVersionById.set(sid, v);
+    console.warn(`[pool3p] client signer=${sid.slice(0, 20)} version=${v}`);
+  }
+  return v;
+}
+
+export async function heartbeatPool3p({ signerId, seatEpoch, clientVersion } = {}) {
   const sid = String(signerId || '').trim();
   if (sid.length < 16) throw new Error('signerId required');
   await maybeAbandonStaleSeats();
-  await touchOrbit(sid);
+  const version = noteClientVersion(sid, clientVersion);
+  await touchOrbit(sid, version ? { version } : {});
 
   const nowIso = new Date().toISOString();
   // One pass under the lock: reading both roles and writing back separately

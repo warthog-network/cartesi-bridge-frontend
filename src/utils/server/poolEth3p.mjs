@@ -901,10 +901,28 @@ function holderStale(rec, now = nowMs()) {
   return now - seen > SEAT_IDLE_MS;
 }
 
-async function touchOrbit(sid) {
+/** Orbit members with last-seen age and the build each one reported. */
+function ethOrbitMembersView(live = liveOrbitMembers()) {
+  const o = loadOrbit();
+  const now = nowMs();
+  return Object.entries(o.members || {})
+    .map(([id, m]) => {
+      const seen = Date.parse(m.lastSeen || 0);
+      return { id, lastSeen: m.lastSeen || null, ageMs: Number.isFinite(seen) ? now - seen : null, live: live.includes(id), version: m.version || null };
+    })
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+const lastVersionById = new Map();
+async function touchOrbit(sid, version = null) {
   const o = loadOrbit();
   o.members = o.members || {};
-  o.members[sid] = { lastSeen: new Date().toISOString() };
+  const v = version ? String(version).slice(0, 40) : o.members[sid]?.version || null;
+  if (version && lastVersionById.get(sid) !== v) {
+    lastVersionById.set(sid, v);
+    console.warn(`[eth3p] client signer=${sid.slice(0, 20)} version=${v}`);
+  }
+  o.members[sid] = { lastSeen: new Date().toISOString(), ...(v ? { version: v } : {}) };
   const keep = Math.max(ORBIT_LIVE_MS, SEAT_IDLE_MS) * 4;
   const now = nowMs();
   for (const [id, m] of Object.entries(o.members)) {
@@ -1814,13 +1832,13 @@ export async function claimBornEthSeat({ signerId, role, shareHex, pok }) {
   });
 }
 
-export async function heartbeatEth3p({ signerId, seatEpoch, seatFault, nodePubHex, attestation } = {}) {
+export async function heartbeatEth3p({ signerId, seatEpoch, seatFault, nodePubHex, attestation, clientVersion } = {}) {
   const sid = String(signerId || '').trim();
   if (!sid) throw new Error('signerId required');
   return withEthLock(async () => {
     await ensureEth3pDapp();
     await maybeAbandonEthSeats();
-    await touchOrbit(sid);
+    await touchOrbit(sid, clientVersion);
     // Public key so other seats can seal pieces to this node, and its signed
     // presence claim. Stored verbatim and never trusted here.
     if (nodePubHex) {
@@ -1897,6 +1915,7 @@ export async function heartbeatEth3p({ signerId, seatEpoch, seatFault, nodePubHe
         live,
         leaseMs: ORBIT_LIVE_MS,
         seatIdleMs: SEAT_IDLE_MS,
+        members: ethOrbitMembersView(live),
       },
       clientBorn: true,
       address: dapp?.address || null,
@@ -2003,6 +2022,7 @@ export async function publicEth3pStatus() {
     lastPaid: lastPaidEthTicket(),
     signed: lastPaidEthTickets(),
     orbit: {
+      members: ethOrbitMembersView(live),
       liveCount: live.length,
       live,
       leaseMs: ORBIT_LIVE_MS,

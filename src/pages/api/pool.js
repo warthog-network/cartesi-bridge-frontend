@@ -388,6 +388,7 @@ export async function POST({ request }) {
         await heartbeatPool3p({
           signerId: body.signerId,
           seatEpoch: body.seatEpoch ?? body.epoch,
+          clientVersion: body.clientVersion,
         }),
       );
     }
@@ -448,6 +449,7 @@ export async function POST({ request }) {
         seatFault: body.seatFault,
         nodePubHex: body.nodePubHex,
         attestation: body.attestation,
+        clientVersion: body.clientVersion,
       });
       const rotation = await tickEthRotation().catch((e) => ({
         lastError: String(e?.message || e),
@@ -696,6 +698,7 @@ export async function POST({ request }) {
       const hb = await heartbeatPool3p({
         signerId: body.signerId,
         seatEpoch: body.seatEpoch,
+        clientVersion: body.clientVersion,
       });
       // Remember this node's key so other seats can seal pieces to it, and hand
       // back any pieces it should reseal for a tab trying to recover a seat.
