@@ -10,6 +10,7 @@
  */
 
 import { LOCAL_WWART } from './localTokens.js';
+import { isV2 as rollupsIsV2, fetchNoticeEdges as rollupsFetchNoticeEdges } from './rollupsClient.js';
 
 // v3: key includes live wWART so redeploys drop stale capacity cache.
 // Bumped v2→v3 2026-08-23: invalidate pre-ledger-wipe snapshots that survived
@@ -222,16 +223,21 @@ export async function claimsFromGraphQLNotices(graphqlUrl, ownerL1) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000);
   try {
-    const res = await fetch(graphqlUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query }),
-      signal: controller.signal,
-      cache: 'no-store',
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const edges = data?.data?.notices?.edges || [];
+    let edges;
+    if (rollupsIsV2()) {
+      edges = await rollupsFetchNoticeEdges(200, { signal: controller.signal, timeoutMs: 8000 });
+    } else {
+      const res = await fetch(graphqlUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query }),
+        signal: controller.signal,
+        cache: 'no-store',
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      edges = data?.data?.notices?.edges || [];
+    }
 
     let wliq = 0n;
     let wwart = 0n;

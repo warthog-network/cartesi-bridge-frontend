@@ -12,6 +12,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { LOCAL_WWART } from '../localTokens.js';
+import { isV2 as rollupsIsV2, listNoticesAscending } from './rollupsApi.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Same root as cosigner local store: cartesi-bridge-frontend/.data */
@@ -357,6 +358,19 @@ function rowFromEdge(edge) {
 }
 
 async function graphqlNoticesPage({ first, after }) {
+  if (rollupsIsV2()) {
+    // rollups-node 2.x: offsets instead of cursors; `index` is the global
+    // output index, `input.index` the input — noticeKey stays unique.
+    const page = await listNoticesAscending({ first, after });
+    return {
+      totalCount: page.totalCount,
+      pageInfo: page.pageInfo,
+      edges: page.notices.map((n) => ({
+        cursor: String(n.outputIndex),
+        node: { index: n.outputIndex, input: { index: n.inputIndex }, payload: n.payloadHex },
+      })),
+    };
+  }
   const afterPart = after ? `, after: ${JSON.stringify(after)}` : '';
   const query = `{ notices(first: ${first}${afterPart}) {
     totalCount

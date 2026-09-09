@@ -26,6 +26,12 @@ import {
   getNetworkId,
   getWwartToken,
 } from '../utils/bridgeConfig.js';
+import {
+  isV2 as rollupsIsV2,
+  fetchNoticeEdges as rollupsFetchNoticeEdges,
+  inspectRaw,
+  probeV2,
+} from '../utils/rollupsClient.js';
 import { SHARE_TOKEN } from '../utils/tokenNames.js';
 import { LOCAL_WWART } from '../utils/localTokens.js';
 import {
@@ -269,18 +275,23 @@ export default function WalletIsland() {
       .toLowerCase();
     if (bare.length !== 40) return false;
     try {
-      const gql = getRollupGraphqlUrl();
-      const res = await fetch(gql, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          query: `{ notices(last: 200) { edges { node { payload } } } }`,
-        }),
-        cache: 'no-store',
-      });
-      if (!res.ok) return false;
-      const data = await res.json();
-      const edges = data?.data?.notices?.edges || [];
+      let edges;
+      if (rollupsIsV2()) {
+        edges = await rollupsFetchNoticeEdges(200);
+      } else {
+        const gql = getRollupGraphqlUrl();
+        const res = await fetch(gql, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: `{ notices(last: 200) { edges { node { payload } } } }`,
+          }),
+          cache: 'no-store',
+        });
+        if (!res.ok) return false;
+        const data = await res.json();
+        edges = data?.data?.notices?.edges || [];
+      }
       for (const e of edges) {
         const raw = e?.node?.payload;
         if (!raw) continue;
@@ -656,6 +667,11 @@ export default function WalletIsland() {
   useEffect(() => {
     let cancelled = false;
     const probe = async () => {
+      if (rollupsIsV2()) {
+        const online = await probeV2();
+        if (!cancelled) setRollupOnline(online);
+        return;
+      }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5000);
       const zero = '0000000000000000000000000000000000000000';
@@ -1294,8 +1310,9 @@ export default function WalletIsland() {
       const base = getInspectUrl().replace(/\/$/, '');
       let json = null;
       try {
-        const res = await fetch(`${base}/vault/${hex}`, { cache: 'no-store' });
-        const data = await res.json();
+        const data = rollupsIsV2()
+          ? await inspectRaw(`vault/${hex}`, { timeoutMs: 12000 })
+          : await (await fetch(`${base}/vault/${hex}`, { cache: 'no-store' })).json();
         if (data.reports?.length > 0) {
           json = decodeInspectPayload(data.reports[0].payload);
           if (json?.error) json = null;

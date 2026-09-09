@@ -44,6 +44,32 @@ export const L1_RPC_URL =
   (typeof import.meta !== 'undefined' && import.meta.env?.PUBLIC_L1_RPC) ||
   'http://localhost:8545';
 
+/**
+ * Rollups API generation. `v1` = Cartesi CLI 1.5 (GraphQL + GET inspect,
+ * validateNotice/executeVoucher). `v2` = rollups-node 2.x (JSON-RPC cartesi_*,
+ * POST inspect, validateOutput/executeOutput). Mirrors ROLLUPS_API on the server.
+ */
+export const ROLLUPS_API =
+  (typeof import.meta !== 'undefined' && String(import.meta.env?.PUBLIC_ROLLUPS_API || '').toLowerCase()) === 'v2'
+    ? 'v2'
+    : 'v1';
+export const V2_RPC_URL =
+  (typeof import.meta !== 'undefined' && import.meta.env?.PUBLIC_V2_RPC_URL) || '/v2/rpc';
+export const V2_INSPECT_URL =
+  (typeof import.meta !== 'undefined' && import.meta.env?.PUBLIC_V2_INSPECT_URL) || '/v2/inspect';
+/** v2 Application contract (the v1 "dapp"). */
+export const APP_ADDRESS =
+  (typeof import.meta !== 'undefined' && import.meta.env?.PUBLIC_APP_ADDRESS) || '';
+export const APP_NAME =
+  (typeof import.meta !== 'undefined' && import.meta.env?.PUBLIC_APP_NAME) || '';
+export function isRollupsV2() {
+  return ROLLUPS_API === 'v2';
+}
+/** JSON-RPC `application` param: name when configured, else address. */
+export function getAppRef() {
+  return APP_NAME || APP_ADDRESS;
+}
+
 /** Make a path absolute for fetch / GraphQLClient (browser-safe). */
 export function resolveAppUrl(pathOrUrl) {
   if (pathOrUrl == null || pathOrUrl === '') return pathOrUrl;
@@ -60,7 +86,19 @@ export function resolveAppUrl(pathOrUrl) {
   if (s.startsWith('/rollup')) {
     return `http://127.0.0.1:8080${s.replace(/^\/rollup/, '')}`;
   }
+  if (s.startsWith('/v2/')) {
+    return `http://127.0.0.1:8090${s.replace(/^\/v2/, '')}`;
+  }
   return s;
+}
+
+/** Absolute v2 node JSON-RPC endpoint. */
+export function getV2RpcUrl() {
+  return resolveAppUrl(V2_RPC_URL);
+}
+/** Absolute v2 inspect base. */
+export function getV2InspectUrl() {
+  return resolveAppUrl(V2_INSPECT_URL);
 }
 
 /** Absolute GraphQL endpoint for graphql-request. */

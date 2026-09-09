@@ -32,6 +32,11 @@ import {
   getAddresses,
   LOCAL_ADDRESSES,
 } from '../utils/bridgeConfig.js';
+import {
+  isV2 as rollupsIsV2,
+  fetchNoticeEdges as rollupsFetchNoticeEdges,
+  inspectRaw,
+} from '../utils/rollupsClient.js';
 import { normalizeTxLookup } from '../utils/txProof.js';
 import {
   fetchVouchers,
@@ -584,6 +589,7 @@ function noticePayloadKey(rawPayload) {
 }
 
 async function fetchNoticeEdges(last = 50) {
+  if (rollupsIsV2()) return rollupsFetchNoticeEdges(last, { timeoutMs: 10000 });
   const res = await fetchWithTimeout(
     getRollupGraphqlUrl(),
     {
@@ -776,6 +782,19 @@ function poolBn(insp, field) {
 /** Count GraphQL vouchers for this L1 owner (msgSender). */
 async function countOwnerVouchers(owner) {
   const want = String(owner || '').toLowerCase();
+  if (rollupsIsV2()) {
+    try {
+      const list = await fetchVouchers({ last: 40 });
+      let n = 0;
+      for (const v of list) {
+        const s = String(v?.msgSender || '').toLowerCase();
+        if (!want || s === want) n += 1;
+      }
+      return n;
+    } catch {
+      return -1;
+    }
+  }
   try {
     const res = await fetchWithTimeout(
       getRollupGraphqlUrl(),
@@ -806,18 +825,10 @@ async function fetchPoolInspect(owner) {
     ? `pool/${String(owner).replace(/^0x/i, '').toLowerCase()}`
     : 'pool';
   try {
-    const base = getInspectUrl().replace(/\/$/, '');
-    const res = await fetchWithTimeout(
-      `${base}/${want}`,
-      { cache: 'no-store' },
-      8000,
-    );
-    if (res.ok) {
-      const data = await res.json();
-      if (data.reports?.length) {
-        const decoded = decodeInspectPayload(data.reports[0].payload);
-        if (decoded && !decoded.error) return decoded;
-      }
+    const data = await inspectRaw(want, { timeoutMs: 8000 });
+    if (data.reports?.length) {
+      const decoded = decodeInspectPayload(data.reports[0].payload);
+      if (decoded && !decoded.error) return decoded;
     }
   } catch {
     /* nginx /rollup/inspect can 404 on the Node port or lock under load */
@@ -1462,17 +1473,10 @@ export default function FungiblePool({
     }
     // Prefer rollup inspect
     try {
-      const base = getInspectUrl().replace(/\/$/, '');
       const path = owner
         ? `pool/${String(owner).replace(/^0x/i, '').toLowerCase()}`
         : 'pool';
-      const res = await fetchWithTimeout(
-        `${base}/${path}`,
-        { cache: 'no-store' },
-        8000,
-      );
-      if (!res.ok) throw new Error(`inspect ${res.status}`);
-      const data = await res.json();
+      const data = await inspectRaw(path, { timeoutMs: 8000 });
       if (data.reports?.length) {
         const json = decodeInspectPayload(data.reports[0].payload);
         if (json && !json.error) {
