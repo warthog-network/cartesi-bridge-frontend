@@ -1347,7 +1347,7 @@ function seatAllowlist() {
     .map((x) => x.trim())
     .filter(Boolean);
 }
-function seatAllowed(sid) {
+export function seatAllowed(sid) {
   const list = seatAllowlist();
   if (!list.length) return true;
   const id = String(sid || '');

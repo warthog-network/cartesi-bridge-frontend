@@ -30,6 +30,7 @@ import {
   loadHolders,
   recoverabilityView,
   paidRecordFor,
+  seatAllowed,
 } from './pool3p.mjs';
 import { getInspect, invalidateInspect, isReplaying, machineView } from './inspectHub.mjs';
 import { assertPaillierModulus, seatPokContext } from '../twoPartyEcdsa.js';
@@ -1275,6 +1276,12 @@ export async function birthNextSeat({
   if (!sid) throw new Error('signerId required');
   if (sid === ORBIT_VPS_ID || /^pool-3p-signer-[12]$/.test(sid)) {
     throw new Error('VPS must not birth next Q');
+  }
+  if (!seatAllowed(sid)) {
+    // Same policy as claim(): an unlisted node is an orbit voter, never a
+    // dealer. Without this the incoming Q's d1 was birthed (sole copy) by a
+    // node that could never hold or sign it — see 2026-09-09 pool-3p-next.
+    throw new Error('next-Q birth denied — signer is not on the seat allowlist (orbit-only)');
   }
   if (holdersFrozen()) {
     return {
