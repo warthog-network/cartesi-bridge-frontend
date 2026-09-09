@@ -96,6 +96,7 @@ import { assertPayoutMatchesTicket } from '../../utils/server/poolTicketVerify.m
 import { getTicketVerifySnapshot } from '../../utils/server/poolVerifySnapshot.mjs';
 import { notePackReport } from '../../utils/server/packReports.mjs';
 import { getInspect, machineView, isReplaying } from '../../utils/server/inspectHub.mjs';
+import { rollupsInfo } from '../../utils/server/rollupsApi.mjs';
 
 export const prerender = false;
 
@@ -169,6 +170,7 @@ async function threshold3pView(ticketId) {
     ok: true,
     custody: '3p-lindell',
     thresholdMode: false,
+    rollups: rollupsInfo(),
     poolAddress: p3.address || null,
     open,
     openCount: open.length,
@@ -409,6 +411,7 @@ export async function POST({ request }) {
       const wartOrbit = orbitSnapshot();
       return json(200, {
         ...pool3pPublicStatus(),
+        rollups: rollupsInfo(),
         orbit: wartOrbit,
         orbitKeys: wartSealedPreshare.orbitKeys(wartOrbit?.live),
         rotation,
@@ -420,7 +423,7 @@ export async function POST({ request }) {
       if (!eth3pOn()) return json(200, { ok: false, configured: false, error: 'ETH 3P off' });
       const st = await publicEth3pStatus();
       const rotation = await tickEthRotation().catch((e) => ({ lastError: String(e?.message || e) }));
-      return json(200, { ...st, rotation, machine: machineView() });
+      return json(200, { ...st, rollups: rollupsInfo(), rotation, machine: machineView() });
     }
     if (action === 'eth3p_enroll') {
       return json(200, await enrollEth3pSigner({ signerId: body.signerId }));

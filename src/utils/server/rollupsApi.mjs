@@ -98,11 +98,15 @@ function absolutePublic(pathOrUrl, fallbackPath) {
  * (`pool3p_status`, `eth3p_status`, `?verifyTicket=`, `?threshold=`).
  * Absent/`api:'v1'` → today's behaviour in the client.
  */
+export function rollupsInfo() {
+  return publicRollupsBlock();
+}
 export function publicRollupsBlock() {
   if (isV2()) {
     return {
       api: 'v2',
       app: appAddress() || null,
+      appName: env('CARTESI_APP_NAME') || null,
       rpcUrl: absolutePublic(env('PUBLIC_V2_RPC_URL'), '/v2/rpc'),
       inspectUrl: absolutePublic(env('PUBLIC_V2_INSPECT_URL'), '/v2/inspect'),
       l1RpcUrl: absolutePublic(env('PUBLIC_L1_RPC'), '/rpc'),
