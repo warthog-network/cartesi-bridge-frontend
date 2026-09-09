@@ -23,11 +23,11 @@ function env(key, fallback = '') {
 
 const INSPECT = env('CARTESI_INSPECT_URL', 'http://127.0.0.1:8080/inspect').replace(/\/$/, '');
 const GRAPHQL = env('CARTESI_GRAPHQL_URL', 'http://127.0.0.1:8080/graphql');
-const TTL_MS = Number(env('INSPECT_HUB_TTL_MS', '10000')) || 10000;
-const OWNER_TTL_MS = Number(env('INSPECT_HUB_OWNER_TTL_MS', '30000')) || 30000;
-const REPLAY_TTL_MS = Number(env('INSPECT_HUB_REPLAY_TTL_MS', '30000')) || 30000;
+const TTL_MS = Number(env('INSPECT_HUB_TTL_MS', '20000')) || 20000;
+const OWNER_TTL_MS = Number(env('INSPECT_HUB_OWNER_TTL_MS', '60000')) || 60000;
+const REPLAY_TTL_MS = Number(env('INSPECT_HUB_REPLAY_TTL_MS', '60000')) || 60000;
 const STALE_MS = Number(env('INSPECT_HUB_STALE_MS', '600000')) || 600000;
-const TOTAL_TTL_MS = Number(env('INSPECT_HUB_TOTAL_TTL_MS', '30000')) || 30000;
+const TOTAL_TTL_MS = Number(env('INSPECT_HUB_TOTAL_TTL_MS', '60000')) || 60000;
 const REPLAY_LAG_INPUTS = Number(env('INSPECT_HUB_REPLAY_LAG', '3')) || 3;
 const REQ_MS = Number(env('INSPECT_HUB_REQ_MS', '12000')) || 12000;
 
