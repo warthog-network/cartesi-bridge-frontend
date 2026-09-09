@@ -54,7 +54,7 @@ function envOn(key, fallback = true) {
   return v !== '0' && v !== 'false' && v !== 'off' && v !== 'no';
 }
 
-const DEFAULT_DATA = '/opt/cartesi-bridge/cartesi-bridge-frontend/.data';
+const DEFAULT_DATA = (globalThis.process?.env?.CARTESI_BRIDGE_DATA || '/opt/cartesi-bridge/cartesi-bridge-frontend/.data');
 const ROTATE_PATH = env('POOL_3P_ROTATE') || path.join(DEFAULT_DATA, 'pool-3p-rotate.json');
 export const NEXT_DAPP_PATH =
   env('POOL_3P_NEXT_DAPP') || path.join(DEFAULT_DATA, 'pool-3p-next.json');

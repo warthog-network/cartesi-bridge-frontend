@@ -921,7 +921,7 @@ export async function POST({ request }) {
         try {
           const { writeFileSync, appendFileSync } = await import('node:fs');
           appendFileSync(
-            '/opt/cartesi-bridge/cartesi-bridge-frontend/.data/pool-submit-err.log',
+            ((globalThis.process?.env?.CARTESI_BRIDGE_DATA || '/opt/cartesi-bridge/cartesi-bridge-frontend/.data') + '/pool-submit-err.log'),
             `${new Date().toISOString()} ${body.ticketId} ${msg}\n`,
           );
         } catch {

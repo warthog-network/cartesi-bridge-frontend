@@ -13,7 +13,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 
-const DEFAULT_DATA = '/opt/cartesi-bridge/cartesi-bridge-frontend/.data';
+const DEFAULT_DATA = (globalThis.process?.env?.CARTESI_BRIDGE_DATA || '/opt/cartesi-bridge/cartesi-bridge-frontend/.data');
 
 function env(key, fallback = '') {
   const e = globalThis.process?.env || {};

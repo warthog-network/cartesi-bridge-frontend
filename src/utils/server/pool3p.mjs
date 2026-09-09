@@ -98,7 +98,7 @@ function env(key, fallback = '') {
   return v == null || v === '' ? fallback : String(v);
 }
 
-const DEFAULT_DATA = '/opt/cartesi-bridge/cartesi-bridge-frontend/.data';
+const DEFAULT_DATA = (globalThis.process?.env?.CARTESI_BRIDGE_DATA || '/opt/cartesi-bridge/cartesi-bridge-frontend/.data');
 export const DAPP_PATH =
   env('POOL_3P_DAPP') || path.join(DEFAULT_DATA, 'pool-3p-dapp.json');
 export const SESS_PATH =
