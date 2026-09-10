@@ -10,7 +10,7 @@ import crypto from 'crypto';
 
 const QUEUE_PATH =
   process.env.POOL_CREDIT_QUEUE_PATH ||
-  '/opt/cartesi-bridge/cartesi-bridge-frontend/.data/pool-credit-queue.json';
+  ((globalThis.process?.env?.CARTESI_BRIDGE_DATA || '/opt/cartesi-bridge/cartesi-bridge-frontend/.data') + '/pool-credit-queue.json');
 
 const EMPTY = {
   version: 1,

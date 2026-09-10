@@ -1,26 +1,16 @@
 /**
- * Verify a pool_release_ticket against Cartesi GraphQL notices before hot payout.
+ * Verify a pool_release_ticket against the rollup's notices before payout.
  * Prevents unauthenticated callers from inventing ticketId/amount/to.
+ *
+ * All rollup reads go through rollupsApi.mjs (Cartesi 1.5 GraphQL or
+ * rollups-node 2.x JSON-RPC, per ROLLUPS_API). The v1 queries are the ones
+ * that used to live here, byte for byte.
  */
-const GRAPHQL =
-  globalThis.process?.env?.CARTESI_GRAPHQL_URL || 'http://127.0.0.1:8080/graphql';
-
-function decodePayload(raw) {
-  if (raw == null) return null;
-  let text = raw;
-  if (String(raw).startsWith('0x')) {
-    try {
-      text = Buffer.from(String(raw).slice(2), 'hex').toString('utf8');
-    } catch {
-      return null;
-    }
-  }
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
+import {
+  findReleaseTicketNotice as apiFindReleaseTicketNotice,
+  validateNoticeOnL1,
+  isV2,
+} from './rollupsApi.mjs';
 
 function normAddr(a) {
   return String(a || '')
@@ -28,76 +18,13 @@ function normAddr(a) {
     .toLowerCase();
 }
 
-function noticeHasEpochProof(proof) {
-  const v = proof?.validity;
-  return !!(
-    v?.noticesEpochRootHash &&
-    Array.isArray(v?.outputHashInOutputHashesSiblings) &&
-    v.outputHashInOutputHashesSiblings.length > 0 &&
-    Array.isArray(v?.outputHashesInEpochSiblings) &&
-    v.outputHashesInEpochSiblings.length > 0
-  );
-}
-
-function rankReleaseNotice(obj) {
-  const typ = String(obj?.type || '');
-  if (typ === 'pool_release_authorized' || obj?.status === 'authorized') return 2;
-  if (typ === 'pool_release_ticket') return 1;
-  if (typ === 'pool_release_pending') return 0;
-  return -1;
-}
-
 /**
- * Walk GraphQL notices newest-first. Header floods make a single last:N miss
+ * Walk notices newest-first. Header floods make a single last:N miss
  * older burns; ticket 8 is recent but later tickets will not be.
- * @returns {Promise<object|null>} ticket notice fields
+ * @returns {Promise<object|null>} ticket notice fields (+ _index/_inputIndex/_payloadHex/_proof/_hasProof)
  */
 export async function findReleaseTicketNotice(ticketId, { pages = 20 } = {}) {
-  const id = String(ticketId || '').trim();
-  if (!id) return null;
-
-  let cursor = null;
-  let best = null;
-  for (let page = 0; page < Math.min(30, Number(pages) || 20); page++) {
-    const after = cursor ? `, before: ${JSON.stringify(cursor)}` : '';
-    const res = await fetch(GRAPHQL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        query: `{ notices(last: 100${after}) { pageInfo { hasPreviousPage startCursor } edges { node { index payload input { index } proof { context validity { inputIndexWithinEpoch outputIndexWithinInput outputHashesRootHash vouchersEpochRootHash noticesEpochRootHash machineStateHash outputHashInOutputHashesSiblings outputHashesInEpochSiblings } } } } } }`,
-      }),
-    });
-    if (!res.ok) {
-      throw new Error(`GraphQL notices HTTP ${res.status}`);
-    }
-    const json = await res.json();
-    const conn = json?.data?.notices || {};
-    for (const e of conn.edges || []) {
-      const obj = decodePayload(e?.node?.payload);
-      if (!obj) continue;
-      if (rankReleaseNotice(obj) < 0) continue;
-      if (String(obj.ticketId || '') !== id) continue;
-      const idx = Number(e?.node?.index ?? 0);
-      const proof = e?.node?.proof || null;
-      const hasProof = noticeHasEpochProof(proof);
-      const rank = rankReleaseNotice(obj);
-      const bestRank = best ? rankReleaseNotice(best) : -1;
-      if (!best || rank > bestRank || (rank === bestRank && idx >= best._index)) {
-        best = {
-          ...obj,
-          _index: idx,
-          _inputIndex: e?.node?.input?.index ?? null,
-          _payloadHex: e?.node?.payload || null,
-          _proof: proof,
-          _hasProof: hasProof,
-        };
-      }
-    }
-    if (best) return best;
-    if (!conn.pageInfo?.hasPreviousPage || !conn.pageInfo?.startCursor) break;
-    cursor = conn.pageInfo.startCursor;
-  }
-  return best;
+  return apiFindReleaseTicketNotice(ticketId, { pages });
 }
 
 /**
@@ -166,17 +93,6 @@ export async function assertPayoutMatchesTicket(args) {
   };
 }
 
-const L1_RPC =
-  process.env.CARTESI_RPC_URL ||
-  process.env.PUBLIC_L1_RPC ||
-  'http://127.0.0.1:8545';
-const DAPP =
-  process.env.CARTESI_DAPP || '0xab7528bb862fB57E8A2BCd567a2e929a0Be56a5e';
-
-const VALIDATE_NOTICE_ABI = [
-  'function validateNotice(bytes notice, tuple(tuple(uint64 inputIndexWithinEpoch, uint64 outputIndexWithinInput, bytes32 outputHashesRootHash, bytes32 vouchersEpochRootHash, bytes32 noticesEpochRootHash, bytes32 machineStateHash, bytes32[] outputHashInOutputHashesSiblings, bytes32[] outputHashesInEpochSiblings) validity, bytes context) proof) view returns (bool)',
-];
-
 export function ticketNeedsNoticeProof(ticketId) {
   const id = String(ticketId || '');
   if (!id) return false;
@@ -187,9 +103,10 @@ export function ticketNeedsNoticeProof(ticketId) {
 
 /**
  * Burn attestation for a release ticket.
- * Require the GraphQL pool_release_ticket (+ epoch siblings when present).
- * L1 Application.validateNotice is best-effort: GraphQL can show the proof
- * before History claims the epoch, and that must not stall d1/d2.
+ * Require the rollup's pool_release_ticket notice (+ proof when present).
+ * L1 validation is best-effort: on 1.5 GraphQL can show the proof before
+ * History claims the epoch, and that must not stall d1/d2. On v2 a proof
+ * only appears once the epoch claim is accepted.
  */
 export async function assertReleaseNoticeProof(ticketId, extra = {}) {
   const id = String(ticketId || '').trim();
@@ -218,54 +135,26 @@ export async function assertReleaseNoticeProof(ticketId, extra = {}) {
       throw new Error('toAddress mismatch vs release notice');
     }
   }
-  if (!notice._hasProof || !notice._proof?.validity || !notice._payloadHex) {
-    // GraphQL notice is the burn attestation. Epoch siblings must not stall
-    // d1/d2 — rooms were expire-idle while signers skipped on this wait.
-    return {
-      ok: true,
-      ticketId: id,
-      noticeIndex: notice._index,
-      inputIndex: notice._inputIndex,
-      amountE8: String(notice.amountE8),
-      toAddress: notice.toAddress,
-      proofSource: 'notice-without-epoch-siblings',
-    };
-  }
-  let l1 = null;
-  try {
-    const { JsonRpcProvider, Contract } = await import('ethers-v6');
-    const provider = new JsonRpcProvider(L1_RPC);
-    const app = new Contract(DAPP, VALIDATE_NOTICE_ABI, provider);
-    const v = notice._proof.validity;
-    const proof = {
-      validity: {
-        inputIndexWithinEpoch: BigInt(v.inputIndexWithinEpoch),
-        outputIndexWithinInput: BigInt(v.outputIndexWithinInput),
-        outputHashesRootHash: v.outputHashesRootHash,
-        vouchersEpochRootHash: v.vouchersEpochRootHash,
-        noticesEpochRootHash: v.noticesEpochRootHash,
-        machineStateHash: v.machineStateHash,
-        outputHashInOutputHashesSiblings: v.outputHashInOutputHashesSiblings,
-        outputHashesInEpochSiblings: v.outputHashesInEpochSiblings,
-      },
-      context: String(notice._proof.context || '').startsWith('0x')
-        ? notice._proof.context
-        : `0x${notice._proof.context || ''}`,
-    };
-    const ok = await app.validateNotice(notice._payloadHex, proof);
-    l1 = { ok: !!ok };
-    if (!ok) l1.error = 'validateNotice returned false';
-  } catch (e) {
-    l1 = { ok: false, error: e.shortMessage || e.message };
-  }
-  return {
+  const base = {
     ok: true,
     ticketId: id,
     noticeIndex: notice._index,
     inputIndex: notice._inputIndex,
+    epochIndex: notice._epochIndex ?? null,
     amountE8: String(notice.amountE8),
     toAddress: notice.toAddress,
-    proofSource: l1?.ok ? 'l1-validateNotice' : 'graphql-epoch-proof',
+  };
+  if (!notice._hasProof || !notice._proof || !notice._payloadHex) {
+    // The rollup notice is the burn attestation. Epoch siblings must not stall
+    // d1/d2 — rooms were expire-idle while signers skipped on this wait.
+    return { ...base, proofSource: 'notice-without-epoch-siblings' };
+  }
+  const l1 = await validateNoticeOnL1(notice);
+  return {
+    ...base,
+    proofSource: l1?.ok
+      ? isV2() ? 'l1-validateOutput' : 'l1-validateNotice'
+      : isV2() ? 'node-output-proof' : 'graphql-epoch-proof',
     l1,
   };
 }

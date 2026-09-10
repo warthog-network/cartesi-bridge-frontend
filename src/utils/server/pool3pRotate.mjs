@@ -33,6 +33,7 @@ import {
   seatAllowed,
 } from './pool3p.mjs';
 import { getInspect, invalidateInspect, isReplaying, machineView } from './inspectHub.mjs';
+import { isV2 as rollupsIsV2, addInput as rollupsAddInput } from './rollupsApi.mjs';
 import { assertPaillierModulus, seatPokContext } from '../twoPartyEcdsa.js';
 import { writeJsonAtomic } from './jsonStore.mjs';
 import {
@@ -53,7 +54,7 @@ function envOn(key, fallback = true) {
   return v !== '0' && v !== 'false' && v !== 'off' && v !== 'no';
 }
 
-const DEFAULT_DATA = '/opt/cartesi-bridge/cartesi-bridge-frontend/.data';
+const DEFAULT_DATA = (globalThis.process?.env?.CARTESI_BRIDGE_DATA || '/opt/cartesi-bridge/cartesi-bridge-frontend/.data');
 const ROTATE_PATH = env('POOL_3P_ROTATE') || path.join(DEFAULT_DATA, 'pool-3p-rotate.json');
 export const NEXT_DAPP_PATH =
   env('POOL_3P_NEXT_DAPP') || path.join(DEFAULT_DATA, 'pool-3p-next.json');
@@ -1518,6 +1519,12 @@ async function postProvenPoolAccountId({ txHash, poolAddress, destAccountId }) {
 }
 
 export async function submitPoolAdvance(input) {
+  if (rollupsIsV2()) {
+    // rollups-node 2.x: same InputBox.addInput(app, payload), v2 InputBox +
+    // Application addresses from env (CARTESI_INPUT_BOX_ADDRESS / CARTESI_APP_ADDRESS).
+    const r = await rollupsAddInput(JSON.stringify(input));
+    return { ok: true, txHash: r.txHash, type: input.type };
+  }
   const { ethers } = await import('ethers-v6');
   const pk =
     env('RELAYER_PK') ||

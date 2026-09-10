@@ -11,7 +11,7 @@ import { readFileSync, existsSync, statSync } from 'node:fs';
 
 const TOKEN_FILE =
   process.env.POOL_OPS_TOKEN_FILE ||
-  '/opt/cartesi-bridge/cartesi-bridge-frontend/.data/pool-ops.token';
+  ((globalThis.process?.env?.CARTESI_BRIDGE_DATA || '/opt/cartesi-bridge/cartesi-bridge-frontend/.data') + '/pool-ops.token');
 
 let cachedFileToken = null;
 let cachedFileMtime = 0;

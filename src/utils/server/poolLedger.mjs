@@ -16,7 +16,7 @@ export const POOL_ADDRESS =
 
 const DEFAULT_PATH =
   process.env.FUNGIBLE_POOL_LEDGER ||
-  '/opt/cartesi-bridge/cartesi-bridge-frontend/.data/fungible-pool.json';
+  ((globalThis.process?.env?.CARTESI_BRIDGE_DATA || '/opt/cartesi-bridge/cartesi-bridge-frontend/.data') + '/fungible-pool.json');
 
 const E8 = 10n ** 8n;
 const E18 = 10n ** 18n;

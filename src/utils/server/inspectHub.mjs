@@ -15,6 +15,7 @@
  * of acting on a ledger that is hours behind.
  */
 import nodeProcess from 'node:process';
+import { isV2, inspectFetch, inputTotal as apiInputTotal } from './rollupsApi.mjs';
 
 function env(key, fallback = '') {
   const v = nodeProcess.env[key];
@@ -64,6 +65,14 @@ async function fetchWithTimeout(url, init = {}) {
 }
 
 async function readInspect(path) {
+  if (isV2()) {
+    // rollups-node 2.x: POST /inspect/{app} with the payload path as body. No
+    // server-manager lock on that side, but the TTLs stay — the machine fork
+    // per inspect is still the most expensive call the node serves.
+    const raw = await inspectFetch(path.replace(/^\//, ''), { timeoutMs: REQ_MS });
+    const decoded = decodeInspectPayload(raw?.reports?.[0]?.payload);
+    return { raw, decoded, processed: Number(raw?.processed_input_count ?? NaN) };
+  }
   const attempt = async (base) => {
     const res = await fetchWithTimeout(`${base}${path}`);
     if (!res.ok) throw new Error(`inspect HTTP ${res.status}`);
@@ -106,13 +115,18 @@ async function refreshTotal() {
   if (total.inflight) return total.inflight;
   total.inflight = (async () => {
     try {
-      const res = await fetchWithTimeout(GRAPHQL, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ query: '{ inputs { totalCount } }' }),
-      });
-      const j = await res.json();
-      const n = Number(j?.data?.inputs?.totalCount);
+      let n;
+      if (isV2()) {
+        n = Number(await apiInputTotal());
+      } else {
+        const res = await fetchWithTimeout(GRAPHQL, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ query: '{ inputs { totalCount } }' }),
+        });
+        const j = await res.json();
+        n = Number(j?.data?.inputs?.totalCount);
+      }
       if (Number.isFinite(n)) total = { at: Date.now(), value: n, inflight: null };
       return total.value;
     } catch {

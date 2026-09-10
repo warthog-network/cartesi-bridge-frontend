@@ -1,13 +1,34 @@
 /**
- * Fetch Cartesi rollup vouchers and execute them on L1 (Application.executeVoucher).
+ * Fetch Cartesi rollup vouchers and execute them on L1.
+ *   v1 (Cartesi 1.5): GraphQL `vouchers`, Application.executeVoucher / wasVoucherExecuted,
+ *                     History.getClaim for "is the epoch claimed".
+ *   v2 (rollups-node 2.x): JSON-RPC cartesi_listOutputs (Voucher selector),
+ *                     Application.executeOutput(raw_data, (outputIndex, siblings)) /
+ *                     wasOutputExecuted(outputIndex); a proof exists only once the
+ *                     epoch claim is accepted.
+ * Same row shape for callers on both: { inputIndex, voucherIndex, destination, payload,
+ * msgSender, timestamp, proof, hasProof, decoded, token, summary } (+ outputIndex,
+ * epochIndex, rawData, value, executed on v2).
  */
 import { Interface, getAddress, formatUnits } from 'ethers-v6';
-import { getRollupGraphqlUrl, getAddresses, LOCAL_ADDRESSES } from './bridgeConfig.js';
+import {
+  getRollupGraphqlUrl,
+  getAddresses,
+  LOCAL_ADDRESSES,
+  isRollupsV2,
+  APP_ADDRESS,
+} from './bridgeConfig.js';
 import { LOCAL_WWART } from './localTokens.js';
+import { listOutputsV2, inputSenderV2, getEpochV2, VOUCHER_SELECTOR } from './rollupsClient.js';
 
 const APP_ABI = [
   'function executeVoucher(address _destination, bytes _payload, tuple(tuple(uint64 inputIndexWithinEpoch, uint64 outputIndexWithinInput, bytes32 outputHashesRootHash, bytes32 vouchersEpochRootHash, bytes32 noticesEpochRootHash, bytes32 machineStateHash, bytes32[] outputHashInOutputHashesSiblings, bytes32[] outputHashesInEpochSiblings) validity, bytes context) _proof) returns (bool)',
   'function wasVoucherExecuted(uint256 _inputIndex, uint256 _outputIndexWithinInput) view returns (bool)',
+];
+const APP_V2_ABI = [
+  'function executeOutput(bytes output, (uint64 outputIndex, bytes32[] outputHashesSiblings) proof)',
+  'function validateOutput(bytes output, (uint64 outputIndex, bytes32[] outputHashesSiblings) proof) view',
+  'function wasOutputExecuted(uint256 outputIndex) view returns (bool)',
 ];
 
 const TRANSFER_SEL = '0xa9059cbb';
@@ -16,6 +37,7 @@ const MINT_SEL = '0x40c10f19';
 const WITHDRAW_ETHER_SEL = '0x522f6815'; // withdrawEther(address,uint256) used by some stacks
 
 export function getDappAddress() {
+  if (isRollupsV2() && APP_ADDRESS) return APP_ADDRESS;
   const a = getAddresses() || LOCAL_ADDRESSES;
   return a.dapp || LOCAL_ADDRESSES.dapp;
 }
@@ -64,10 +86,69 @@ export function tokenLabel(destination) {
   return null;
 }
 
+function rowSummary(token, dest, decoded) {
+  return [
+    token || shortAddr(dest),
+    decoded.label,
+    decoded.amountHuman != null ? `${decoded.amountHuman}` : null,
+    decoded.to ? `→ ${shortAddr(decoded.to)}` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+/** v2: rows from cartesi_listOutputs, senders filled from the inputs (cached). */
+async function fetchVouchersV2(opts = {}) {
+  const last = opts.last ?? 40;
+  const { rows } = await listOutputsV2({ outputType: VOUCHER_SELECTOR, limit: last, descending: true, signal: opts.signal });
+  const uniqueInputs = [...new Set(rows.map((r) => r.inputIndex).filter((x) => x != null))];
+  const senders = new Map();
+  // a handful of inputs per page; bounded concurrency keeps the node quiet
+  const queue = uniqueInputs.slice();
+  const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
+    while (queue.length) {
+      const idx = queue.shift();
+      const s = await inputSenderV2(idx, { signal: opts.signal });
+      if (s) senders.set(idx, s);
+    }
+  });
+  await Promise.all(workers);
+  return rows
+    .map((r) => {
+      const decoded = decodeVoucherPayload(r.payloadHex);
+      const token = tokenLabel(r.destination);
+      const s = senders.get(r.inputIndex) || {};
+      return {
+        inputIndex: Number(r.inputIndex),
+        voucherIndex: Number(r.outputIndex),
+        outputIndex: Number(r.outputIndex),
+        epochIndex: r.epochIndex,
+        destination: r.destination,
+        value: r.value,
+        payload: r.payloadHex,
+        rawData: r.rawData,
+        msgSender: s.sender || null,
+        timestamp: s.timestamp ?? null,
+        proof: r.proof,
+        hasProof: r.hasProof,
+        executed: r.executed,
+        txHash: r.txHash,
+        decoded,
+        token,
+        summary: rowSummary(token, r.destination, decoded),
+      };
+    })
+    .sort((a, b) => {
+      if (b.inputIndex !== a.inputIndex) return b.inputIndex - a.inputIndex;
+      return b.voucherIndex - a.voucherIndex;
+    });
+}
+
 /**
  * @param {{ last?: number, signal?: AbortSignal }} [opts]
  */
 export async function fetchVouchers(opts = {}) {
+  if (isRollupsV2()) return fetchVouchersV2(opts);
   const last = opts.last ?? 40;
   const graphql = getRollupGraphqlUrl();
   const query = `{
@@ -138,14 +219,7 @@ export async function fetchVouchers(opts = {}) {
         hasProof,
         decoded,
         token,
-        summary: [
-          token || shortAddr(dest),
-          decoded.label,
-          decoded.amountHuman != null ? `${decoded.amountHuman}` : null,
-          decoded.to ? `→ ${shortAddr(decoded.to)}` : null,
-        ]
-          .filter(Boolean)
-          .join(' · '),
+        summary: rowSummary(token, dest, decoded),
       };
     })
     // newest first
@@ -173,11 +247,25 @@ function toBytes32Array(arr) {
   return (arr || []).map(toBytes32);
 }
 
+function isV2Voucher(voucher) {
+  return !!(voucher?.rawData || (voucher?.proof && 'outputHashesSiblings' in voucher.proof));
+}
+
 /**
- * Build ethers Proof tuple for executeVoucher.
+ * Build ethers Proof tuple for executeVoucher (v1) / executeOutput (v2).
  */
 export function proofToEthers(proof) {
-  if (!proof?.validity) throw new Error('Voucher has no proof yet (wait for epoch)');
+  if (!proof) throw new Error('Voucher has no proof yet (wait for epoch)');
+  if ('outputHashesSiblings' in proof) {
+    if (!Array.isArray(proof.outputHashesSiblings) || !proof.outputHashesSiblings.length) {
+      throw new Error('Voucher has no proof yet (wait for epoch claim)');
+    }
+    return {
+      outputIndex: BigInt(proof.outputIndex ?? 0),
+      outputHashesSiblings: toBytes32Array(proof.outputHashesSiblings),
+    };
+  }
+  if (!proof.validity) throw new Error('Voucher has no proof yet (wait for epoch)');
   const v = proof.validity;
   return {
     validity: {
@@ -200,8 +288,23 @@ export function proofToEthers(proof) {
  */
 let _historyAddr = null;
 
-/** History.getClaim — GraphQL can show a proof before Authority submits the epoch. */
+/**
+ * v1: History.getClaim — GraphQL can show a proof before Authority submits the epoch.
+ * v2: a proof only exists after the claim is accepted; confirm with the epoch status
+ *     when the node answers, else trust the proof.
+ */
 export async function isVoucherClaimedOnL1(signerOrProvider, voucher) {
+  if (isRollupsV2() || isV2Voucher(voucher)) {
+    if (!voucher?.hasProof) return false;
+    if (voucher.epochIndex == null) return true;
+    try {
+      const ep = await getEpochV2(voucher.epochIndex);
+      const st = String(ep?.status || '');
+      return st ? st === 'CLAIM_ACCEPTED' : true;
+    } catch {
+      return true;
+    }
+  }
   const ctx = voucher?.proof?.context;
   if (!ctx) return false;
   const dapp = getDappAddress();
@@ -237,6 +340,10 @@ export async function isVoucherClaimedOnL1(signerOrProvider, voucher) {
 export async function wasVoucherExecuted(signerOrProvider, voucher) {
   const dapp = getDappAddress();
   const { Contract } = await import('ethers-v6');
+  if (isRollupsV2() || isV2Voucher(voucher)) {
+    const app = new Contract(dapp, APP_V2_ABI, signerOrProvider);
+    return app.wasOutputExecuted(BigInt(voucher.outputIndex ?? voucher.voucherIndex));
+  }
   const app = new Contract(dapp, APP_ABI, signerOrProvider);
   const outIdx =
     voucher.proof?.validity?.outputIndexWithinInput != null
@@ -266,10 +373,10 @@ export function formatVoucherExecuteError(e) {
       'Hard-refresh, stay on Anvil 31337, then Execute the newest ready row — do not re-deposit.'
     );
   }
-  if (/Already executed/i.test(s)) {
+  if (/Already executed|OutputAlreadyExecuted/i.test(s)) {
     return 'That voucher was already executed — check MetaMask wWART balance';
   }
-  if (/L1_CLAIM_PENDING|InvalidClaimIndex/i.test(s)) {
+  if (/L1_CLAIM_PENDING|InvalidClaimIndex|InvalidOutputHashesSiblingsArrayLength|ClaimNotAccepted/i.test(s)) {
     return (
       'L1 has not claimed this epoch yet (GraphQL shows the proof early). ' +
       'Wait, hit Refresh, then Execute the 1 wWART row — do not re-deposit.'
@@ -301,6 +408,79 @@ export function formatVoucherExecuteError(e) {
 }
 
 /**
+ * v2: Application.executeOutput(raw_data, proof). Same gas discipline as v1.
+ */
+async function executeOutputOnL1(signer, voucher) {
+  if (!voucher?.hasProof) throw new Error('Proof not ready — wait for the epoch claim, then refresh');
+  if (!voucher?.rawData) throw new Error('Voucher has no raw output data');
+  const claimed = await isVoucherClaimedOnL1(signer, voucher);
+  if (!claimed) {
+    throw new Error('L1_CLAIM_PENDING: the epoch claim for this output is not accepted yet');
+  }
+  const dapp = getDappAddress();
+  if (!dapp || /^0x0{40}$/i.test(dapp)) {
+    throw new Error('Application address not configured — cannot execute output');
+  }
+  const { Contract } = await import('ethers-v6');
+  const app = new Contract(dapp, APP_V2_ABI, signer);
+  const outIdx = BigInt(voucher.outputIndex ?? voucher.voucherIndex);
+  try {
+    const done = await app.wasOutputExecuted(outIdx);
+    if (done) throw new Error('Already executed on L1');
+  } catch (e) {
+    if (String(e.message || e).includes('Already executed')) throw e;
+  }
+  const proof = proofToEthers(voucher.proof);
+  const args = [voucher.rawData, proof];
+  try {
+    await app.executeOutput.staticCall(...args);
+  } catch (e) {
+    try {
+      const done = await app.wasOutputExecuted(outIdx);
+      if (done) throw new Error('Already executed on L1');
+    } catch (e2) {
+      if (String(e2.message || e2).includes('Already executed')) throw e2;
+    }
+    const err = new Error(formatVoucherExecuteError(e));
+    err.cause = e;
+    throw err;
+  }
+  const gasOverrides = {
+    gasLimit: 1_500_000n,
+    type: 0,
+    gasPrice: 1_000_000_007n,
+  };
+  try {
+    const est = await app.executeOutput.estimateGas(...args);
+    if (est && est > 0n) {
+      const buffered = (est * 130n) / 100n;
+      gasOverrides.gasLimit = buffered > 3_000_000n ? 3_000_000n : buffered < 300_000n ? 500_000n : buffered;
+    }
+  } catch {
+    /* keep fixed 1.5M — intentional */
+  }
+  try {
+    const tx = await app.executeOutput(...args, gasOverrides);
+    const receipt = await tx.wait();
+    if (receipt && receipt.status === 0) {
+      throw new Error('executeOutput mined but reverted — try newest voucher only');
+    }
+    return { hash: tx.hash, receipt };
+  } catch (e) {
+    if (/Already executed/i.test(String(e?.message || ''))) throw e;
+    try {
+      const done = await app.wasOutputExecuted(outIdx);
+      if (done) throw new Error('Already executed on L1');
+    } catch (e2) {
+      if (String(e2.message || e2).includes('Already executed')) throw e2;
+    }
+    const err = new Error(formatVoucherExecuteError(e));
+    err.cause = e;
+    throw err;
+  }
+}
+
+/**
  * Execute a voucher on L1 via connected MetaMask signer.
  *
  * MetaMask often fails `estimateGas` on large Cartesi proofs with
@@ -310,6 +490,7 @@ export function formatVoucherExecuteError(e) {
  * @returns {Promise<{ hash: string, receipt: any }>}
  */
 export async function executeVoucherOnL1(signer, voucher) {
+  if (isRollupsV2() || isV2Voucher(voucher)) return executeOutputOnL1(signer, voucher);
   if (!voucher?.hasProof) throw new Error('Proof not ready — wait a few blocks/epochs, then refresh');
   const claimed = await isVoucherClaimedOnL1(signer, voucher);
   if (!claimed) {
@@ -400,4 +581,4 @@ export async function executeVoucherOnL1(signer, voucher) {
   }
 }
 
-export { APP_ABI };
+export { APP_ABI, APP_V2_ABI };

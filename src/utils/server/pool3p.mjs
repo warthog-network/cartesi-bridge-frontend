@@ -98,7 +98,7 @@ function env(key, fallback = '') {
   return v == null || v === '' ? fallback : String(v);
 }
 
-const DEFAULT_DATA = '/opt/cartesi-bridge/cartesi-bridge-frontend/.data';
+const DEFAULT_DATA = (globalThis.process?.env?.CARTESI_BRIDGE_DATA || '/opt/cartesi-bridge/cartesi-bridge-frontend/.data');
 export const DAPP_PATH =
   env('POOL_3P_DAPP') || path.join(DEFAULT_DATA, 'pool-3p-dapp.json');
 export const SESS_PATH =
@@ -2737,9 +2737,11 @@ export async function pool3pOfferR1({
     throw new Error('R1Hex + hashHex required');
   }
   const id = String(ticketId);
+  let noticeInputIndex = null;
   if (ticketNeedsNoticeProof(id)) {
     try {
-      await assertReleaseNoticeProof(id, { amountE8, toAddress });
+      const np = await assertReleaseNoticeProof(id, { amountE8, toAddress });
+      if (np?.inputIndex != null) noticeInputIndex = Number(np.inputIndex);
     } catch (e) {
       logShareEvent('r1 refused', { ticketId: id, signerId: sid, reason: e.message });
       return {
@@ -2781,6 +2783,7 @@ export async function pool3pOfferR1({
         r1SignerId: sid,
         haveR1: true,
         noticeProofOk: ticketNeedsNoticeProof(id) ? true : prev.noticeProofOk,
+        noticeInputIndex: noticeInputIndex ?? prev.noticeInputIndex ?? null,
         status: prev.haveD2 ? 'ready' : 'wait_d2',
         updatedAt: Date.now(),
         room: true,
@@ -2931,9 +2934,11 @@ export async function pool3pOfferD2({
     };
   }
   const ticketIdNorm = String(ticketId);
+  let noticeInputIndex = null;
   if (ticketNeedsNoticeProof(ticketIdNorm)) {
     try {
-      await assertReleaseNoticeProof(ticketIdNorm, { amountE8, toAddress });
+      const np = await assertReleaseNoticeProof(ticketIdNorm, { amountE8, toAddress });
+      if (np?.inputIndex != null) noticeInputIndex = Number(np.inputIndex);
     } catch (e) {
       logShareEvent('d2 refused', {
         ticketId: ticketIdNorm,
@@ -3016,6 +3021,7 @@ export async function pool3pOfferD2({
         ticketId: id,
         haveD2: true,
         noticeProofOk: ticketNeedsNoticeProof(id) ? true : prev.noticeProofOk,
+        noticeInputIndex: noticeInputIndex ?? prev.noticeInputIndex ?? null,
         status: prev.haveR1 ? 'ready' : 'wait_r1',
         updatedAt: Date.now(),
         room: true,
@@ -3297,6 +3303,8 @@ export function listOpenPool3pTickets() {
       count: Number(!!t.haveR1) + Number(!!t.haveD2),
       need: 2,
       waitingOn,
+      // Burn input index when known (rollups v2 signers look the notice up by it).
+      inputIndex: t.noticeInputIndex ?? null,
       room: true,
       steps: {
         d1: !!t.haveR1,

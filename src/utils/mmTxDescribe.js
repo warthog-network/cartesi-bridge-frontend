@@ -97,10 +97,13 @@ export function describeVoucherExecute(voucher, opts = {}) {
     .filter(Boolean)
     .join(' · ');
 
+  const v2 = !!(voucher?.proof && 'outputHashesSiblings' in voucher.proof) || !!voucher?.rawData;
   const outIdx =
     voucher?.proof?.validity?.outputIndexWithinInput != null
       ? Number(voucher.proof.validity.outputIndexWithinInput)
-      : voucher?.voucherIndex;
+      : voucher?.proof?.outputIndex != null
+        ? Number(voucher.proof.outputIndex)
+        : voucher?.voucherIndex;
 
   const decodedJson = {
     kind: decoded?.kind,
@@ -124,7 +127,15 @@ export function describeVoucherExecute(voucher, opts = {}) {
     summary: voucher?.summary || null,
   };
 
-  const proofJson = voucher?.proof
+  const proofJson = v2
+    ? voucher?.proof?.outputHashesSiblings?.length
+      ? {
+          hasProof: true,
+          outputIndex: String(voucher.proof.outputIndex ?? ''),
+          outputHashesSiblings: (voucher.proof.outputHashesSiblings || []).map(String),
+        }
+      : { hasProof: false }
+    : voucher?.proof
     ? {
         hasProof: true,
         context: voucher.proof.context || null,
@@ -152,9 +163,11 @@ export function describeVoucherExecute(voucher, opts = {}) {
     : { hasProof: false };
 
   const lines = [
-    `Method: Application.executeVoucher`,
+    v2 ? `Method: Application.executeOutput` : `Method: Application.executeVoucher`,
     `App: ${shortAddr(opts.dappAddress || getDappAddress())}`,
-    `input #${voucher?.inputIndex} · voucher #${voucher?.voucherIndex}`,
+    v2
+      ? `input #${voucher?.inputIndex} · output #${voucher?.voucherIndex}`
+      : `input #${voucher?.inputIndex} · voucher #${voucher?.voucherIndex}`,
     decoded?.label ? `action: ${decoded.label}` : null,
     token ? `token: ${token}` : `dest: ${shortAddr(voucher?.destination)}`,
     decoded?.amountHuman != null
@@ -166,21 +179,24 @@ export function describeVoucherExecute(voucher, opts = {}) {
   return {
     kind: 'execute_voucher',
     title,
-    method: 'Application.executeVoucher(destination, payload, proof)',
+    method: v2
+      ? 'Application.executeOutput(output, proof)'
+      : 'Application.executeVoucher(destination, payload, proof)',
     summary: lines.join('\n'),
     payloadJson: safeJson(voucherJson),
     sections: [
       { label: 'Voucher', json: safeJson(voucherJson) },
       { label: 'Decoded payload', json: safeJson(decodedJson) },
-      { label: 'Epoch proof', json: safeJson(proofJson) },
+      { label: v2 ? 'Output proof' : 'Epoch proof', json: safeJson(proofJson) },
       {
         label: 'Call context',
         json: {
           contract: 'Application (dApp)',
-          method: 'executeVoucher',
+          method: v2 ? 'executeOutput' : 'executeVoucher',
           dappAddress: opts.dappAddress || getDappAddress(),
           destination: voucher?.destination,
           payloadHex: voucher?.payload,
+          ...(v2 ? { outputRawData: voucher?.rawData || null } : {}),
         },
       },
     ],

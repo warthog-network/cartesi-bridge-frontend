@@ -17,6 +17,7 @@ import { Toaster, toast } from 'react-hot-toast';
 import { RefreshCw, Eye, EyeOff, MoreVertical } from 'lucide-react';
 import '../styles/subWallet.css';
 import { getRollupGraphqlUrl } from '../utils/bridgeConfig.js';
+import { isV2 as rollupsIsV2, fetchNoticeEdges as rollupsFetchNoticeEdges } from '../utils/rollupsClient.js';
 import { deriveSubWallet, deriveSubPrivateKey } from '../utils/subWalletDerive.js';
 import { SHARE_TOKEN } from '../utils/tokenNames.js';
 
@@ -191,8 +192,14 @@ function SubWallet({
 
   const fetchCartesiSalt = async (userMainAddress) => {
     try {
-      const { notices } = await client.request(gql`{ notices(last: 1) { edges { node { payload } } } }`);
-      const noticePayload = notices.edges[0]?.node.payload || 'fallback';
+      let noticePayload;
+      if (rollupsIsV2()) {
+        const edges = await rollupsFetchNoticeEdges(1);
+        noticePayload = edges[edges.length - 1]?.node?.payload || 'fallback';
+      } else {
+        const { notices } = await client.request(gql`{ notices(last: 1) { edges { node { payload } } } }`);
+        noticePayload = notices.edges[0]?.node.payload || 'fallback';
+      }
       const timestamp = Math.floor(Date.now() / 1000);
       return keccak256(
         toUtf8Bytes(noticePayload + userMainAddress + timestamp)

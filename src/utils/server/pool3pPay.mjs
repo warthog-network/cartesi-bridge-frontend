@@ -15,7 +15,7 @@ const NODE_URL =
 
 const NONCE_PATH =
   env('POOL_3P_NONCE') ||
-  '/opt/cartesi-bridge/cartesi-bridge-frontend/.data/pool-3p-nonce.json';
+  ((globalThis.process?.env?.CARTESI_BRIDGE_DATA || '/opt/cartesi-bridge/cartesi-bridge-frontend/.data') + '/pool-3p-nonce.json');
 
 async function readNonceFile() {
   try {

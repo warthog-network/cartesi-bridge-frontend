@@ -48,7 +48,7 @@ function env(key, fallback = '') {
   return v == null || v === '' ? fallback : String(v);
 }
 
-const DEFAULT_DATA = '/opt/cartesi-bridge/cartesi-bridge-frontend/.data';
+const DEFAULT_DATA = (globalThis.process?.env?.CARTESI_BRIDGE_DATA || '/opt/cartesi-bridge/cartesi-bridge-frontend/.data');
 export const ETH3P_SCHEME = 'eth-3p-ecdsa-lindell-v1';
 export const ETH3P_ORBIT_VPS_ID = 'pool-eth-3p-orbit-vps';
 
