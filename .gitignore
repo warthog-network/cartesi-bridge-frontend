@@ -45,3 +45,4 @@ fungible-pool-paid.json
 dist.*/
 dist-*/
 *.tmp-*
+node_modules
