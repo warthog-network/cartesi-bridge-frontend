@@ -16,6 +16,31 @@ import { LOCAL_WWART } from './localTokens.js';
 
 export const NETWORK_IDS = /** @type {const} */ (['anvil', 'sepolia']);
 
+function envAddr(key) {
+  if (typeof import.meta === 'undefined') return '';
+  const v = import.meta.env?.[key];
+  return typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v) ? v : '';
+}
+
+const ZERO = '0x0000000000000000000000000000000000000000';
+
+/** Build-time rollups API selector (bridgeConfig.js reads the same var). */
+const ROLLUPS_V2 =
+  typeof import.meta !== 'undefined' && import.meta.env?.PUBLIC_ROLLUPS_API === 'v2';
+
+/**
+ * Cartesi rollups v2 devnet base contracts (cartesi/sdk 0.12 anvil state,
+ * chain 31337). Verified with eth_getCode on the live v2 anvil 2026-09-10;
+ * the ERC20Portal is the only devnet contract carrying selector 0x95854b81
+ * (depositERC20Tokens), the EtherPortal the only one with 0x938c054f.
+ */
+export const CARTESI_V2_DEVNET_BASE = {
+  inputBox: '0x346B3df038FE9f8380071eC6514D5a83aD143939',
+  etherPortal: '0x8b53327575ac999bdfa8003f4b5134DFF9027516',
+  erc20Portal: '0x22E57511C30CcE6CDaa742E13CE3b774fDC663b1',
+  selfHostedApplicationFactory: '0x6145C5996a71a379E030aEb0440df79D60833418',
+};
+
 /**
  * Cartesi CLI 1.5 Anvil book + this VPS mock/minter tokens.
  * minterWwart is filled by scripts/deploy-minter-wwart.mjs (lab); live demo still uses wwart.
@@ -31,11 +56,21 @@ export const ANVIL = {
     'https://cartesi-bridge.duckdns.org/rpc',
   nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
   contracts: {
-    dapp: '0xab7528bb862fB57E8A2BCd567a2e929a0Be56a5e',
-    inputBox: '0x59b22D57D4f067708AB0c00552767405926dc768',
-    etherPortal: '0xFfdbe43d4c855BF7e0f105c400A50857f53AB044',
-    erc20Portal: '0x9C21AEb2093C32DDbC53eEF24B873BDCd1aDa1DB',
-    dappAddressRelay: '0xF5DE34d6BbC0446E2a45719E718efEbaaE179daE',
+    // Rollups v2 (PUBLIC_ROLLUPS_API=v2): the Application address comes from the
+    // build env and the base contracts are the v2 devnet ones — the 1.x CREATE2
+    // addresses below have NO code on the cartesi/sdk 0.12 anvil.
+    dapp: envAddr('PUBLIC_APP_ADDRESS') || '0xab7528bb862fB57E8A2BCd567a2e929a0Be56a5e',
+    inputBox:
+      envAddr('PUBLIC_INPUT_BOX_ADDRESS') ||
+      (ROLLUPS_V2 ? CARTESI_V2_DEVNET_BASE.inputBox : '0x59b22D57D4f067708AB0c00552767405926dc768'),
+    etherPortal:
+      envAddr('PUBLIC_ETHER_PORTAL_ADDRESS') ||
+      (ROLLUPS_V2 ? CARTESI_V2_DEVNET_BASE.etherPortal : '0xFfdbe43d4c855BF7e0f105c400A50857f53AB044'),
+    erc20Portal:
+      envAddr('PUBLIC_ERC20_PORTAL_ADDRESS') ||
+      (ROLLUPS_V2 ? CARTESI_V2_DEVNET_BASE.erc20Portal : '0x9C21AEb2093C32DDbC53eEF24B873BDCd1aDa1DB'),
+    /** 1.x only — v2 puts app_contract in every input; zero on v2. */
+    dappAddressRelay: ROLLUPS_V2 ? ZERO : '0xF5DE34d6BbC0446E2a45719E718efEbaaE179daE',
     /** Live demo token — promoted MinterWWART (minter-only). */
     wwart: LOCAL_WWART.address,
     /**
@@ -80,13 +115,6 @@ export const ANVIL = {
  *   PUBLIC_SEPOLIA_WWART=0x…
  *   PUBLIC_L1_RPC=https://…sepolia…
  */
-function envAddr(key) {
-  if (typeof import.meta === 'undefined') return '';
-  const v = import.meta.env?.[key];
-  return typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v) ? v : '';
-}
-
-const ZERO = '0x0000000000000000000000000000000000000000';
 
 /** Cartesi rollups 1.x base contracts (CREATE2) — confirmed code on Sepolia. */
 export const CARTESI_SEPOLIA_BASE = {
