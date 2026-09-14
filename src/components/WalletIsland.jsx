@@ -11,6 +11,7 @@ import { ethers, toUtf8String, getBytes } from 'ethers-v6';
 import WarthogWallet from './WarthogWallet'; // Added import for WarthogWallet component
 import EthSubWallets from './EthSubWallets.jsx';
 import VoucherExecutor from './VoucherExecutor.jsx';
+import { useUiMode } from '../utils/uiMode.js';
 import AnvilTestKeys from './AnvilTestKeys.jsx';
 import FungiblePool from './FungiblePool.jsx';
 import { useMmTxConfirm } from './MmTxConfirm.jsx';
@@ -207,6 +208,8 @@ export default function WalletIsland() {
   const [l1Registered, setL1Registered] = useState(null);
   /** Public Anvil /rpc probe (must stay before any early return — Rules of Hooks). */
   const [l1RpcOk, setL1RpcOk] = useState(null);
+  const [uiMode] = useUiMode();
+  const simpleUi = uiMode !== 'advanced';
 
   useEffect(() => {
     let cancelled = false;
@@ -957,6 +960,17 @@ export default function WalletIsland() {
    * Prove L1 is usable for InputBox: VPS Anvil up + MetaMask on chainId with a live RPC.
    * Rebinds provider/signer after network switch.
    */
+  /** PUBLIC_L1_RPC may be a same-origin path ("/rpc"); ethers wants an absolute URL. */
+  const absRpcUrl = (u) => {
+    const s = String(u || '');
+    if (/^https?:\/\//i.test(s)) return s;
+    try {
+      return new URL(s, window.location.origin).href;
+    } catch {
+      return s;
+    }
+  };
+
   const ensureL1ReadyForSend = async () => {
     const net = getNetwork() || ACTIVE_NETWORK;
     const wantChain = Number(net.chainId ?? 31337);
@@ -1031,8 +1045,9 @@ export default function WalletIsland() {
 
     // 4) If the wallet's own RPC is dead (localhost:8545 after a VPS Anvil
     // wipe), rewrite the chain URL. Only then do we open a network dialog.
+    let walletBlock = null;
     try {
-      await Promise.race([
+      walletBlock = await Promise.race([
         prov.getBlockNumber(),
         new Promise((_, rej) =>
           setTimeout(() => rej(new Error('wallet rpc timeout')), 8000),
@@ -1049,6 +1064,42 @@ export default function WalletIsland() {
           `Approve the network update, then: MetaMask → Settings → Advanced → Clear activity tab data. ` +
           `RPC must be ${publicRpc}.`,
       );
+    }
+
+    // 5) Same chain id is not the same chain: a wallet pointed at another
+    // 31337 Anvil mines the tx there, tx.wait() succeeds, and the rollup never
+    // sees the input ("Burn not confirmed" with nothing on chain, 2026-09-10).
+    try {
+      const pub = new ethers.JsonRpcProvider(absRpcUrl(publicRpc));
+      const serverBlock = await Promise.race([
+        pub.getBlockNumber(),
+        new Promise((_, rej) =>
+          setTimeout(() => rej(new Error('public rpc timeout')), 8000),
+        ),
+      ]);
+      // A bundle built without PUBLIC_* carries the rollups 1.x addresses,
+      // which have no code on the v2 Anvil: the tx mines, emits nothing, and
+      // the rollup never sees the input (2026-09-10).
+      const ibCode = await pub.getCode(INPUT_BOX_ADDRESS);
+      if (!ibCode || ibCode === '0x') {
+        throw new Error(
+          `No InputBox contract at ${INPUT_BOX_ADDRESS} on this chain — the site is serving a stale contract set. ` +
+            'Nothing sent. Hard-reload the page; if it persists the frontend must be rebuilt with the v2 addresses.',
+        );
+      }
+      if (
+        Number.isFinite(Number(walletBlock)) &&
+        Number.isFinite(Number(serverBlock)) &&
+        Math.abs(Number(walletBlock) - Number(serverBlock)) > 200
+      ) {
+        throw new Error(
+          `Wallet is on a different chain ${wantChain} (wallet block ${walletBlock}, server block ${serverBlock}). ` +
+            `Nothing sent. Set the wallet's ${wantChain} network RPC to ${publicRpc} and retry.`,
+        );
+      }
+    } catch (e) {
+      if (/different chain|No InputBox contract/.test(String(e?.message || ''))) throw e;
+      /* public RPC hiccup — the post-send receipt check below still catches it */
     }
     return sign;
   };
@@ -1621,7 +1672,7 @@ export default function WalletIsland() {
         throw new Error(`InputBox send failed: ${m}`);
       }
       toast.dismiss('inputbox');
-      const pub = new ethers.JsonRpcProvider(publicRpc);
+      const pub = new ethers.JsonRpcProvider(absRpcUrl(publicRpc));
       let receipt = null;
       try {
         receipt = await Promise.race([
@@ -1639,6 +1690,25 @@ export default function WalletIsland() {
           );
         }
         throw new Error(`L1 tx ${String(tx.hash).slice(0, 12)}… is pending on Anvil — wait and refresh.`);
+      }
+      // The wallet's receipt is only proof if THIS Anvil has the tx: a wallet
+      // on another chain 31337 returns a perfectly good receipt from there.
+      {
+        let onServer = null;
+        for (let i = 0; i < 8 && !onServer; i++) {
+          try {
+            onServer = await pub.getTransaction(tx.hash);
+          } catch {
+            /* retry */
+          }
+          if (!onServer) await new Promise((r) => setTimeout(r, 1500));
+        }
+        if (!onServer) {
+          throw new Error(
+            `Wallet mined ${String(tx.hash).slice(0, 12)}… on a different chain 31337 — this Anvil never received it, so the rollup will not see the input. ` +
+              `Set the wallet's 31337 network RPC to ${publicRpc} and retry.`,
+          );
+        }
       }
       // ethers-v6: receipt.hash (v5 used transactionHash)
       const txHash = receipt?.hash || receipt?.transactionHash || tx?.hash || '';
@@ -2238,17 +2308,29 @@ export default function WalletIsland() {
           }}
         >
           <span>
-            <strong>Anvil L1:</strong>{' '}
+            <strong>{simpleUi ? 'Bridge network:' : 'Anvil L1:'}</strong>{' '}
             {l1RpcOk === null
               ? 'checking…'
               : l1RpcOk
-                ? `reachable · chain ${ACTIVE_NETWORK?.chainId || 31337}`
-                : 'UNREACHABLE from this browser'}
-            <span className="wi-muted" style={{ display: 'block', fontSize: '0.72rem' }}>
-              Wallet network RPC must be{' '}
-              <code style={{ wordBreak: 'break-all' }}>{RPC_URL}</code>
-              {' '}— never <code>localhost:8545</code> on a phone.
-            </span>
+                ? simpleUi
+                  ? 'ready'
+                  : `reachable · chain ${ACTIVE_NETWORK?.chainId || 31337}`
+                : simpleUi
+                  ? 'not set up in your wallet yet'
+                  : 'UNREACHABLE from this browser'}
+            {simpleUi ? (
+              <span className="wi-muted" style={{ display: 'block', fontSize: '0.72rem' }}>
+                {l1RpcOk
+                  ? 'Your Ethereum wallet is connected to the bridge network.'
+                  : 'Your Ethereum wallet needs the bridge network added. One click does it; approve the prompt in your wallet.'}
+              </span>
+            ) : (
+              <span className="wi-muted" style={{ display: 'block', fontSize: '0.72rem' }}>
+                Wallet network RPC must be{' '}
+                <code style={{ wordBreak: 'break-all' }}>{RPC_URL}</code>
+                {' '}— never <code>localhost:8545</code> on a phone.
+              </span>
+            )}
           </span>
           <button
             type="button"
@@ -2266,7 +2348,7 @@ export default function WalletIsland() {
               }
             }}
           >
-            Fix wallet → Anvil RPC
+            {simpleUi ? 'Set up network' : 'Fix wallet → Anvil RPC'}
           </button>
         </div>
       </div>

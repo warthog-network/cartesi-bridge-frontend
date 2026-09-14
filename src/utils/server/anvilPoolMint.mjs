@@ -5,6 +5,7 @@
  */
 import { ANVIL_TEST_ACCOUNTS } from '../anvilTestAccounts.js';
 import { LOCAL_WWART } from '../localTokens.js';
+import { appAddress, inputBoxAddress, l1RpcUrl } from './rollupsApi.mjs';
 
 function env(key, fallback = '') {
   const e = globalThis.process?.env || {};
@@ -28,14 +29,23 @@ async function submitAnvilPoolInput(owner, payload, mode) {
     );
   }
   const { ethers } = await import('ethers-v6');
-  // Same Anvil as wallets: nginx /rpc → 127.0.0.1:8545.
-  const rpc =
-    env('PUBLIC_L1_RPC') ||
-    env('CARTESI_PUBLIC_RPC') ||
-    'https://cartesi-bridge.duckdns.org/rpc';
-  const dapp = env('DAPP_ADDRESS', '0xab7528bb862fB57E8A2BCd567a2e929a0Be56a5e');
-  const boxAddr = env('INPUT_BOX', '0x59b22D57D4f067708AB0c00552767405926dc768');
-  const provider = new ethers.JsonRpcProvider(rpc);
+  // Server-side: the same L1 the SSR side already talks to (CARTESI_RPC_URL,
+  // http://127.0.0.1:8090/anvil on v2). PUBLIC_L1_RPC is the browser's
+  // path ("/rpc") — on 2026-09-11 it reached here, ethers threw
+  // "unsupported protocol /rpc" and the orphaned provider retried network
+  // detection once a second for the life of the process.
+  const rpc = l1RpcUrl();
+  if (!/^https?:\/\//i.test(rpc)) {
+    throw new Error(`anvil pool input: L1 RPC must be an absolute http(s) URL, got "${rpc}"`);
+  }
+  // App + InputBox follow the configured rollups API (v2 app, v2 InputBox),
+  // not the 1.x defaults this file used to hardcode.
+  const dapp = appAddress();
+  const boxAddr = inputBoxAddress();
+  if (!dapp) throw new Error('anvil pool input: no application address configured');
+  // staticNetwork: never re-poll chain id, so a bad endpoint fails once and
+  // does not leave a retry loop behind.
+  const provider = new ethers.JsonRpcProvider(rpc, undefined, { staticNetwork: true });
   const wallet = new ethers.Wallet(rec.privateKey, provider);
   const nonce = await provider.getTransactionCount(wallet.address, 'latest');
   const box = new ethers.Contract(

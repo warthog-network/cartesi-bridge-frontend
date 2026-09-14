@@ -337,3 +337,7 @@ h1 {
   border-color: color-mix(in srgb, var(--primary) 50%, transparent);
   background: color-mix(in srgb, var(--primary) 12%, transparent);
 }
+
+/* Simple / Advanced UI mode — mirrored on <html data-ui> by src/utils/uiMode.js */
+html[data-ui='simple'] .adv-only { display: none !important; }
+html:not([data-ui='simple']) .simple-only { display: none !important; }

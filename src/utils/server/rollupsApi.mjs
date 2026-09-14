@@ -282,6 +282,13 @@ export async function fetchWithTimeout(url, init = {}, ms = REQ_MS) {
 
 let rpcId = 0;
 /** v2 node JSON-RPC (`cartesi_*`). Named params object. */
+/** rollups-node 2.x JSON-RPC takes uint64 indices as 0x-hex strings, not JSON numbers. */
+export function hexIndex(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`bad index ${v}`);
+  return '0x' + Math.trunc(n).toString(16);
+}
+
 export async function rpcCall(method, params = {}, { timeoutMs } = {}) {
   const res = await fetchWithTimeout(
     nodeRpcUrl(),
@@ -435,7 +442,8 @@ export async function findNoticesByInput(inputIndex) {
   if (isV2()) {
     const r = await rpcCall('cartesi_listOutputs', {
       application: appRef(),
-      input_index: idx,
+      // rollups-node 2.x wants indices hex-encoded ("0x2fb"); a JSON number is "Invalid parameters".
+      input_index: hexIndex(idx),
       output_type: NOTICE_SELECTOR,
       limit: 100,
       offset: 0,
@@ -596,7 +604,7 @@ export async function fetchNoticeProofByInput(inputIndex, ticketId) {
 // ---------------------------------------------------------------------------
 
 export async function getEpoch(epochIndex) {
-  const r = await rpcCall('cartesi_getEpoch', { application: appRef(), epoch_index: Number(epochIndex) });
+  const r = await rpcCall('cartesi_getEpoch', { application: appRef(), epoch_index: hexIndex(epochIndex) });
   return r?.data ?? r;
 }
 

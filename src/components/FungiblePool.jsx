@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import { toast } from '../utils/trackedToast.js';
 import { setPipeline } from '../utils/bridgeProgress.js';
+import { useUiMode } from '../utils/uiMode.js';
 import { ethers } from 'ethers-v6';
 import { FUNGIBLE_POOL } from '../utils/fungiblePoolConfig.js';
 import { LOCAL_WWART } from '../utils/localTokens.js';
@@ -155,6 +156,177 @@ async function copyText(value) {
   }
 }
 
+/**
+ * The real reason a 3P ticket is waiting, verbatim from the signers.
+ *
+ * Every browser node that declines to sign posts pool3p_skip with its reasons
+ * ("waiting for Cartesi notice proof (epoch not claimed)", "local WASM is not
+ * synced", …); the server keeps the latest per signer on pool3p_ticket.skips
+ * and journals the same text. Until 2026-09-12 the UI never read it and said
+ * "d2 is vacant" for every stall, including a server-side claimer outage.
+ * Seat holders first, then orbit extras; recent entries only; deduped.
+ */
+function signerWaitSummary(st, { maxAgeMs = 180000, max = 3 } = {}) {
+  const skips = st?.skips && typeof st.skips === 'object' ? st.skips : null;
+  if (!skips) return '';
+  const now = Date.now();
+  const h1 = st?.members?.d1?.signerId || null;
+  const h2 = st?.members?.d2?.signerId || null;
+  const rank = (sid) => (sid === h1 ? 0 : sid === h2 ? 1 : 2);
+  const rows = Object.entries(skips)
+    .filter(
+      ([, r]) =>
+        r && Array.isArray(r.reasons) && r.reasons.length && now - Number(r.at || 0) <= maxAgeMs,
+    )
+    .sort((a, b) => rank(a[0]) - rank(b[0]) || Number(b[1].at || 0) - Number(a[1].at || 0));
+  const seen = new Set();
+  const out = [];
+  for (const [sid, r] of rows) {
+    const seat = sid === h1 ? 'd1' : sid === h2 ? 'd2' : r.role ? `orbit d${r.role}` : 'orbit';
+    const text = r.reasons.join('; ');
+    const key = `${seat}:${text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(`${seat} ${r.client || 'signer'}: ${text}`);
+    if (out.length >= max) break;
+  }
+  return out.join(' · ');
+}
+
+/** Timeout text built from the last observed room state, not a fixed guess. */
+function payoutTimeoutMessage(ticketId, st) {
+  const why = signerWaitSummary(st, { maxAgeMs: 600000, max: 4 });
+  const wait = (st?.waitingOn || []).join('+') || 'signatures';
+  const tail = ' The ticket stays open and pays as soon as both seats can sign; use “Report” to copy this state when asking for help.';
+  if (st?.members?.d2?.live === false) {
+    return `3P payout timeout for ${ticketId} — the d2 seat is vacant. Reopen the browser profile that birthed d2 (orbit extras cannot fill it).${why ? ` Signers said: ${why}.` : ''}${tail}`;
+  }
+  if (st?.members?.d1?.live === false) {
+    return `3P payout timeout for ${ticketId} — the d1 seat is vacant. Reopen the browser profile that holds d1.${why ? ` Signers said: ${why}.` : ''}${tail}`;
+  }
+  if (why) {
+    return `3P payout timeout for ${ticketId} — both seats are live but still waiting on ${wait}. Signers said: ${why}.${tail}`;
+  }
+  return `3P payout timeout for ${ticketId} — both seats are live, still waiting on ${wait}.${tail}`;
+}
+
+/**
+ * Everything a maintainer asked for when a ticket stalled this week, in one
+ * JSON blob: ticket state with the signers' own reasons, seat liveness, orbit
+ * build versions, rotation phase, machine lag, SPV tip, and which frontend
+ * build the tester was on. No secrets: pool3p_status is the public view and
+ * signer ids are truncated.
+ */
+function buildDiagReport({ p3, ticketSt, lastTicket, owner, wartFrom, snap, eth3pSt, swapAsset }) {
+  const short = (v) => (v ? String(v).slice(0, 13) : null);
+  const members = (p3?.orbit?.members || []).map((m) => ({
+    id: short(m.id),
+    live: !!m.live,
+    ageMs: m.ageMs ?? null,
+    version: m.version || null,
+  }));
+  let ticket = null;
+  if (ticketSt) {
+    const id = ticketSt.ticketId || lastTicket?.ticketId || null;
+    const skips = {};
+    for (const [sid, r] of Object.entries(ticketSt.skips || {})) {
+      skips[short(sid)] = {
+        at: r?.at ? new Date(r.at).toISOString() : null,
+        role: r?.role ?? null,
+        client: r?.client || null,
+        network: r?.network || null,
+        reasons: r?.reasons || [],
+        checks: r?.checks || null,
+      };
+    }
+    ticket = {
+      ticketId: id,
+      ok: ticketSt.ok ?? null,
+      status: ticketSt.status ?? null,
+      waitingOn: ticketSt.waitingOn || null,
+      haveR1: !!ticketSt.haveR1,
+      haveD2: !!ticketSt.haveD2,
+      members: ticketSt.members
+        ? {
+            d1: { ...ticketSt.members.d1, signerId: short(ticketSt.members.d1?.signerId) },
+            d2: { ...ticketSt.members.d2, signerId: short(ticketSt.members.d2?.signerId) },
+          }
+        : null,
+      lastError: ticketSt.lastError || null,
+      payout: ticketSt.payout || null,
+      paid: Array.isArray(ticketSt.paid)
+        ? ticketSt.paid.filter((r) => r?.ticketId === id)
+        : (ticketSt.paid ?? null),
+      skips,
+      error: ticketSt.error || null,
+    };
+  }
+  const r = p3?.rotation || null;
+  return {
+    kind: 'cartesi-bridge-report',
+    v: 1,
+    at: new Date().toISOString(),
+    build: {
+      sha: import.meta.env.PUBLIC_BUILD_SHA || null,
+      at: import.meta.env.PUBLIC_BUILD_AT || null,
+      server: p3?.build || null,
+    },
+    page: typeof location !== 'undefined' ? location.href : null,
+    userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : null,
+    asset: swapAsset || null,
+    wallet: { l1: owner || null, warthog: wartFrom || null },
+    lastTicket: lastTicket
+      ? {
+          ticketId: lastTicket.ticketId,
+          amountE8: lastTicket.amountE8 ?? null,
+          toAddress: lastTicket.toAddress || null,
+        }
+      : null,
+    ticket,
+    seats: {
+      d1Live: p3?.d1Live ?? null,
+      d2Live: p3?.d2Live ?? null,
+      holder1: short(p3?.holder1),
+      holder2: short(p3?.holder2),
+      seatEpoch: p3?.seatEpoch ?? null,
+      poolQ: p3?.address || null,
+    },
+    orbit: { liveCount: p3?.orbit?.liveCount ?? null, members },
+    rotation: r
+      ? {
+          phase: r.phase ?? null,
+          block: r.block ?? null,
+          due: r.due ?? null,
+          dueInEpochs: r.dueInEpochs ?? null,
+          clock: r.clock ?? null,
+          sweepTicketId: r.sweepTicketId ?? null,
+          openUserRooms: r.openUserRooms ?? null,
+          deferredForRooms: r.deferredForRooms ?? null,
+          lastError: r.lastError ?? null,
+          lastAt: r.last?.at ?? null,
+        }
+      : null,
+    machine: p3?.machine || null,
+    rollups: p3?.rollups
+      ? { api: p3.rollups.api, app: p3.rollups.app, appName: p3.rollups.appName }
+      : null,
+    spv: snap?.spv
+      ? {
+          bootstrapped: !!snap.spv.bootstrapped,
+          bestHeight: snap.spv.bestHeight ?? null,
+          bestHash: snap.spv.bestHash ?? null,
+        }
+      : null,
+    recovery: p3?.recovery
+      ? { recoverable: p3.recovery.recoverable ?? null, atRisk: p3.recovery.atRisk ?? null }
+      : null,
+    eth3p:
+      swapAsset === 'ETH' && eth3pSt
+        ? { e1Live: eth3pSt.e1Live ?? null, e2Live: eth3pSt.e2Live ?? null, adapter: eth3pSt.adapter || null }
+        : null,
+  };
+}
+
 function humanTo18(human) {
   const s = String(human || '').trim();
   if (!s) return 0n;
@@ -197,6 +369,19 @@ async function portalDepositPoolWwart(signer, amountHuman) {
     }
   } catch {
     /* switch is best-effort; deposit will fail clearly if still wrong chain */
+  }
+  // A stale bundle (built without PUBLIC_*) points at the rollups 1.x portal,
+  // which has no code on the v2 Anvil: the deposit "succeeds" and moves nothing.
+  try {
+    const code = await signer.provider.getCode(portalAddr);
+    if (!code || code === '0x') {
+      throw new Error(
+        `No ERC20Portal contract at ${portalAddr} on this chain — the site is serving a stale contract set. Nothing sent; hard-reload, and if it persists the frontend must be rebuilt with the v2 addresses.`,
+      );
+    }
+  } catch (e) {
+    if (/No ERC20Portal contract/.test(String(e?.message || ''))) throw e;
+    /* RPC hiccup: let the deposit itself report */
   }
   const tokenC = new ethers.Contract(token, ERC20_ABI, signer);
   const portal = new ethers.Contract(portalAddr, ERC20_PORTAL_ABI, signer);
@@ -1181,6 +1366,11 @@ export default function FungiblePool({
   /** Path A3 threshold pool status (3-of-4 browser signers) */
   const [thresholdSt, setThresholdSt] = useState(null);
   const [pool3pSt, setPool3pSt] = useState(null);
+  // Simple (default) hides operator vocabulary; Advanced is the full cockpit.
+  const [uiMode, setUiMode] = useUiMode();
+  const simple = uiMode !== 'advanced';
+  // One verdict from five server-side signals (utils/server/bridgeHealth.mjs).
+  const [health, setHealth] = useState(null);
   /**
    * UI custody toggle — same fungible deposit/mint flow either way;
    * only WART *release* uses 3-of-4 signers when on.
@@ -1567,6 +1757,27 @@ export default function FungiblePool({
     const t = setInterval(refresh, 20000);
     return () => clearInterval(t);
   }, [refresh]);
+
+  useEffect(() => {
+    let stop = false;
+    const tick = async () => {
+      try {
+        const h = await poolApi('/api/pool', {
+          method: 'POST',
+          body: JSON.stringify({ action: 'bridge_health' }),
+        });
+        if (!stop && h?.level) setHealth(h);
+      } catch {
+        /* keep the last verdict */
+      }
+    };
+    tick();
+    const t = setInterval(tick, 20000);
+    return () => {
+      stop = true;
+      clearInterval(t);
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -3336,6 +3547,7 @@ export default function FungiblePool({
       toast.loading(`3P pool: waiting for d1 + d2 on ${ticketId}…`, { id: 'pool' });
       const deadline = Date.now() + 180000;
       let first = true;
+      let lastSt = null;
       while (Date.now() < deadline) {
         if (!first) await new Promise((r) => setTimeout(r, 700));
         first = false;
@@ -3367,20 +3579,26 @@ export default function FungiblePool({
           ? `${String(st.members.d2.signerId).slice(0, 12)}…`
           : 'no holder';
         const line = `3P Lindell · ${wait} · d1 ${st.haveR1 ? 'in' : '…'} · d2 ${st.haveD2 ? 'in' : `… (${d2Who})`}`;
-        if ((st.waitingOn || []).includes('notice-proof')) {
-          toastWartSent(`${line} — waiting for Cartesi notice proof`);
-        } else if ((st.waitingOn || []).includes('d2-holder')) {
+        lastSt = st;
+        // Say what the signers themselves reported (pool3p_ticket.skips) before
+        // guessing from waitingOn; "d2 vacant" only when the seat really is.
+        const why = signerWaitSummary(st);
+        if (why) {
+          toast.loading(`${line} — ${why}`, { id: 'pool' });
+        } else if ((st.waitingOn || []).includes('notice-proof')) {
+          toastWartSent(`${line} — waiting for Cartesi notice proof (L1 epoch claim)`);
+        } else if (st.members?.d2?.live === false) {
           toast.loading(
-            `${line} — d2 vacant; reopen the original d2 tab (orbit extras cannot fill it)`,
+            `${line} — d2 seat vacant; reopen the original d2 tab (orbit extras cannot fill it)`,
             { id: 'pool' },
           );
+        } else if (st.members?.d1?.live === false) {
+          toast.loading(`${line} — d1 seat vacant; reopen the original d1 tab`, { id: 'pool' });
         } else {
           toast.loading(line, { id: 'pool' });
         }
       }
-      throw new Error(
-        `3P payout timeout for ${ticketId} — d2 is vacant. Extra signers are orbit-only; reopen the browser profile that birthed d2 (or one that still has that hex / orbit pack).`,
-      );
+      throw new Error(payoutTimeoutMessage(ticketId, lastSt));
     }
 
     // Path A3: opened for 3-of-4 signers — poll until real transfer lands
@@ -3485,9 +3703,14 @@ export default function FungiblePool({
     );
     toast.loading('Confirming burn on rollup…', { id: 'pool' });
 
-    // Collect ticket/reject from notices without blocking success on them
+    // The rollups v2 node reflects an input in inspect ~8–15 s after it is
+    // mined (longer while an epoch snapshot is being written), so the old 20 s
+    // window produced "Burn not confirmed" for burns that had already gone
+    // through and paid. Wait up to 60 s, and accept the burn/ticket notice as
+    // proof on its own — a reject notice still throws.
+    const BURN_CONFIRM_MS = 60000;
     const noticeP = waitForNotice(['pool_wwart_burned', 'pool_release_ticket'], {
-      timeoutMs: 30000,
+      timeoutMs: BURN_CONFIRM_MS,
       rejectType: 'pool_wwart_burn_rejected',
       matchOwner: owner,
       seenPayloads: seen,
@@ -3496,36 +3719,40 @@ export default function FungiblePool({
       return null;
     });
 
-    const after = await waitForPoolState(
-      owner,
-      (s) =>
-        userBn(s, 'claim18') < prevClaim ||
+    const progressed = (s) =>
+      !!s &&
+      (userBn(s, 'claim18') < prevClaim ||
         userBn(s, 'depositedE8') < prevDeposited ||
         (poolBn(s, 'globalLockedE8') || poolBn(s, 'lockedE8')) < prevLocked ||
         (poolBn(s, 'globalClaimed18') || poolBn(s, 'claimed18')) <
           prevGlobalClaim ||
-        userBn(s, 'redeemedE8') > userBn(before, 'redeemedE8'),
-      { timeoutMs: 20000, intervalMs: 700 },
+        userBn(s, 'redeemedE8') > userBn(before, 'redeemedE8'));
+
+    // Race ledger polling against the notice so whichever lands first wins.
+    let noticeObj = null;
+    let noticeDone = false;
+    noticeP.then((n) => { noticeObj = n; noticeDone = true; }, () => { noticeDone = true; });
+    const after = await waitForPoolState(
+      owner,
+      (s) => progressed(s) || (noticeDone && !!noticeObj),
+      { timeoutMs: BURN_CONFIRM_MS, intervalMs: 700 },
     );
 
-    const burned =
-      after &&
-      (userBn(after, 'claim18') < prevClaim ||
-        userBn(after, 'depositedE8') < prevDeposited ||
-        (poolBn(after, 'globalLockedE8') || poolBn(after, 'lockedE8')) <
-          prevLocked ||
-        (poolBn(after, 'globalClaimed18') || poolBn(after, 'claimed18')) <
-          prevGlobalClaim ||
-        userBn(after, 'redeemedE8') > userBn(before, 'redeemedE8'));
+    let burned = progressed(after);
     if (!burned) {
-      // Maybe reject notice
-      await noticeP.catch(() => null);
+      // Surfaces "Rollup rejected: …" from a reject notice, or the burn notice.
+      noticeObj = await noticeP;
+      if (noticeObj) burned = true;
+    }
+    if (!burned) {
       throw new Error(
-        'Burn not confirmed. Portal-deposit your MetaMask wWART first, then Burn. Anyone holding completed wWART can redeem; unfinished mint/withdraw stays with the depositor.',
+        `Burn not confirmed after ${Math.round(BURN_CONFIRM_MS / 1000)} s — the rollup has not recorded it. ` +
+          'Do not resend yet: refresh and check Used — if it already dropped, the burn went through and WART is on its way. ' +
+          'If MetaMask signed but Used never moves, MetaMask is on a different chain 31337; set its RPC to this site\'s /rpc and retry.',
       );
     }
 
-    let ticket = pickReleaseTicket(await noticeP.catch(() => null), {
+    let ticket = pickReleaseTicket(noticeObj || (await noticeP.catch(() => null)), {
       owner,
       amountE8: humanToE8(amt),
       toAddress: to,
@@ -4160,6 +4387,41 @@ export default function FungiblePool({
     toast.success('Copied', { id: 'fp-copy', duration: 1400 });
     setTimeout(() => setCopiedKey((k) => (k === key ? '' : k)), 1600);
   };
+  // "Report" chip: fresh pool3p_status + the last ticket's room (with the
+  // signers' own skip reasons) + build ids, as one JSON blob on the clipboard.
+  const copyReport = async () => {
+    toast.loading('Collecting report…', { id: 'fp-copy' });
+    let p3 = pool3pSt;
+    let ticketSt = null;
+    try {
+      const fresh = await poolApi('/api/pool', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'pool3p_status' }),
+      });
+      if (fresh) p3 = fresh;
+    } catch {
+      /* use the last polled status */
+    }
+    if (lastTicket?.ticketId) {
+      try {
+        ticketSt = await poolApi('/api/pool', {
+          method: 'POST',
+          body: JSON.stringify({ action: 'pool3p_ticket', ticketId: lastTicket.ticketId }),
+        });
+      } catch (e) {
+        ticketSt = { error: String(e?.message || e) };
+      }
+    }
+    const report = buildDiagReport({ p3, ticketSt, lastTicket, owner, wartFrom, snap, eth3pSt, swapAsset });
+    const ok = await copyText(JSON.stringify(report, null, 2));
+    if (!ok) {
+      toast.error('Copy failed', { id: 'fp-copy' });
+      return;
+    }
+    setCopiedKey('report');
+    toast.success('Report copied — paste it where you ask for help', { id: 'fp-copy', duration: 2500 });
+    setTimeout(() => setCopiedKey((k) => (k === 'report' ? '' : k)), 1600);
+  };
   const ethUnwrapMaxE8 = (() => {
     let m = 0n;
     const wartKey = String(wartFrom || '')
@@ -4373,9 +4635,10 @@ export default function FungiblePool({
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
           <Droplets size={18} color="#00ffcc" aria-hidden />
           <h3 style={{ margin: 0, fontSize: '1rem', color: '#e8fff9' }}>
-            Fungible pool
+            {simple ? (swapAsset === 'ETH' ? 'ETH bridge' : 'WART bridge') : 'Fungible pool'}
           </h3>
           <span
+            className="adv-only"
             style={{
               fontSize: '0.68rem',
               padding: '0.12rem 0.4rem',
@@ -4388,6 +4651,7 @@ export default function FungiblePool({
             Path A · {swapAsset === 'ETH' ? 'ETH 3P' : 'real WART'}
           </span>
           <span
+            className="adv-only"
             title={
               swapAsset === 'ETH'
                 ? 'ETH lock needs d_dapp + e1 + e2. Receipt is Warthog WETH you mint.'
@@ -4455,19 +4719,47 @@ export default function FungiblePool({
           >
             {open ? 'Hide' : 'Show'}
           </button>
+          <button
+            type="button"
+            className="btn secondary small"
+            onClick={() => setUiMode(simple ? 'advanced' : 'simple')}
+            title={
+              simple
+                ? 'Show operator details: seats, orbit, pool address, protocol labels'
+                : 'Hide operator details and use plain-language labels'
+            }
+          >
+            {simple ? 'Advanced' : 'Simple'}
+          </button>
         </div>
       </header>
 
       <p className="fp-status-line">
-        {swapAsset === 'ETH'
-          ? '1:1 ETH lock in the e1/e2 3P. You mint the Warthog wETH receipt; anyone holding it can redeem ETH.'
-          : '1:1 reserved mint. Until you hold wWART, only you can mint or withdraw your deposit. After that, anyone holding the token can redeem WART.'}
-        {ageLabel ? <span className="fp-status-age"> · pool {ageLabel}</span> : null}
+        {simple
+          ? swapAsset === 'ETH'
+            ? 'Lock ETH here and get the same amount of wETH on Warthog. Send wETH back to get your ETH.'
+            : 'Send WART here and get the same amount of wWART on Ethereum. Send wWART back to get your WART.'
+          : swapAsset === 'ETH'
+            ? '1:1 ETH lock in the e1/e2 3P. You mint the Warthog wETH receipt; anyone holding it can redeem ETH.'
+            : '1:1 reserved mint. Until you hold wWART, only you can mint or withdraw your deposit. After that, anyone holding the token can redeem WART.'}
+        {ageLabel && !simple ? <span className="fp-status-age"> · pool {ageLabel}</span> : null}
       </p>
       <div className="fp-chip-row" aria-label="Pool status">
+        {health ? (
+          <span
+            className={`fp-chip fp-chip-health${
+              health.level === 'ok' ? ' is-ok' : health.level === 'warn' ? ' is-wait' : ' is-bad'
+            }`}
+            title={(health.signals || [])
+              .map((s) => `${s.skipped ? '–' : s.ok ? '✓' : '✗'} ${s.label}${s.detail ? ` — ${s.detail}` : ''}`)
+              .join('\n')}
+          >
+            {health.summary}
+          </span>
+        ) : null}
         <button
           type="button"
-          className="fp-chip fp-chip-q"
+          className="fp-chip fp-chip-q adv-only"
           title={(swapAsset === 'ETH' ? ethQ : poolAddr) || 'pool address'}
           disabled={!(swapAsset === 'ETH' ? ethQ : poolAddr)}
           onClick={() => flashCopy('q', swapAsset === 'ETH' ? ethQ : poolAddr)}
@@ -4482,18 +4774,35 @@ export default function FungiblePool({
               ? shortHex(poolAddr, 6, 4)
               : '…'}
         </button>
+        <button
+          type="button"
+          className="fp-chip"
+          title="Copy a diagnostic report (last ticket, signer reasons, seats, orbit versions, build) to paste when asking for help"
+          onClick={copyReport}
+        >
+          {copiedKey === 'report' ? <Check size={12} /> : <Copy size={12} />}
+          Report
+        </button>
         <span
           className={`fp-chip${wartBind?.status === 'match' ? ' is-ok' : bindBlocked ? ' is-bad' : ' is-wait'}`}
         >
           {wartBind?.status === 'match'
-            ? 'Bound'
+            ? simple
+              ? 'Wallets linked'
+              : 'Bound'
             : bindBlocked
-              ? 'Bind clash'
+              ? simple
+                ? 'Wallet link clash'
+                : 'Bind clash'
               : owner && wartFrom
-                ? 'Bind needed'
-                : 'Unbound'}
+                ? simple
+                  ? 'Link wallets'
+                  : 'Bind needed'
+                : simple
+                  ? 'Wallets not linked'
+                  : 'Unbound'}
         </span>
-        {swapAsset === 'ETH' && eth3pSt?.ok ? (
+        {simple ? null : swapAsset === 'ETH' && eth3pSt?.ok ? (
           <>
             <span className={`fp-chip${eth3pSt.e1Live ? ' is-ok' : ' is-wait'}`}>
               {eth3pSt.e1Live ? 'e1 live' : 'e1 wait'}
@@ -4524,7 +4833,7 @@ export default function FungiblePool({
             ) : null}
           </>
         ) : null}
-        {spv ? (
+        {!simple && spv ? (
           <span className={`fp-chip${spv.bootstrapped ? ' is-ok' : ' is-wait'}`}>
             SPV {spv.bootstrapped ? 'on' : 'off'}
             {spv.bestHeight != null ? ` · ${spv.bestHeight}` : ''}
@@ -4540,41 +4849,65 @@ export default function FungiblePool({
           >
             <div className="wi-stat wi-stat--liquid">
               <Layers size={16} className="wi-stat-icon" />
-              <span className="wi-stat-k">Available</span>
+              <span className="wi-stat-k">{simple ? 'Ready to convert' : 'Available'}</span>
               <span className="wi-stat-v">
                 {swapAsset === 'ETH'
                   ? ethLedger.availableHuman
                   : (snap?.availableHuman ?? '…')}
               </span>
               <span className="wi-stat-hint">
-                {swapAsset === 'ETH' ? 'your unused ETH lock' : 'your unused deposit'}
+                {simple
+                  ? swapAsset === 'ETH'
+                    ? 'ETH you locked, not yet turned into wETH'
+                    : 'WART you sent, not yet turned into wWART'
+                  : swapAsset === 'ETH'
+                    ? 'your unused ETH lock'
+                    : 'your unused deposit'}
               </span>
             </div>
             <div className="wi-stat">
-              <span className="wi-stat-k">Locked</span>
+              <span className="wi-stat-k">{simple ? 'In the bridge' : 'Locked'}</span>
               <span className="wi-stat-v">
                 {swapAsset === 'ETH'
                   ? ethLedger.lockedHuman
                   : (snap?.lockedHuman ?? '…')}
               </span>
               <span className="wi-stat-hint">
-                {swapAsset === 'ETH' ? 'your ETH still in 3P' : 'your WART credited'}
+                {simple
+                  ? swapAsset === 'ETH'
+                    ? 'ETH the bridge holds for you'
+                    : 'WART the bridge holds for you'
+                  : swapAsset === 'ETH'
+                    ? 'your ETH still in 3P'
+                    : 'your WART credited'}
               </span>
             </div>
             <div className="wi-stat">
-              <span className="wi-stat-k">Used</span>
+              <span className="wi-stat-k">{simple ? 'Converted' : 'Used'}</span>
               <span className="wi-stat-v">
                 {swapAsset === 'ETH'
                   ? ethLedger.usedHuman
                   : (snap?.claimedHuman ?? '…')}
               </span>
               <span className="wi-stat-hint">
-                {swapAsset === 'ETH' ? 'your unburned wETH' : 'your minted claim'}
+                {simple
+                  ? swapAsset === 'ETH'
+                    ? 'turned into wETH so far'
+                    : 'turned into wWART so far'
+                  : swapAsset === 'ETH'
+                    ? 'your unburned wETH'
+                    : 'your minted claim'}
               </span>
             </div>
             <div className="wi-stat wi-stat--spoof">
               <span className="wi-stat-k">
-                {swapAsset === 'ETH' ? 'WART L1 wETH' : 'MetaMask wWART'}
+                {simple
+                  ? swapAsset === 'ETH'
+                    ? 'In your Warthog wallet'
+                    : 'In your Ethereum wallet'
+                  : swapAsset === 'ETH'
+                    ? 'WART L1 wETH'
+                    : 'MetaMask wWART'}
               </span>
               <span className="wi-stat-v">
                 {swapAsset === 'ETH'
@@ -4589,7 +4922,9 @@ export default function FungiblePool({
                         ? ` · largest ${ethReceiptSummary.largestHuman} (unwrap cap)`
                         : ' · unwrap one at a time')
                     : 'no receipts on this Warthog address'
-                  : 'your L1 token'}
+                  : simple
+                    ? 'wWART you hold right now'
+                    : 'your L1 token'}
               </span>
             </div>
           </div>
@@ -4933,19 +5268,33 @@ export default function FungiblePool({
                 title="Dual-sign: bind this Warthog address to the connected MetaMask account. Required before deposit/withdraw on a fresh stack."
               >
                 {wartBind?.status === 'match'
-                  ? `Bound ${String(wartFrom).slice(0, 8)}… → ${String(owner).slice(0, 8)}…`
-                  : 'Bind WART ↔ ETH'}
+                  ? simple
+                    ? 'Wallets linked'
+                    : `Bound ${String(wartFrom).slice(0, 8)}… → ${String(owner).slice(0, 8)}…`
+                  : simple
+                    ? 'Link my two wallets'
+                    : 'Bind WART ↔ ETH'}
               </button>
               <p className="fp-swap-hint" style={{ marginTop: '-0.2rem' }}>
                 {!owner
-                  ? 'Connect MetaMask to bind.'
+                  ? simple
+                    ? 'Connect your Ethereum wallet (MetaMask) first.'
+                    : 'Connect MetaMask to bind.'
                   : !wartFrom
-                    ? 'Unlock Warthog to bind.'
+                    ? simple
+                      ? 'Unlock your Warthog wallet first.'
+                      : 'Unlock Warthog to bind.'
                     : bindBlocked
-                      ? wartBind?.error || 'This Warthog wallet is bound to another L1 account.'
+                      ? simple
+                        ? 'This Warthog wallet is already linked to a different Ethereum account.'
+                        : wartBind?.error || 'This Warthog wallet is bound to another L1 account.'
                       : wartBind?.status === 'match'
-                        ? 'This pair is bound. You can swap.'
-                        : 'Bind once (Warthog sig + MetaMask sig), then deposit or withdraw.'}
+                        ? simple
+                          ? 'Your wallets are linked. You can swap.'
+                          : 'This pair is bound. You can swap.'
+                        : simple
+                          ? 'One-time step: you sign once in each wallet, then you can send either way.'
+                          : 'Bind once (Warthog sig + MetaMask sig), then deposit or withdraw.'}
               </p>
               <button
                 type="button"
@@ -5520,6 +5869,14 @@ export default function FungiblePool({
               {lastTicket.amountE8 ? ` · ${humanFromE8(lastTicket.amountE8)} WART` : ''}
             </p>
           )}
+          {import.meta.env.PUBLIC_BUILD_SHA ? (
+            <p className="wi-muted" style={{ fontSize: '0.7rem' }}>
+              build <code>{import.meta.env.PUBLIC_BUILD_SHA}</code>
+              {pool3pSt?.build?.head && pool3pSt.build.head !== import.meta.env.PUBLIC_BUILD_SHA
+                ? ` · server ${pool3pSt.build.head} — reload the page`
+                : ''}
+            </p>
+          ) : null}
           </div>
           )}
           {/*

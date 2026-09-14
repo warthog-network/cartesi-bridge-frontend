@@ -1864,3 +1864,25 @@ button.eth-section-btn:hover {
   color: #cfeee8;
   margin-bottom: 0.25rem;
 }
+
+/* ---- Simple / Advanced UI mode (src/utils/uiMode.js; <html data-ui>) ---- */
+html[data-ui='simple'] .adv-only {
+  display: none !important;
+}
+html:not([data-ui='simple']) .simple-only {
+  display: none !important;
+}
+.fungible-pool .fp-chip-health {
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.fungible-pool .fp-chip-health::before {
+  content: '';
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  margin-right: 0.35rem;
+  background: currentColor;
+  box-shadow: 0 0 0.35rem currentColor;
+}

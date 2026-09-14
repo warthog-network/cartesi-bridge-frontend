@@ -6,6 +6,15 @@
 		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 		<meta name="generator" content={Astro.generator} />
 		<title>Warthog Cartesi Bridge</title>
+		<script is:inline>
+			// Simple/Advanced UI mode before first paint (see src/utils/uiMode.js).
+			try {
+				var m = localStorage.getItem('bridge.ui');
+				document.documentElement.dataset.ui = m === 'advanced' ? 'advanced' : 'simple';
+			} catch (e) {
+				document.documentElement.dataset.ui = 'simple';
+			}
+		</script>
 	</head>
 	<body>
 		<slot />

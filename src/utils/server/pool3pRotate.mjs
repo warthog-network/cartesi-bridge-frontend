@@ -155,6 +155,20 @@ export async function syncInspectToLiveCoordinator(opts = {}) {
   if (!/^[0-9a-f]{48}$/.test(addr)) {
     return { ok: false, skipped: 'coordinator has no sealed Q' };
   }
+  // activateNextUnbound(): the live Q was promoted without a machine bind
+  // because its creation block fell out of the machine LC window. Re-pinning
+  // would post pool_announce_next(live) — flipping pendingNext away from the
+  // new next Q mid-rotation — and a pool_set_address the machine rejects.
+  // The machine stays on the previous Q until the next cutover binds a
+  // fresh sweep; that cutover replaces r.last and lifts this.
+  const lastRot = loadRotate()?.last;
+  if (lastRot?.unboundInMachine && normQ(lastRot.address) === addr) {
+    return {
+      ok: false,
+      skipped: 'live Q activated without a machine bind (LC window); machine stays on previous Q until the next cutover',
+      machineLive: lastRot.machineLive || null,
+    };
+  }
   const p1 = dapp?.seats?.[1]?.P || dapp?.seats?.['1']?.P || dapp?.seal?.P1;
   const p2 = dapp?.seats?.[2]?.P || dapp?.seats?.['2']?.P || dapp?.seal?.P2;
   if (!p1 || !p2 || !dapp?.seal) {
@@ -166,9 +180,8 @@ export async function syncInspectToLiveCoordinator(opts = {}) {
   let snap = await inspectPoolSnap();
   const inspectAddr = normQ(snap?.poolAddress);
   if (inspectAddr === addr) {
-    // Address already matches. Cutover often posted accountId=null (new Q
-    // not indexed yet), so inspect keeps the previous id. If Warthog has
-    // since indexed THIS hex, patch the id without rotating.
+    // Address match is not enough. Inspect with a null/wrong id is an
+    // incomplete Q — never "already synced".
     const chain = await wartAccount(addr).catch(() => null);
     const chainId = Number(chain?.accountId || 0);
     const inspectId = Number(snap?.poolAccountId || 0);
@@ -177,6 +190,14 @@ export async function syncInspectToLiveCoordinator(opts = {}) {
       ? await wartAccount(prevHex).catch(() => null)
       : null;
     const prevChainId = Number(prevChain?.accountId || 0);
+    if (inspectPairOk(snap, addr, chainId > 0 ? chainId : null)) {
+      return {
+        ok: true,
+        already: true,
+        address: addr,
+        poolAccountId: inspectId,
+      };
+    }
     if (
       chainId > 0 &&
       chainId !== inspectId &&
@@ -185,8 +206,7 @@ export async function syncInspectToLiveCoordinator(opts = {}) {
       const sweepHash = loadRotate()?.last?.sweepTxHash || null;
       if (!sweepHash) {
         return {
-          ok: true,
-          already: true,
+          ok: false,
           address: addr,
           poolAccountId: inspectId || null,
           waiting: 'no sweep hash to SPV-bind account id',
@@ -199,9 +219,9 @@ export async function syncInspectToLiveCoordinator(opts = {}) {
       });
       invalidateInspect('pool');
       const after = await waitInspect(
-        (s) => Number(s?.poolAccountId || 0) === chainId,
-        2,
-        1500,
+        (s) => inspectPairOk(s, addr, chainId),
+        8,
+        2000,
       );
       const rot = loadRotate();
       if (rot.last && normQ(rot.last.address) === addr) {
@@ -209,7 +229,7 @@ export async function syncInspectToLiveCoordinator(opts = {}) {
         await saveRotate(rot);
       }
       return {
-        ok: Number(after?.poolAccountId || 0) === chainId,
+        ok: inspectPairOk(after, addr, chainId),
         address: addr,
         poolAccountId: after?.poolAccountId ?? chainId,
         patchedAccountId: chainId,
@@ -217,10 +237,10 @@ export async function syncInspectToLiveCoordinator(opts = {}) {
       };
     }
     return {
-      ok: true,
-      already: true,
+      ok: false,
       address: addr,
-      poolAccountId: snap?.poolAccountId || null,
+      poolAccountId: inspectId || null,
+      waiting: 'inspect poolAccountId missing or does not match Warthog',
     };
   }
   const pending = normQ(snap?.pendingNext?.address || snap?.pendingNext);
@@ -248,14 +268,31 @@ export async function syncInspectToLiveCoordinator(opts = {}) {
       announceTx: announce?.txHash || null,
     };
   }
-  const posted = await submitPoolAdvance({
-    type: 'pool_set_address',
+  // Bind with the sweep that created the live Q's account (see pickBindSweepTx);
+  // a refund re-sweep's hash has no newAddresses and cannot prove the id.
+  const sweepHash = lastRot?.bindTxHash || lastRot?.sweepTxHash || null;
+  const chain = await wartAccount(addr).catch(() => null);
+  const chainId = Number(chain?.accountId || 0);
+  if (!sweepHash || !(chainId > 0)) {
+    return {
+      ok: false,
+      address: addr,
+      inspect: snap?.poolAddress || null,
+      waiting:
+        'will not post pool_set_address without a mined sweep to SPV-bind the account id',
+      announceTx: announce?.txHash || null,
+    };
+  }
+  const posted = await postProvenSetAddress({
+    txHash: sweepHash,
     address: addr,
+    destAccountId: chainId,
+    sweepTxHash: sweepHash,
   });
   invalidateInspect('pool');
-  const after = await inspectPoolSnap();
+  const after = await waitInspect((s) => inspectPairOk(s, addr, chainId), 8, 2000);
   return {
-    ok: normQ(after?.poolAddress) === addr,
+    ok: inspectPairOk(after, addr, chainId),
     address: addr,
     inspect: after?.poolAddress || null,
     accountId: after?.poolAccountId || null,
@@ -359,6 +396,61 @@ async function wartTxStatus(hash) {
     height,
     confirmations: Number(d?.confirmations || 0),
   };
+}
+
+/**
+ * Which sweep tx may SPV-bind the next Q's account id?
+ *
+ * bindPoolHexToAccountId requires the tx's block body to carry exactly one
+ * `newAddresses` entry equal to the next Q — i.e. the sweep that CREATED the
+ * account. A refund re-sweep (restartSweepIfRefunded) replaces r.sweepTxHash
+ * with a later tx whose block has no newAddresses, and cutover then threw
+ * "cutover: body has no newAddresses" on every tick for 40 h (2026-09-11 →
+ * 09-13, 341 WART parked in the next Q). So the bind tx is chosen from every
+ * sweep this rotation broadcast — current first, then the restarted ones,
+ * newest first — by reading each block's newAddresses, and remembered in
+ * r.bindTxHash so a later restart cannot move it. Falls back to r.sweepTxHash
+ * (the old behaviour) when nothing qualifies, so the existing error surfaces.
+ */
+async function pickBindSweepTx(r, nextAddress) {
+  if (r.bindTxHash) return r.bindTxHash;
+  const { spvCore, getBlockFull } = await import('../../../../scripts/lib/wartSpvHost.mjs');
+  const want20 = spvCore.address20FromWartHex(
+    String(nextAddress || '')
+      .replace(/^0x/i, '')
+      .toLowerCase(),
+  );
+  if (!want20) return r.sweepTxHash;
+  const candidates = [
+    ...new Set(
+      [r.sweepTxHash, ...(r.restartedSweeps || []).slice().reverse()]
+        .filter(Boolean)
+        .map((h) => String(h).replace(/^0x/i, '').toLowerCase()),
+    ),
+  ];
+  for (const h of candidates) {
+    const st = await wartTxStatus(h);
+    if (!st?.mined || st.height == null) continue;
+    let hashes = [];
+    try {
+      const block = await getBlockFull(st.height, WART_NODE);
+      hashes = spvCore.decodeNewAddresses(block.bodyBytes, block.bodyStructure);
+    } catch {
+      continue;
+    }
+    if (hashes.length === 1 && hashes[0] === want20) {
+      if (h !== String(r.sweepTxHash || '').toLowerCase()) {
+        console.warn(
+          `[pool3pRotate] cutover: binding with account-creating sweep ${h.slice(0, 12)}… ` +
+            `(current sweep ${String(r.sweepTxHash || '').slice(0, 12)}… has no newAddresses)`,
+        );
+      }
+      r.bindTxHash = h;
+      await saveRotate(r);
+      return h;
+    }
+  }
+  return r.sweepTxHash;
 }
 
 /** Does the live Q still hold value? `total`, not `spendable` — money that is
@@ -494,6 +586,10 @@ function incomingNextPacksReady() {
  * state change, then at most once per PACKS_WARN_MS.
  */
 const PACKS_WARN_MS = Number(env('POOL_3P_PACKS_WARN_MS', '600000')) || 600000;
+const SET_ADDRESS_RETRY_MS =
+  Number(env('POOL_3P_SET_ADDRESS_RETRY_MS', '300000')) || 300000;
+/** Mirrors the machine's WART_SPV_MAX_HEADERS (index.js default 512). */
+const LC_WINDOW_HEADERS = Number(env('WART_SPV_MAX_HEADERS', '512')) || 512;
 let lastPacksWarn = { key: '', at: 0 };
 function noteMissingNextPacks(where) {
   const packs = incomingNextPacksReady();
@@ -532,6 +628,7 @@ export function rotationView(r = loadRotate(), block = null, extra = {}) {
     machineReady: extra.machineReady ?? null,
     sweepTicketId: r.sweepTicketId || null,
     sweepTxHash: r.sweepTxHash || lastPaidRotate()?.txHash || null,
+    bindTxHash: r.bindTxHash || null,
     announceTx: r.announceTx || null,
     setTx: r.setTx || null,
     lastError: r.lastError || extra.lastError || null,
@@ -733,6 +830,10 @@ async function tickRotationInner() {
       r.lastError = null;
       r.sweepTicketId = null;
       r.sweepTxHash = null;
+      // Both belong to the Q we just retired; a stale bindTxHash would bind
+      // the new next Q with the wrong block.
+      r.bindTxHash = null;
+      r.restartedSweeps = [];
       r.announceTx = null;
       r.setTx = null;
       await saveRotate(r);
@@ -1179,6 +1280,24 @@ async function cutOver(r, next) {
       }
     }
     noteMissingNextPacks('cutover');
+    /**
+     * After activateNextUnbound() the machine still credits deposits to the
+     * PREVIOUS Q (its poolAccountId never moved). Anything that landed there
+     * since activation would be orphaned the moment this cutover moves the
+     * machine to the new Q, so refuse until it is swept out.
+     */
+    if (r.last?.unboundInMachine && r.last?.machineLive?.address) {
+      const ml = r.last.machineLive;
+      const acct = await wartAccount(ml.address).catch(() => null);
+      const feeNow = await wartMinFee().catch(() => 10000n);
+      if ((acct?.total ?? 0n) > feeNow) {
+        throw new Error(
+          `blocked — machine-live Q ${String(ml.address).slice(0, 12)}… (acct ${ml.accountId}) ` +
+            `holds ${acct.total} E8 received since the unbound activation; sweep it before the ` +
+            `machine is moved to the new Q`,
+        );
+      }
+    }
     let accountId = null;
     for (let i = 0; i < 20 && !accountId; i += 1) {
       const found = await wartAccount(next.address);
@@ -1186,22 +1305,41 @@ async function cutOver(r, next) {
       else await new Promise((res) => setTimeout(res, 1000));
     }
     if (!accountId) {
-      const liveAddr = loadDapp()?.address;
-      const liveAcct = liveAddr ? await wartAccount(liveAddr).catch(() => null) : null;
-      const fee = await wartMinFee().catch(() => 1n);
-      const liveDust = !liveAcct || (liveAcct.spendable ?? 0n) <= fee;
-      const swept = !!(r.sweepTxHash);
-      if (swept && !liveDust) {
-        throw new Error(
-          `cutover blocked — Warthog has no accountId for ${String(next.address).slice(0, 12)}… yet`,
-        );
-      }
-      // Skip-sweep: next Q may not be indexed yet. Do not invent an id.
-      // Machine inspect CLEARS the previous/baked id until the first SPV
-      // credit adopts destAccountId (or pool_set_account_id runs).
+      throw new Error(
+        `cutover blocked — Warthog has no accountId for ${String(next.address).slice(0, 12)}… yet`,
+      );
     }
+    if (!r.sweepTxHash) {
+      throw new Error(
+        'cutover blocked — no sweep tx to SPV-bind inspect poolAddress+poolAccountId',
+      );
+    }
+    const bindTx = await pickBindSweepTx(r, next.address);
     const want = normQ(next.address);
     const snap = await inspectPoolSnap().catch(() => null);
+    /**
+     * The machine's light client keeps only WART_SPV_MAX_HEADERS (512, ~2 h)
+     * recent headers plus its checkpoint, gap-fills only from a stored parent
+     * and trims back to 512 after every apply — so a bind whose block is
+     * further below the LC tip than that can NEVER verify in-machine, whatever
+     * header window we attach (2026-09-13: input #2677 rejected with "cannot
+     * apply header h=354050 (tip=355428)"). Posting it again every 5 min just
+     * fills the InputBox with rejected inputs; say so instead. Recovery is a
+     * fresh sweep out of the next Q (see memory), not a retry.
+     */
+    const lcTip = Number(snap?.spv?.bestHeight || 0);
+    if (lcTip > 0) {
+      const bindSt = await wartTxStatus(bindTx).catch(() => null);
+      const bindH = Number(bindSt?.height || 0);
+      if (bindH > 0 && lcTip - bindH > LC_WINDOW_HEADERS - 16) {
+        throw new Error(
+          `blocked — bind block h=${bindH} (sweep ${String(bindTx).slice(0, 12)}…) is ` +
+            `${lcTip - bindH} headers below the machine light-client tip ${lcTip}; the LC keeps ` +
+            `${LC_WINDOW_HEADERS}, so this next Q can never be SPV-bound. Operator action required: ` +
+            `sweep it into a Q the machine can bind.`,
+        );
+      }
+    }
     const pending = normQ(snap?.pendingNext?.address || snap?.pendingNext);
     const live = normQ(snap?.poolAddress);
     if (live !== want && pending !== want) {
@@ -1219,29 +1357,47 @@ async function cutOver(r, next) {
         throw new Error('cutover: inspect pendingNext never matched next Q');
       }
     }
-    if (live !== want) {
-      const posted = await submitPoolAdvance({
-        type: 'pool_set_address',
-        address: next.address,
-        sweepTxHash: r.sweepTxHash || null,
-      });
-      r.setTx = posted.txHash;
-      await saveRotate(r);
-      const after = await waitInspect((s) => normQ(s?.poolAddress) === want);
-      if (normQ(after?.poolAddress) !== want) {
-        throw new Error('cutover: inspect poolAddress still not next Q');
+    if (!inspectPairOk(snap, want, accountId)) {
+      // A pool_set_address already in the InputBox is not stale until the node
+      // has had a fair chance to run it. Every tick used to re-post while
+      // inspect lagged; with the v2 node stuck (2026-09-13) that is one
+      // duplicate input per tick for hours. Retry at most every
+      // POOL_3P_SET_ADDRESS_RETRY_MS (default 5 min).
+      const sinceSet = r.setTxAt ? Date.now() - Date.parse(r.setTxAt) : Infinity;
+      if (r.setTx && r.setTx !== 'already-live' && sinceSet < SET_ADDRESS_RETRY_MS) {
+        throw new Error(
+          `waiting for inspect to reflect pool_set_address ${String(r.setTx).slice(0, 12)}… ` +
+            `(posted ${Math.round(sinceSet / 1000)}s ago)`,
+        );
       }
-      if (r.sweepTxHash) {
-        await postProvenPoolAccountId({
-          txHash: r.sweepTxHash,
-          poolAddress: next.address,
-          destAccountId: accountId || undefined,
-        }).catch((e) => {
-          console.warn(
-            '[pool3pRotate] proven pool_set_account_id',
-            e?.message || e,
-          );
+      if (live !== want) {
+        const posted = await postProvenSetAddress({
+          txHash: bindTx,
+          address: next.address,
+          destAccountId: accountId,
+          sweepTxHash: r.sweepTxHash,
         });
+        r.setTx = posted.txHash;
+        r.setTxAt = new Date().toISOString();
+        await saveRotate(r);
+      } else {
+        const posted = await postProvenPoolAccountId({
+          txHash: bindTx,
+          poolAddress: next.address,
+          destAccountId: accountId,
+        });
+        r.setTx = r.setTx || posted.txHash;
+        await saveRotate(r);
+      }
+      const after = await waitInspect(
+        (s) => inspectPairOk(s, want, accountId),
+        8,
+        2000,
+      );
+      if (!inspectPairOk(after, want, accountId)) {
+        throw new Error(
+          `cutover: inspect pair incomplete (address=${String(after?.poolAddress || '').slice(0, 12)} id=${after?.poolAccountId ?? 'null'}, want ${want.slice(0, 12)}/${accountId})`,
+        );
       }
     } else {
       r.setTx = r.setTx || 'already-live';
@@ -1480,6 +1636,10 @@ export async function activateNextDapp({ sweepTxHash, accountId, setTx } = {}) {
     address: next.address,
     previous: live?.address || null,
     sweepTxHash: sweepTxHash || rot.sweepTxHash || null,
+    // The sweep whose block created this Q's account — the only tx that can
+    // SPV-bind it again (resyncStaleInspect). Differs from sweepTxHash after
+    // a refund re-sweep.
+    bindTxHash: rot.bindTxHash || null,
     accountId: accountId || null,
     setTx: setTx || rot.setTx || null,
     // Coverage of the OUTGOING Q at the moment it was retired.
@@ -1503,11 +1663,167 @@ export async function activateNextDapp({ sweepTxHash, accountId, setTx } = {}) {
   return { ok: true, address: next.address, previous: live?.address || null };
 }
 
-async function postProvenPoolAccountId({ txHash, poolAddress, destAccountId }) {
+/**
+ * Operator recovery for a next Q the machine can never bind.
+ *
+ * When the account-creating sweep block has fallen out of the machine LC's
+ * WART_SPV_MAX_HEADERS window, pool_set_address for the next Q is rejected
+ * forever while its balance sits there unspendable (2026-09-13: 341 WART in
+ * 5aec0424…). This promotes that next Q to the coordinator's live Q WITHOUT a
+ * machine bind — exactly activateNextDapp() minus the inspect confirmation —
+ * records that the machine still sits on the previous Q (r.last.unboundInMachine
+ * / machineLive), and immediately opens a fresh rotation (need_birth) so the
+ * normal cycle sweeps the balance into a brand-new next Q whose creation block
+ * is proven minutes later. syncInspectToLiveCoordinator() stays out of the way
+ * while the flag is set; cutOver() refuses if the machine-live Q gained deposits.
+ *
+ * Dry-run by default. Refuses unless every precondition holds; never moves
+ * funds itself.
+ */
+export async function activateNextUnbound({ dryRun = true, reason = '' } = {}) {
+  // Serialise with the driver: never run while a tick is mutating state.
+  if (tickLock) {
+    try {
+      await tickLock;
+    } catch {
+      /* the tick's own failure is not ours */
+    }
+  }
+  let release = null;
+  tickLock = new Promise((res) => {
+    release = res;
+  });
+  try {
+    const r = loadRotate();
+    const next = loadNextDapp();
+    const live = loadDapp();
+    const problems = [];
+    if (r.phase !== 'cutover') problems.push(`phase is ${r.phase}, expected cutover`);
+    if (!next?.address) problems.push('no next Q on disk');
+    if (next && (!next.seats?.[1]?.P || !next.seats?.[2]?.P)) problems.push('next Q seats not both born');
+    if (next && !next.dappShareHex) problems.push('next Q missing d_dapp');
+    if (!live?.address) problems.push('no live Q on disk');
+    if (r.last?.unboundInMachine) problems.push('previous activation still unbound — finish that rotation first');
+    const userRooms = listOpenUserPool3pTickets();
+    if (userRooms.length) problems.push(`${userRooms.length} user 3P room(s) open`);
+    const rotateRooms = listOpenPool3pTickets().filter((t) => /rotate/i.test(String(t.ticketId || '')));
+    if (rotateRooms.length) problems.push(`${rotateRooms.length} rotate room(s) open`);
+
+    const feeNow = await wartMinFee().catch(() => 10000n);
+    const nextAcct = next?.address ? await wartAccount(next.address).catch(() => null) : null;
+    const liveAcct = live?.address ? await wartAccount(live.address).catch(() => null) : null;
+    if (!(Number(nextAcct?.accountId) > 0)) problems.push('next Q has no Warthog account id');
+    if ((nextAcct?.total ?? 0n) <= feeNow) problems.push('next Q holds nothing — nothing to recover');
+    if ((liveAcct?.total ?? 0n) > feeNow) {
+      problems.push(`live Q still holds ${liveAcct.total} E8 — sweep it first (normal cutover path)`);
+    }
+
+    const snap = await inspectPoolSnap().catch(() => null);
+    const inspectLive = normQ(snap?.poolAddress);
+    const inspectPending = normQ(snap?.pendingNext?.address || snap?.pendingNext);
+    if (!snap) problems.push('inspect unreachable');
+    if (snap && inspectLive !== normQ(live?.address)) {
+      problems.push(`machine live ${inspectLive.slice(0, 12)}… is not the coordinator live Q`);
+    }
+    if (snap && next?.address && inspectPending !== normQ(next.address)) {
+      problems.push(`machine pendingNext ${inspectPending.slice(0, 12) || 'null'}… is not the next Q`);
+    }
+
+    // Only for a bind the machine genuinely cannot verify.
+    const bindTx = next?.address ? await pickBindSweepTx(r, next.address).catch(() => r.sweepTxHash) : null;
+    const bindSt = bindTx ? await wartTxStatus(bindTx).catch(() => null) : null;
+    const lcTip = Number(snap?.spv?.bestHeight || 0);
+    const bindH = Number(bindSt?.height || 0);
+    const belowTip = lcTip && bindH ? lcTip - bindH : null;
+    if (!(bindH > 0)) problems.push('no mined account-creating sweep found for the next Q');
+    if (belowTip != null && belowTip <= LC_WINDOW_HEADERS - 16) {
+      problems.push(
+        `bind block h=${bindH} is only ${belowTip} headers below the LC tip — the machine can still bind it; let cutover finish`,
+      );
+    }
+
+    const plan = {
+      ok: problems.length === 0,
+      dryRun,
+      reason: reason || null,
+      problems,
+      coordinatorLive: live?.address || null,
+      machineLive: { address: inspectLive || null, accountId: Number(snap?.poolAccountId || 0) || null },
+      nextQ: next?.address || null,
+      nextAccountId: Number(nextAcct?.accountId || 0) || null,
+      nextBalanceE8: nextAcct ? nextAcct.total.toString() : null,
+      liveBalanceE8: liveAcct ? liveAcct.total.toString() : null,
+      bindTx: bindTx || null,
+      bindHeight: bindH || null,
+      lcTip: lcTip || null,
+      headersBelowTip: belowTip,
+      lcWindow: LC_WINDOW_HEADERS,
+      willDo: [
+        'archive live Q to pool-3p-dapp-prev-<ts>.json and promote next Q to live (activateNextDapp)',
+        'mark r.last.unboundInMachine=true with machineLive so inspect re-pin is suppressed',
+        'create a fresh dapp-only next Q and enter need_birth so holders birth new seats',
+        'normal cycle then sweeps the recovered balance into the new next Q and binds it with a fresh proof',
+      ],
+    };
+    if (!plan.ok || dryRun) return plan;
+
+    const act = await activateNextDapp({
+      sweepTxHash: r.sweepTxHash,
+      accountId: plan.nextAccountId,
+      setTx: 'operator-activation-unbound',
+    });
+    const rot = loadRotate();
+    rot.last = {
+      ...(rot.last || {}),
+      unboundInMachine: true,
+      machineLive: plan.machineLive,
+      bindTxHash: bindTx || null,
+      activatedAt: new Date().toISOString(),
+      activationReason: reason || null,
+    };
+    // Straight into a new rotation — do not sit in idle where the driver
+    // would try to re-pin inspect to a Q the machine cannot bind.
+    const { dapp } = await createDappOnlyPool();
+    await writeNextDapp(dapp);
+    rot.phase = 'need_birth';
+    rot.nextStartedAt = new Date().toISOString();
+    rot.lastError = null;
+    rot.sweepTicketId = null;
+    rot.sweepTxHash = null;
+    rot.bindTxHash = null;
+    rot.restartedSweeps = [];
+    rot.announceTx = null;
+    rot.setTx = null;
+    rot.setTxAt = null;
+    await saveRotate(rot);
+    console.warn(
+      `[pool3pRotate] activateNextUnbound: ${String(plan.coordinatorLive).slice(0, 12)}… → ` +
+        `${String(plan.nextQ).slice(0, 12)}… (acct ${plan.nextAccountId}, ${plan.nextBalanceE8} E8) ` +
+        `without machine bind; machine stays on ${String(plan.machineLive.address).slice(0, 12)}… ` +
+        `acct ${plan.machineLive.accountId}; new next ${String(dapp.address).slice(0, 12)}… awaiting births`,
+    );
+    return { ...plan, applied: true, activate: act, newNext: dapp.address, phase: rot.phase };
+  } finally {
+    tickLock = null;
+    if (release) release();
+  }
+}
+
+function inspectPairOk(snap, addr, accountId = null) {
+  if (!snap || normQ(snap.poolAddress) !== normQ(addr)) return false;
+  const id = Number(snap.poolAccountId || 0);
+  if (!(id > 0)) return false;
+  if (accountId != null && Number(accountId) > 0 && id !== Number(accountId)) {
+    return false;
+  }
+  return true;
+}
+
+async function buildAccountBindClaim({ txHash, poolAddress, destAccountId }) {
   const { buildPoolAccountIdClaim } = await import(
     '../../../../scripts/lib/wartSpvHost.mjs'
   );
-  const claim = await buildPoolAccountIdClaim({
+  return buildPoolAccountIdClaim({
     txHash,
     poolAddress,
     destAccountId,
@@ -1515,6 +1831,29 @@ async function postProvenPoolAccountId({ txHash, poolAddress, destAccountId }) {
     node: WART_NODE,
     bootstrap: false,
   });
+}
+
+async function postProvenPoolAccountId({ txHash, poolAddress, destAccountId }) {
+  return submitPoolAdvance(
+    await buildAccountBindClaim({ txHash, poolAddress, destAccountId }),
+  );
+}
+
+/** Flip inspect hex and id in one InputBox payload. Machine rejects either half. */
+async function postProvenSetAddress({
+  txHash,
+  address,
+  destAccountId,
+  sweepTxHash,
+}) {
+  const claim = await buildAccountBindClaim({
+    txHash,
+    poolAddress: address,
+    destAccountId,
+  });
+  claim.type = 'pool_set_address';
+  claim.address = normQ(address);
+  claim.sweepTxHash = sweepTxHash || txHash;
   return submitPoolAdvance(claim);
 }
 

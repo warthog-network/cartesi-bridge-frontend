@@ -5,11 +5,33 @@
  * - request_credit / credits: deposit queue for SPV relayer
  * - lab ledger: read-only status (mutations retired with Path A3)
  */
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { bridgeHealth } from '../../utils/server/bridgeHealth.mjs';
 import { applyPoolAction } from '../../utils/server/poolLedger.mjs';
 import {
   requestPoolCredit,
   listPoolCredits,
 } from '../../utils/server/poolCreditQueue.mjs';
+
+// Build identity for "Copy report": the stamp deploy-frontend.sh writes next to
+// the served dist (src sha + worktree head). process.cwd() on purpose — the unit
+// runs from the frontend dir and __dirname is unreliable inside dist chunks.
+let buildStampCache;
+function buildStamp() {
+  if (buildStampCache !== undefined) return buildStampCache;
+  try {
+    const s = JSON.parse(readFileSync(path.join(process.cwd(), 'dist', 'BUILD_STAMP.json'), 'utf8'));
+    buildStampCache = {
+      src: String(s.srcSha || '').slice(0, 12) || null,
+      head: s.head || null,
+      at: s.at || null,
+    };
+  } catch {
+    buildStampCache = null;
+  }
+  return buildStampCache;
+}
 import {
   checkWartOwnerBind,
   registerWartOwnerBind,
@@ -304,8 +326,10 @@ export async function GET({ request }) {
       livePool,
       pendingCredits: credits.items || [],
       mode: 'rollup+3p-payout+relayer',
+      modeA: 'v2',
+      rollups: 'v2',
       note:
-        'Deposit is 1-button (WART send → credit queue → SPV relayer). Prefer /inspect/pool for balances. Payout requires matching release ticket notice.',
+        'Deposit is 1-button (WART send → credit queue → SPV relayer). Prefer /inspect/pool for balances. Payout requires matching release ticket notice. Mode A is rollups v2.',
     });
   } catch (e) {
     return json(400, { ok: false, error: e?.message || String(e) });
@@ -373,6 +397,9 @@ export async function POST({ request }) {
       );
     }
 
+    if (action === 'bridge_health') {
+      return json(200, await bridgeHealth());
+    }
     if (action === 'pool3p_close_room' || action === 'pool3p_reset_room') {
       return json(200, await closePool3pRoom(body.ticketId, body.reason || 'manual-reset'));
     }
@@ -412,6 +439,7 @@ export async function POST({ request }) {
       return json(200, {
         ...pool3pPublicStatus(),
         rollups: rollupsInfo(),
+        build: buildStamp(),
         orbit: wartOrbit,
         orbitKeys: wartSealedPreshare.orbitKeys(wartOrbit?.live),
         rotation,
@@ -640,6 +668,19 @@ export async function POST({ request }) {
         pok: body.pok,
         rangeProof: body.rangeProof,
       }));
+    }
+    if (action === 'pool3p_activate_next_unbound') {
+      // Operator-only: promote a next Q the machine can never SPV-bind (its
+      // creation block left the LC window) and open a fresh rotation. Dry-run
+      // unless body.apply === true. See pool3pRotate.activateNextUnbound.
+      const { requirePoolOps } = await import('../../utils/server/poolOpsAuth.mjs');
+      const auth = requirePoolOps(request, body);
+      if (!auth.ok) return json(auth.status, { error: auth.error });
+      const { activateNextUnbound } = await import('../../utils/server/pool3pRotate.mjs');
+      return json(
+        200,
+        await activateNextUnbound({ dryRun: body.apply !== true, reason: body.reason || '' }),
+      );
     }
     if (action === 'pool3p_announce_next') {
       const { tickRotation, submitPoolAdvance } = await import('../../utils/server/pool3pRotate.mjs');

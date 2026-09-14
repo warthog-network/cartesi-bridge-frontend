@@ -44,6 +44,13 @@ function srcSha() {
 }
 
 function gitHead() {
+  // deploy-frontend.sh exports the frontend worktree's head as PUBLIC_BUILD_SHA
+  // (the served dir has no .git of its own — `git rev-parse` here would answer
+  // for the parent /opt/cartesi-bridge repo, a different history). Prefer it so
+  // the stamp and the browser bundle name the same build.
+  if (process.env.PUBLIC_BUILD_SHA && process.env.PUBLIC_BUILD_SHA !== 'unknown') {
+    return process.env.PUBLIC_BUILD_SHA;
+  }
   try {
     return execSync('git rev-parse --short HEAD', { cwd: ROOT, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
   } catch {
