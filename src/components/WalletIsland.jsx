@@ -14,6 +14,7 @@ import VoucherExecutor from './VoucherExecutor.jsx';
 import { useUiMode } from '../utils/uiMode.js';
 import AnvilTestKeys from './AnvilTestKeys.jsx';
 import FungiblePool from './FungiblePool.jsx';
+
 import { useMmTxConfirm } from './MmTxConfirm.jsx';
 import '../styles/global.css'; // Assuming global styles (including new Warthog CSS) in Astro
 import '../styles/warthog.css';
