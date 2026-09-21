@@ -95,6 +95,8 @@ import {
   finishEthSeatPdl,
   creditEthLock,
   registerEthWrap,
+  pendingEthWraps,
+  tickPendingEthWraps,
   recordEthBurn,
   bindEthOwner,
   ETH_BURN_BIN,
@@ -112,11 +114,12 @@ import {
   ethMintable,
   classifyEthBurn,
 } from '../../utils/server/poolEth3p.mjs';
-import { tickEthRotation } from '../../utils/server/poolEth3pRotate.mjs';
+import { tickEthRotation, ethRotationClockView } from '../../utils/server/poolEth3pRotate.mjs';
 import { preparePool3pTransfer, submitPool3pTransfer } from '../../utils/server/pool3pPay.mjs';
 import { assertPayoutMatchesTicket } from '../../utils/server/poolTicketVerify.mjs';
 import { getTicketVerifySnapshot } from '../../utils/server/poolVerifySnapshot.mjs';
 import { notePackReport } from '../../utils/server/packReports.mjs';
+import { requirePoolOps } from '../../utils/server/poolOpsAuth.mjs';
 import { getInspect, machineView, isReplaying } from '../../utils/server/inspectHub.mjs';
 import { rollupsInfo } from '../../utils/server/rollupsApi.mjs';
 
@@ -420,15 +423,12 @@ export async function POST({ request }) {
       await maybeAbandonStaleSeats().catch(() => []);
       let rotation = null;
       try {
-        const { tickRotation, rotationView } = await import(
+        const { tickRotation, rotationClockView } = await import(
           '../../utils/server/pool3pRotate.mjs'
         );
-        rotation = await Promise.race([
-          tickRotation(),
-          new Promise((resolve) =>
-            setTimeout(() => resolve(rotationView()), 5000),
-          ),
-        ]);
+        // Clock only here — a hung tickRotation used to keep Signing disabled.
+        rotation = await rotationClockView();
+        tickRotation().catch(() => null);
       } catch {
         /* */
       }
@@ -450,7 +450,15 @@ export async function POST({ request }) {
     if (action === 'eth3p_status') {
       if (!eth3pOn()) return json(200, { ok: false, configured: false, error: 'ETH 3P off' });
       const st = await publicEth3pStatus();
-      const rotation = await tickEthRotation().catch((e) => ({ lastError: String(e?.message || e) }));
+      // Clock only here — awaiting tickEthRotation used to stall ETH enroll
+      // the same way a hung tickRotation kept WART Signing disabled.
+      let rotation = null;
+      try {
+        rotation = await ethRotationClockView();
+      } catch {
+        /* */
+      }
+      tickEthRotation().catch(() => null);
       return json(200, { ...st, rollups: rollupsInfo(), rotation, machine: machineView() });
     }
     if (action === 'eth3p_enroll') {
@@ -465,9 +473,13 @@ export async function POST({ request }) {
         attestation: body.attestation,
         clientVersion: body.clientVersion,
       });
-      const rotation = await tickEthRotation().catch((e) => ({
-        lastError: String(e?.message || e),
-      }));
+      let rotation = null;
+      try {
+        rotation = await ethRotationClockView();
+      } catch {
+        /* */
+      }
+      tickEthRotation().catch(() => null);
       return json(200, { ...hb, rotation });
     }
     // Take a born-but-vacant e1/e2 by proving dlog(P). Never births — the seat's
@@ -569,6 +581,15 @@ export async function POST({ request }) {
     if (action === 'eth3p_assets') {
       return json(200, ethWrapIndex());
     }
+    /** Receipts minted but not yet proved; the server finishes them itself. */
+    if (action === 'eth3p_pending_wraps') {
+      const tick = body.tick ? await tickPendingEthWraps({ force: true }) : null;
+      return json(200, {
+        ok: true,
+        pending: pendingEthWraps({ issuerWart: body.issuerWart || body.wartAddress || null }),
+        tick,
+      });
+    }
     /**
      * Read-only burn precheck. Must be called BEFORE signing the transfer to the
      * burn bin — a Warthog transfer is irreversible, and recordEthBurn() can only
@@ -639,6 +660,7 @@ export async function POST({ request }) {
           paillierG: body.paillierG,
           pok: body.pok,
           rangeProof: body.rangeProof,
+          network: body.network,
         }),
       );
     }
@@ -667,20 +689,17 @@ export async function POST({ request }) {
         paillierG: body.paillierG,
         pok: body.pok,
         rangeProof: body.rangeProof,
+        network: body.network,
       }));
     }
-    if (action === 'pool3p_activate_next_unbound') {
-      // Operator-only: promote a next Q the machine can never SPV-bind (its
-      // creation block left the LC window) and open a fresh rotation. Dry-run
-      // unless body.apply === true. See pool3pRotate.activateNextUnbound.
-      const { requirePoolOps } = await import('../../utils/server/poolOpsAuth.mjs');
+    if (action === 'pool3p_strand_activate_next') {
       const auth = requirePoolOps(request, body);
-      if (!auth.ok) return json(auth.status, { error: auth.error });
-      const { activateNextUnbound } = await import('../../utils/server/pool3pRotate.mjs');
-      return json(
-        200,
-        await activateNextUnbound({ dryRun: body.apply !== true, reason: body.reason || '' }),
-      );
+      if (!auth.ok) return json(auth.status, { ok: false, error: auth.error });
+      const { strandAndActivateNext } = await import('../../utils/server/pool3pRotate.mjs');
+      return json(200, await strandAndActivateNext({
+        dryRun: body.dryRun === true || body.dryRun === '1',
+        reason: body.reason || 'strand-pay-from-next',
+      }));
     }
     if (action === 'pool3p_announce_next') {
       const { tickRotation, submitPoolAdvance } = await import('../../utils/server/pool3pRotate.mjs');
@@ -726,6 +745,8 @@ export async function POST({ request }) {
         signerId: body.signerId,
         seatEpoch: body.seatEpoch,
         clientVersion: body.clientVersion,
+        network: body.network,
+        client: body.client,
       });
       // Remember this node's key so other seats can seal pieces to it, and hand
       // back any pieces it should reseal for a tab trying to recover a seat.
@@ -737,8 +758,9 @@ export async function POST({ request }) {
       const sealedFields = sealedPreshareFieldsFor(body.signerId, hb?.orbit?.live);
       let rotation = null;
       try {
-        const { tickRotation } = await import('../../utils/server/pool3pRotate.mjs');
-        rotation = await tickRotation();
+        const { tickRotation, rotationClockView } = await import('../../utils/server/pool3pRotate.mjs');
+        rotation = await rotationClockView();
+        tickRotation().catch(() => null);
       } catch {
         /* */
       }
@@ -772,6 +794,7 @@ export async function POST({ request }) {
         role: body.role,
         shareHex: body.pok ? undefined : (body.shareHex || body.d1Hex || body.d2Hex),
         pok: body.pok,
+        network: body.network,
       }));
     }
     if (action === 'pool3p_rekey_d1' || action === 'rekey_d1') {
@@ -850,7 +873,10 @@ export async function POST({ request }) {
     }
     if (action === 'pool3p_preshare_collect') {
       const sealed = wartSealedPreshare.collect({ signerId: body.signerId, role: body.role });
-      if (sealed?.pack) return json(200, sealed);
+      if (sealed?.denied || sealed?.pack) return json(200, sealed);
+      // Sealed store is empty — do not 400 through the plaintext fallback.
+      // Vacant + no pack is a 200 the client can retry; a throw was a 400/beat.
+      if (sealed && sealed.ok && !sealed.pack) return json(200, sealed);
       return json(200, await collectPreshare({ signerId: body.signerId, role: body.role }));
     }
     if (action === 'pool3p_prepare') {
@@ -1114,7 +1140,15 @@ export async function POST({ request }) {
     const status =
       /Unauthorized|No pool_release|mismatch|disabled/i.test(msg) ? 403 : 400;
     noteActionError(request, status, msg);
-    return json(status, { ok: false, error: msg });
+    // Structured retry hints: TX_UNCONFIRMED is a wait (and now queued server-side),
+    // RECEIPT_TOO_OLD is final. Browsers key on `code`, not on the prose.
+    return json(status, {
+      ok: false,
+      error: msg,
+      ...(e?.code ? { code: String(e.code) } : {}),
+      ...(e?.retry != null ? { retry: !!e.retry } : {}),
+      ...(e?.queued ? { queued: true } : {}),
+    });
   }
 }
 

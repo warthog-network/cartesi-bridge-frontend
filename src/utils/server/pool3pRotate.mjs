@@ -30,7 +30,8 @@ import {
   loadHolders,
   recoverabilityView,
   paidRecordFor,
-  seatAllowed,
+  nextBirthDeniedReason,
+  maybeResetStuckFinish,
 } from './pool3p.mjs';
 import { getInspect, invalidateInspect, isReplaying, machineView } from './inspectHub.mjs';
 import { isV2 as rollupsIsV2, addInput as rollupsAddInput } from './rollupsApi.mjs';
@@ -604,6 +605,20 @@ function noteMissingNextPacks(where) {
   return packs;
 }
 
+/** Anvil block for dueInEpochs without running the rotate state machine. */
+export async function rotationClockView(extra = {}) {
+  let block = null;
+  try {
+    block = await Promise.race([
+      anvilBlockNumber(),
+      new Promise((resolve) => setTimeout(() => resolve(null), 800)),
+    ]);
+  } catch {
+    /* */
+  }
+  return rotationView(loadRotate(), block, extra);
+}
+
 export function rotationView(r = loadRotate(), block = null, extra = {}) {
   const next = loadNextDapp();
   const elapsed =
@@ -787,6 +802,10 @@ async function tickRotationInner() {
 
   const auto = envOn('POOL_3P_AUTO_ROTATE', true);
   const elapsed = Math.max(0, block - Number(r.anchorBlock));
+  // Stranded previous Q: coordinator live is next without a machine bind.
+  // Do not start need_birth (that invents another Q) until an operator lifts
+  // last.unboundInMachine.
+  const holdNewRotation = !!(r.last?.unboundInMachine && r.last?.strandedPrevious);
   // Everything below reads inspect and posts inputs against what it sees. A
   // replaying machine reports a Q retired hours ago: inspect-sync would
   // re-announce/re-set addresses and cutover would refuse or misjudge. Hold.
@@ -807,6 +826,7 @@ async function tickRotationInner() {
   const rooms = userRoomsOpen();
   if (
     auto &&
+    !holdNewRotation &&
     elapsed >= Number(r.intervalEpochs || INTERVAL) &&
     r.phase === 'idle'
   ) {
@@ -1128,6 +1148,22 @@ async function maybeOpenOrAdvanceSweep(r, next) {
     const room = existing.find((t) => String(t.ticketId) === String(keep)) || existing[0];
     const stalledMs = noteSweepProgress(r, room);
     /**
+     * Finish-ready but unbroadcast (lost k1 / stale pin / dead R1 poster):
+     * drop R1 so the live d1 holder can post a fresh nonce. Do not touch
+     * wait_d2. Cooldown lives in maybeResetStuckFinish.
+     */
+    if (room?.haveR1 && room?.hasPartial) {
+      const retry = await maybeResetStuckFinish(keep, {
+        stalledMs,
+        stallMs: SWEEP_STALL_MS,
+      }).catch(() => null);
+      if (retry?.ok) {
+        r.lastError = `sweep retry: reset R1 (${retry.why})`;
+        await saveRotate(r);
+        return;
+      }
+    }
+    /**
      * Do NOT blanket-clear lastError here.
      *
      * This branch ran on every tick while a sweep room was open and wrote
@@ -1210,6 +1246,24 @@ async function maybeOpenOrAdvanceSweep(r, next) {
       await saveRotate(r);
       return;
     }
+    /**
+     * Hard gate (2026-09-18): do not move the pool's money onto a Q whose seat
+     * shares exist in exactly one browser tab. Q 9143e026… lost d1 two seconds
+     * after cutover (the holder's tab never persisted its next-born share) and
+     * 234.8 WART froze with no pack anywhere to rebuild it from. Gating here —
+     * before the sweep is opened — is safe: the live Q keeps serving, nothing
+     * has been paid yet, and the 2026-09-04 freeze only happened because the
+     * gate sat AFTER a paid sweep. Off by default until every holder runs a
+     * build that re-packs after cutover (browser-node ≥ 1.5.2, ac45ca4).
+     */
+    if (envOn('POOL_3P_REQUIRE_NEXT_PACKS', false)) {
+      const packs = incomingNextPacksReady();
+      if (!packs.ok) {
+        r.lastError = `${packs.reason} — sweep NOT opened (POOL_3P_REQUIRE_NEXT_PACKS=1)`;
+        await saveRotate(r);
+        return;
+      }
+    }
     const amountE8 = spendable - fee - reserved;
     const ticketId = `wart-pool-rotate-${Date.now()}`;
     await openPool3pPayout({
@@ -1290,11 +1344,24 @@ async function cutOver(r, next) {
       const ml = r.last.machineLive;
       const acct = await wartAccount(ml.address).catch(() => null);
       const feeNow = await wartMinFee().catch(() => 10000n);
-      if ((acct?.total ?? 0n) > feeNow) {
+      const held = acct?.total ?? 0n;
+      const alreadyStranded = BigInt(String(r.last.strandedBalanceE8 || '0'));
+      // Option 2: inspect moves to the Q that just received this rotation's
+      // sweep. Pre-existing stranded coins (snapshot at unbound activation)
+      // stay on the machine-live Q. Only NEW deposits since that snapshot
+      // must be swept first.
+      if (held > feeNow && held > alreadyStranded) {
         throw new Error(
           `blocked — machine-live Q ${String(ml.address).slice(0, 12)}… (acct ${ml.accountId}) ` +
-            `holds ${acct.total} E8 received since the unbound activation; sweep it before the ` +
+            `holds ${held} E8 (${held - alreadyStranded} E8 above strand snapshot); sweep it before the ` +
             `machine is moved to the new Q`,
+        );
+      }
+      if (held > feeNow) {
+        console.warn(
+          `[pool3pRotate] cutover: leaving ${held} E8 stranded on machine-live ` +
+            `${String(ml.address).slice(0, 12)}… (snapshot ${alreadyStranded}); ` +
+            `inspect will follow the swept next Q`,
         );
       }
     }
@@ -1426,6 +1493,7 @@ export async function birthNextSeat({
   paillierG,
   pok,
   rangeProof,
+  network,
 }) {
   const r = Number(role);
   if (r !== 1 && r !== 2) throw new Error('role must be 1 or 2');
@@ -1434,11 +1502,12 @@ export async function birthNextSeat({
   if (sid === ORBIT_VPS_ID || /^pool-3p-signer-[12]$/.test(sid)) {
     throw new Error('VPS must not birth next Q');
   }
-  if (!seatAllowed(sid)) {
-    // Same policy as claim(): an unlisted node is an orbit voter, never a
-    // dealer. Without this the incoming Q's d1 was birthed (sole copy) by a
-    // node that could never hold or sign it — see 2026-09-09 pool-3p-next.
-    throw new Error('next-Q birth denied — signer is not on the seat allowlist (orbit-only)');
+  const holding =
+    loadHolders().roles?.['1']?.signerId === sid ||
+    loadHolders().roles?.['2']?.signerId === sid;
+  const why = nextBirthDeniedReason(sid, { network, holding });
+  if (why) {
+    throw new Error(`next-Q birth denied — ${why}`);
   }
   if (holdersFrozen()) {
     return {
@@ -1680,6 +1749,110 @@ export async function activateNextDapp({ sweepTxHash, accountId, setTx } = {}) {
  * Dry-run by default. Refuses unless every precondition holds; never moves
  * funds itself.
  */
+/**
+ * Operator: strand the funded live Q and make next the coordinator live Q
+ * without a sweep or pool_set_address. Inspect stays on the old Q;
+ * pendingNext is already the next Q so browsers will sign a ticket FROM next.
+ * Does not birth a further Q.
+ */
+export async function strandAndActivateNext({ dryRun = true, reason = '' } = {}) {
+  if (tickLock) {
+    try {
+      await tickLock;
+    } catch {
+      /* */
+    }
+  }
+  let release = null;
+  tickLock = new Promise((res) => {
+    release = res;
+  });
+  try {
+    const r = loadRotate();
+    const next = loadNextDapp();
+    const live = loadDapp();
+    const problems = [];
+    if (!next?.address) problems.push('no next Q on disk');
+    if (next && (!next.seats?.[1]?.P || !next.seats?.[2]?.P)) problems.push('next Q seats not both born');
+    if (next && !next.dappShareHex) problems.push('next Q missing d_dapp');
+    if (!live?.address) problems.push('no live Q on disk');
+    if (r.last?.unboundInMachine) problems.push('previous activation still unbound');
+    if (normQ(next?.address) === normQ(live?.address)) problems.push('next Q is already live');
+
+    const feeNow = await wartMinFee().catch(() => 10000n);
+    const nextAcct = next?.address ? await wartAccount(next.address).catch(() => null) : null;
+    const liveAcct = live?.address ? await wartAccount(live.address).catch(() => null) : null;
+    if (!(Number(nextAcct?.accountId) > 0)) problems.push('next Q has no Warthog account id');
+    if ((nextAcct?.total ?? 0n) <= feeNow) problems.push('next Q holds nothing to pay from');
+
+    const snap = await inspectPoolSnap().catch(() => null);
+    const inspectLive = normQ(snap?.poolAddress);
+    const inspectPending = normQ(snap?.pendingNext?.address || snap?.pendingNext);
+    if (!snap) problems.push('inspect unreachable');
+    if (snap && next?.address && inspectPending !== normQ(next.address)) {
+      problems.push(`inspect pendingNext ${inspectPending.slice(0, 12) || 'null'}… is not the next Q`);
+    }
+
+    const userRooms = listOpenUserPool3pTickets();
+    const plan = {
+      ok: problems.length === 0,
+      dryRun,
+      reason: reason || 'strand-pay-from-next',
+      problems,
+      coordinatorLive: live?.address || null,
+      machineLive: {
+        address: inspectLive || null,
+        accountId: Number(snap?.poolAccountId || 0) || null,
+      },
+      nextQ: next?.address || null,
+      nextAccountId: Number(nextAcct?.accountId || 0) || null,
+      nextBalanceE8: nextAcct ? nextAcct.total.toString() : null,
+      liveBalanceE8: liveAcct ? liveAcct.total.toString() : null,
+      pendingNext: inspectPending || null,
+      openUserRooms: userRooms.map((t) => t.ticketId),
+      willDo: [
+        'close open user 3P rooms (rollup notice stays authorized)',
+        'archive current Q and promote next to coordinator live (no set_address)',
+        'mark unboundInMachine + strandedPrevious so inspect is not re-pinned and no new Q is born',
+        'operator then reopens wart-pool-0:2 so prepare spends FROM next',
+      ],
+    };
+    if (!plan.ok || dryRun) return plan;
+
+    for (const t of userRooms) {
+      await closePool3pRoom(t.ticketId, reason || 'strand-pay-from-next');
+    }
+    const act = await activateNextDapp({
+      sweepTxHash: null,
+      accountId: plan.nextAccountId,
+      setTx: 'operator-strand-no-sweep',
+    });
+    const rot = loadRotate();
+    rot.last = {
+      ...(rot.last || {}),
+      unboundInMachine: true,
+      strandedPrevious: live.address,
+      strandedBalanceE8: plan.liveBalanceE8,
+      machineLive: plan.machineLive,
+      activatedAt: new Date().toISOString(),
+      activationReason: reason || 'strand-pay-from-next',
+    };
+    rot.lastError =
+      'stranded previous Q — coordinator live is next; inspect stays on previous until a real sweep';
+    await saveRotate(rot);
+    console.warn(
+      `[pool3pRotate] strandAndActivateNext: ${String(live.address).slice(0, 12)}… ` +
+        `(${plan.liveBalanceE8} E8 stranded) → ${String(next.address).slice(0, 12)}… ` +
+        `acct ${plan.nextAccountId} (${plan.nextBalanceE8} E8); inspect stays ` +
+        `${String(plan.machineLive.address).slice(0, 12)}…`,
+    );
+    return { ...plan, applied: true, activate: act, phase: rot.phase };
+  } finally {
+    tickLock = null;
+    if (release) release();
+  }
+}
+
 export async function activateNextUnbound({ dryRun = true, reason = '' } = {}) {
   // Serialise with the driver: never run while a tick is mutating state.
   if (tickLock) {

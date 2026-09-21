@@ -114,20 +114,31 @@ export default function WethManager({
    * Split holdings against the live registry. Name is not evidence — an orphan
    * from a wiped generation is also called "WETH" and also has a real balance.
    */
-  const { live, dead } = useMemo(() => {
+  const { live, dead, untracked } = useMemo(() => {
     const byHash = index?.byHash || {};
+    const registryOk = index?.ok === true && !!index.byHash;
+    const voided = new Set(index?.voidedHashes || []);
     const live = [];
     const dead = [];
+    const untracked = [];
     for (const h of hold) {
       if (BigInt(h.e8 || 0) <= 0n) continue;
       const wrap = byHash[h.hash];
       if (wrap && BigInt(wrap.outstandingE8 || '0') > 0n) {
         live.push({ ...h, wrap });
+      } else if (wrap) {
+        // Still on the books: fully redeemed, or stamped with a prior L1 session.
+        dead.push({ ...h, wrap });
+      } else if (registryOk) {
+        // No ledger record at all (a reset voided it, or the bridge never
+        // issued it). Not a receipt — untracked, never listed as one.
+        untracked.push({ ...h, voided: voided.has(h.hash) });
       } else {
-        dead.push({ ...h, wrap: wrap || null });
+        // Registry unavailable: never hide a balance on a failed lookup.
+        dead.push({ ...h, wrap: null });
       }
     }
-    return { live, dead };
+    return { live, dead, untracked };
   }, [hold, index]);
 
   // Keep the selection valid as the registry and balances move under it.
@@ -380,7 +391,11 @@ export default function WethManager({
                       <strong>{h.name || 'WETH'}</strong>
                       <span className="mono">{h.available ?? h.total}</span>
                       <span style={{ fontSize: '0.7rem' }}>
-                        {h.wrap ? 'fully redeemed' : 'orphaned by reset'}
+                        {!h.wrap
+                          ? 'registry unavailable'
+                          : h.wrap.backing === 'orphaned'
+                            ? 'unbacked — prior L1 session'
+                            : 'fully redeemed'}
                       </span>
                       <button
                         type="button"
@@ -407,6 +422,17 @@ export default function WethManager({
             </>
           ) : null}
         </div>
+      ) : null}
+
+      {untracked.length ? (
+        <p className="wh-hint" style={{ marginTop: '0.6rem', fontSize: '0.72rem' }}>
+          {untracked.length} WETH asset{untracked.length > 1 ? 's' : ''} on this address{' '}
+          {untracked.length > 1 ? 'are' : 'is'} not a bridge receipt
+          {untracked.filter((h) => h.voided).length
+            ? ` (${untracked.filter((h) => h.voided).length} voided by a ledger reset)`
+            : ''}
+          . Untracked here — the tokens stay on Warthog and cannot be unwrapped.
+        </p>
       ) : null}
 
       {line ? <p className={line.kind === 'err' ? 'dash__error' : 'wh-hint'}>{line.text}</p> : null}

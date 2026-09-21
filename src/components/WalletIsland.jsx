@@ -775,10 +775,13 @@ export default function WalletIsland() {
     const chainName = net.label || 'Cartesi Local';
     // Prefer public DuckDNS RPC — never leave MetaMask on localhost:8545
     // (that only works if Anvil is on the *user's* machine).
-    const publicRpc =
+    // PUBLIC_L1_RPC is a same-origin path ("/rpc") since the rollups v2 cutover;
+    // wallet_addEthereumChain needs an absolute https URL or MetaMask rejects it.
+    const publicRpc = absRpcUrl(
       net.rpcUrl ||
       RPC_URL ||
-      'https://cartesi-bridge.duckdns.org/rpc';
+      'https://cartesi-bridge.duckdns.org/rpc',
+    );
     const rpcUrls = [publicRpc].filter(
       (u) => u && !/localhost|127\.0\.0\.1/i.test(String(u)),
     );
@@ -975,8 +978,9 @@ export default function WalletIsland() {
   const ensureL1ReadyForSend = async () => {
     const net = getNetwork() || ACTIVE_NETWORK;
     const wantChain = Number(net.chainId ?? 31337);
-    const publicRpc =
-      net.rpcUrl || RPC_URL || 'https://cartesi-bridge.duckdns.org/rpc';
+    const publicRpc = absRpcUrl(
+      net.rpcUrl || RPC_URL || 'https://cartesi-bridge.duckdns.org/rpc',
+    );
 
     // 1) Server Anvil (public RPC) — if this fails, the VPS really is down
     try {

@@ -23,6 +23,8 @@ import {
   partitionWethLinks,
   untrackWethLink,
   clearOrphanedWethLinks,
+  fetchEthWrapRegistry,
+  pruneVoidedWethLinks,
 } from '../utils/mintEthWarthogAsset.js';
 import { getInspectUrl } from '../utils/bridgeConfig.js';
 
@@ -64,6 +66,11 @@ function BridgeWethWatchCard({ wartAddress, selectedNode, ownerL1, onRefreshL1Va
     const hit = await fetchLiveL1Epoch();
     const epoch = hit.ok ? hit.epoch : null;
     setLiveEpoch(epoch);
+    // Receipts the ledger voided are untracked here — the tokens stay on Warthog.
+    const reg = await fetchEthWrapRegistry();
+    if (reg?.voidedHashes?.length) {
+      pruneVoidedWethLinks({ ownerL1, wartAddress, voidedHashes: reg.voidedHashes });
+    }
     if (epoch) {
       if (ownerL1) applyLiveEpochToLinks(ownerL1, epoch);
       applyLiveEpochToWatch(wartAddress, epoch);

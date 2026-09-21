@@ -139,6 +139,68 @@ export function linkBackingStatus(entry, liveEpoch) {
   return entry.status || 'active';
 }
 
+/** Module cache so a failed registry call does not drop links. */
+let registryCache = { at: 0, reg: null };
+
+/**
+ * The bridge's wrap registry (`eth3p_assets`): live receipts by hash plus the
+ * hashes a ledger reset voided. `null` on failure — callers must not prune on
+ * that.
+ */
+export async function fetchEthWrapRegistry({ force } = {}) {
+  const now = Date.now();
+  if (!force && registryCache.reg && now - registryCache.at < 30_000) {
+    return registryCache.reg;
+  }
+  try {
+    const res = await fetch('/api/pool', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'eth3p_assets' }),
+    });
+    const j = await res.json();
+    if (!res.ok || j?.ok !== true || !j.byHash) throw new Error('registry unavailable');
+    registryCache = { at: now, reg: j };
+    return j;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Untrack links whose receipt the bridge's own books voided (a ledger reset
+ * archived the wrap). Only explicit voids are pruned: an unregistered hash may
+ * be a mint whose register_wrap is still in flight. Tokens stay on Warthog —
+ * this touches browser tracking only. Returns how many links were dropped.
+ */
+export function pruneVoidedWethLinks({ ownerL1, wartAddress, voidedHashes } = {}) {
+  const dead = new Set((Array.isArray(voidedHashes) ? voidedHashes : []).map(normHash).filter(Boolean));
+  if (!dead.size) return 0;
+  let dropped = 0;
+  if (ownerL1) {
+    const list = listLocalEthWartAssets(ownerL1);
+    const keep = list.filter((e) => !dead.has(e.assetHash));
+    if (keep.length !== list.length) {
+      dropped += list.length - keep.length;
+      saveLocalLinks(ownerL1, keep);
+    }
+  }
+  if (wartAddress) {
+    const w = String(wartAddress)
+      .replace(/^0x/i, '')
+      .toLowerCase();
+    const all = readStore(LS_WATCH);
+    const list = (Array.isArray(all[w]) ? all[w] : []).map(normEntry).filter(Boolean);
+    const keep = list.filter((e) => !dead.has(e.assetHash));
+    if (keep.length !== list.length) {
+      dropped += list.length - keep.length;
+      all[w] = keep;
+      writeStore(LS_WATCH, all);
+    }
+  }
+  return dropped;
+}
+
 export function partitionWethLinks(links, liveEpoch) {
   const current = [];
   const orphaned = [];
@@ -594,96 +656,6 @@ export async function createWarthogEthAsset({
   return entry;
 }
 
-function e8FromBalance(bal) {
-  const e8 = bal?.total?.E8 ?? bal?.available?.E8;
-  if (e8 != null && e8 !== '') {
-    try {
-      return BigInt(String(e8));
-    } catch {
-      /* */
-    }
-  }
-  const str = String(bal?.total?.str ?? bal?.available?.str ?? '0');
-  const [w, f = ''] = str.split('.');
-  try {
-    return BigInt(w || '0') * 10n ** 8n + BigInt((f + '00000000').slice(0, 8));
-  } catch {
-    return 0n;
-  }
-}
-
-function collectHistoryAssetHashes(histPayload) {
-  const out = [];
-  const rows =
-    histPayload?.history ||
-    histPayload?.transactions ||
-    histPayload?.txs ||
-    (Array.isArray(histPayload) ? histPayload : []);
-  for (const tx of rows) {
-    const type = String(tx?.type || tx?.txType || tx?.kind || '').toLowerCase();
-    const name = String(tx?.assetName || tx?.tokenName || tx?.asset || '').toUpperCase();
-    let h = tx?.assetHash || tx?.tokenHash || tx?.asset_id || tx?.token?.hash;
-    if (!h && (type.includes('asset') || name === 'WETH')) {
-      h = tx?.txHash || tx?.hash;
-    }
-    const n = normHash(h);
-    if (n) out.push(n);
-  }
-  return out;
-}
-
-/**
- * Live Warthog L1 asset holdings for an address (WETH and any extra hashes).
- * Combines local watch, wrap registry hashes, and account history.
- */
-export async function fetchWartAssetHoldings(wartAddress, extraHashes = [], nodeUrl) {
-  const addr = String(wartAddress || '')
-    .replace(/^0x/i, '')
-    .toLowerCase();
-  if (!/^[0-9a-f]{48}$/.test(addr)) return [];
-  const api = await createWarthogApi(nodeUrl || DEFAULT_NODE_URL);
-  const hashes = new Set();
-  for (const h of extraHashes || []) {
-    const n = normHash(h);
-    if (n) hashes.add(n);
-  }
-  for (const it of listWethWatch(addr)) {
-    if (it.assetHash) hashes.add(it.assetHash);
-  }
-  try {
-    const hist = await api.getAccountHistory(addr);
-    if (hist.success) {
-      for (const h of collectHistoryAssetHashes(hist.data)) hashes.add(h);
-    }
-  } catch {
-    /* optional */
-  }
-  const holdings = [];
-  for (const hash of hashes) {
-    try {
-      const res = await api.getAccountAssetBalance(addr, hash);
-      if (!res.success) continue;
-      const bal = res.data?.balance;
-      const e8 = e8FromBalance(bal);
-      if (e8 <= 0n) continue;
-      const token = res.data?.token || {};
-      holdings.push({
-        hash,
-        name: String(token.name || 'WETH')
-          .toUpperCase()
-          .slice(0, 8),
-        available: bal?.available?.str ?? bal?.total?.str ?? '0',
-        total: bal?.total?.str ?? '0',
-        locked: bal?.locked?.str ?? '0',
-        e8: e8.toString(),
-      });
-    } catch {
-      /* skip */
-    }
-  }
-  return holdings;
-}
-
 /** Payload fields to attach on mint_weth_claim for rollup link. */
 export function claimLinkPayload(assetLink, wartAddress) {
   if (!assetLink?.assetHash) return {};
@@ -726,9 +698,20 @@ export async function reconcileWethLinks(ownerL1, inspectList) {
   const hit = await fetchLiveL1Epoch();
   const epoch = hit.ok ? hit.epoch : null;
   let list = mergeEthWartAssetLinks(ownerL1, inspectList);
+  // Inspect may keep echoing a receipt the ledger has since voided; drop it
+  // after the merge so it never re-enters the tracked count.
+  const reg = await fetchEthWrapRegistry();
+  const voidedHashes = reg?.voidedHashes || [];
+  if (voidedHashes.length) {
+    if (ownerL1 && pruneVoidedWethLinks({ ownerL1, voidedHashes })) {
+      list = listLocalEthWartAssets(ownerL1);
+    }
+    const dead = new Set(voidedHashes.map(normHash).filter(Boolean));
+    list = list.filter((e) => !dead.has(e.assetHash));
+  }
   if (epoch && ownerL1) list = applyLiveEpochToLinks(ownerL1, epoch);
   const { current, orphaned } = partitionWethLinks(list, epoch);
-  return { current, orphaned, epoch, all: list };
+  return { current, orphaned, epoch, all: list, voidedHashes };
 }
 
 // Back-compat aliases

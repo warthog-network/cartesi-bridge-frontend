@@ -410,7 +410,14 @@ async function poolApi(path, init) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.ok === false) {
-    throw new Error(data.error || `pool API ${res.status}`);
+    const err = new Error(data.error || `pool API ${res.status}`);
+    // Structured hints from the server (see pool.js catch): retry loops key on
+    // these rather than on message prose.
+    if (data.code) err.code = String(data.code);
+    if (data.retry != null) err.retry = !!data.retry;
+    if (data.queued) err.queued = true;
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
@@ -421,21 +428,69 @@ async function poolApi(path, init) {
  * failure: retry the *register* call, never the mint. A second createAssets
  * would put a second, separately-backed WETH asset on chain.
  */
+const WRAP_WAIT_RE = /TX_UNCONFIRMED|not mined yet|need \d+ confs, have \d+/i;
+// fetch() rejections and gateway errors: the request may never have reached the
+// server, or the server was mid-wait when nginx gave up. Retry, never re-mint.
+const WRAP_TRANSIENT_RE =
+  /Failed to fetch|Load failed|NetworkError|network request failed|ECONN|socket|timed? ?out|pool API (0|5\d\d)/i;
+
 async function registerWrapWhenMined(send, note) {
-  const deadline = Date.now() + 300000;
+  const deadline = Date.now() + 600000;
+  let backoff = 3000;
   for (;;) {
     try {
       return await send();
     } catch (e) {
       const msg = e?.message || String(e);
+      if (e?.code === 'RECEIPT_TOO_OLD' || e?.retry === false) throw e;
       // Same three-layer confirmation vocabulary as the redeem path — a bare
       // `need N confs, have M` from the claim builder is a wait, not a failure.
-      if (!/TX_UNCONFIRMED|not mined yet|need \d+ confs, have \d+/.test(msg) || Date.now() > deadline) {
-        throw e;
+      const waiting = e?.code === 'TX_UNCONFIRMED' || e?.retry === true || WRAP_WAIT_RE.test(msg);
+      const transient = !waiting && WRAP_TRANSIENT_RE.test(msg);
+      if ((!waiting && !transient) || Date.now() > deadline) throw e;
+      if (waiting) {
+        note?.(
+          e?.queued
+            ? 'Receipt minted; the bridge server has queued the registration and will finish it even if this tab closes. Waiting for the createAssets block…'
+            : 'Waiting for the createAssets block — the receipt is minted, do not mint again…',
+        );
+        backoff = 3000;
+      } else {
+        note?.('Network hiccup while registering the receipt — retrying. The receipt is minted, do not mint again…');
+        backoff = Math.min(Math.round(backoff * 1.6), 15000);
       }
-      note?.('Waiting for the createAssets block — the receipt is minted, do not mint again…');
-      await new Promise((r) => setTimeout(r, 3000));
+      await new Promise((r) => setTimeout(r, backoff));
     }
+  }
+}
+
+/**
+ * A minted-but-unregistered receipt outlives the tab that minted it (mobile
+ * browsers freeze and discard background tabs within seconds). Remember it per
+ * issuer so a reload prefills "Register wrap" instead of inviting a second mint.
+ */
+const ethPendingWrapKey = (issuer) =>
+  `cartesi.pool.eth3p.pendingWrap.v1.${String(issuer || '').toLowerCase()}`;
+function rememberPendingEthWrap(issuer, rec) {
+  try {
+    localStorage.setItem(ethPendingWrapKey(issuer), JSON.stringify({ ...rec, at: new Date().toISOString() }));
+  } catch {
+    /* storage unavailable — the server queue still covers us */
+  }
+}
+function readPendingEthWrap(issuer) {
+  try {
+    const r = JSON.parse(localStorage.getItem(ethPendingWrapKey(issuer)) || 'null');
+    return r && typeof r.assetTxHash === 'string' ? r : null;
+  } catch {
+    return null;
+  }
+}
+function forgetPendingEthWrap(issuer) {
+  try {
+    localStorage.removeItem(ethPendingWrapKey(issuer));
+  } catch {
+    /* */
   }
 }
 
@@ -1351,6 +1406,8 @@ export default function FungiblePool({
   const [ethManualSupply, setEthManualSupply] = useState('');
   const [ethManualBurnTx, setEthManualBurnTx] = useState('');
   const [ethMintable, setEthMintable] = useState(null);
+  /** Receipt minted from this browser and not yet proved (localStorage-backed). */
+  const [ethPendingWrap, setEthPendingWrap] = useState(null);
   const [swapFlipTick, setSwapFlipTick] = useState(0);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
@@ -3314,10 +3371,18 @@ export default function FungiblePool({
     });
     const hash = minted?.assetHash || minted?.hash;
     if (!hash) throw new Error('createAssets returned no assetHash');
+    {
+      const rec = { assetTxHash: minted?.txHash || hash, assetHash: hash, supplyE8: e8.toString(), supplyHuman: supply };
+      rememberPendingEthWrap(wartFrom, rec);
+      setEthPendingWrap(rec);
+      setEthManualAssetTx(rec.assetTxHash);
+      setEthManualSupply(supply);
+    }
     await registerWrapWhenMined(
       () =>
         poolApi('/api/pool', {
           method: 'POST',
+          keepalive: true,
           body: JSON.stringify({
             action: 'eth3p_register_wrap',
             assetHash: hash,
@@ -3332,6 +3397,10 @@ export default function FungiblePool({
         setActionStatus({ kind: 'info', text });
       },
     );
+    forgetPendingEthWrap(wartFrom);
+    setEthPendingWrap(null);
+    setEthManualAssetTx('');
+    setEthManualSupply('');
     const feeHuman = humanFromE8(BigInt(credited?.credit?.feeE8 || '0'));
     setActionStatus({
       kind: 'ok',
@@ -3979,6 +4048,12 @@ export default function FungiblePool({
         body: JSON.stringify({ action: 'eth3p_mintable', issuerWart: wartFrom }),
       });
       setEthMintable(m?.ok ? m : null);
+      // The server says this receipt is registered — drop the local reminder.
+      const rec = readPendingEthWrap(wartFrom);
+      if (rec && Array.isArray(m?.registeredHashes) && m.registeredHashes.includes(rec.assetTxHash)) {
+        forgetPendingEthWrap(wartFrom);
+        setEthPendingWrap(null);
+      }
     } catch {
       setEthMintable(null);
     }
@@ -3987,6 +4062,20 @@ export default function FungiblePool({
   useEffect(() => {
     void refreshEthMintable();
   }, [refreshEthMintable, eth3pSt?.address]);
+
+  // Reload / new tab: surface a receipt this wallet minted but never registered.
+  useEffect(() => {
+    if (!wartFrom) {
+      setEthPendingWrap(null);
+      return;
+    }
+    const rec = readPendingEthWrap(wartFrom);
+    setEthPendingWrap(rec);
+    if (rec) {
+      setEthManualAssetTx((cur) => cur || rec.assetTxHash);
+      if (rec.supplyHuman) setEthManualSupply((cur) => cur || rec.supplyHuman);
+    }
+  }, [wartFrom]);
 
   /**
    * Step 2 of a deposit whose receipt is already minted: SPV-prove the
@@ -4009,6 +4098,7 @@ export default function FungiblePool({
       () =>
         poolApi('/api/pool', {
           method: 'POST',
+          keepalive: true,
           body: JSON.stringify({
             action: 'eth3p_register_wrap',
             assetHash: tx,
@@ -4023,6 +4113,8 @@ export default function FungiblePool({
         setActionStatus({ kind: 'info', text });
       },
     );
+    forgetPendingEthWrap(wartFrom);
+    setEthPendingWrap(null);
     setEthManualAssetTx('');
     setEthManualSupply('');
     await refreshEthMintable();
@@ -4150,15 +4242,19 @@ export default function FungiblePool({
     const txHash = minted?.txHash || assetHash;
     setEthManualAssetTx(txHash);
     setEthManualSupply(supply);
+    const rec = { assetTxHash: txHash, assetHash, supplyE8: credit.e8.toString(), supplyHuman: supply };
+    rememberPendingEthWrap(wartFrom, rec);
+    setEthPendingWrap(rec);
     return { assetHash, txHash, supply };
   };
 
   /** Stage 4: SPV-prove a minted receipt. Safe to retry; keyed on the asset hash. */
-  const ethRegisterMinted = async ({ assetHash, txHash, e8 }) =>
-    registerWrapWhenMined(
+  const ethRegisterMinted = async ({ assetHash, txHash, e8 }) => {
+    const out = await registerWrapWhenMined(
       () =>
         poolApi('/api/pool', {
           method: 'POST',
+          keepalive: true,
           body: JSON.stringify({
             action: 'eth3p_register_wrap',
             assetHash,
@@ -4173,6 +4269,10 @@ export default function FungiblePool({
         setActionStatus({ kind: 'info', text });
       },
     );
+    forgetPendingEthWrap(wartFrom);
+    setEthPendingWrap(null);
+    return out;
+  };
 
   /**
    * Step 1 alone: lock ETH on the Q and credit it — no receipt.
@@ -4509,9 +4609,13 @@ export default function FungiblePool({
     // Redeem/burn drops outstandingE8, so Locked and Used fall together.
     const locked = available + used;
     let wartL1 = used;
+    // Only a real balance read can say how much is elsewhere; while wartL1
+    // is just the wrap sum the gap is zero by construction.
+    let elsewhere = null;
     if (ethWartL1E8 != null && ethWartL1E8 !== '') {
       try {
         wartL1 = BigInt(ethWartL1E8);
+        if (used > wartL1) elsewhere = used - wartL1;
       } catch {
         /* keep wrap sum */
       }
@@ -4521,6 +4625,12 @@ export default function FungiblePool({
       lockedHuman: humanFromE8(locked),
       usedHuman: humanFromE8(used),
       wartL1Human: humanFromE8(wartL1),
+      /**
+       * Bridge-outstanding wETH this wallet does not hold: sent, sold on the
+       * DEX or deposited as liquidity. Without this line "Bridge converted"
+       * and the wallet total disagree and it reads as a bug.
+       */
+      elsewhereHuman: elsewhere ? humanFromE8(elsewhere) : null,
     };
   })();
   /**
@@ -4883,7 +4993,7 @@ export default function FungiblePool({
               </span>
             </div>
             <div className="wi-stat">
-              <span className="wi-stat-k">{simple ? 'Converted' : 'Used'}</span>
+              <span className="wi-stat-k">{simple ? 'Bridge converted' : 'Used'}</span>
               <span className="wi-stat-v">
                 {swapAsset === 'ETH'
                   ? ethLedger.usedHuman
@@ -4892,8 +5002,8 @@ export default function FungiblePool({
               <span className="wi-stat-hint">
                 {simple
                   ? swapAsset === 'ETH'
-                    ? 'turned into wETH so far'
-                    : 'turned into wWART so far'
+                    ? 'wETH minted from your ETH and not yet burned back, wherever it sits now'
+                    : 'wWART minted from your WART and not yet burned back, wherever it sits now'
                   : swapAsset === 'ETH'
                     ? 'your unburned wETH'
                     : 'your minted claim'}
@@ -4926,6 +5036,11 @@ export default function FungiblePool({
                     ? 'wWART you hold right now'
                     : 'your L1 token'}
               </span>
+              {swapAsset === 'ETH' && ethLedger.elsewhereHuman ? (
+                <span className="wi-stat-hint wi-stat-hint--note">
+                  {ethLedger.elsewhereHuman} wETH is outside your wallet (in a pool, sent, or sold)
+                </span>
+              ) : null}
             </div>
           </div>
 
@@ -6069,6 +6184,26 @@ export default function FungiblePool({
                 wallet, then paste that createAssets hash here. Safe to retry —
                 <b> never mint a second time</b>, each mint is a new unbacked asset.
               </p>
+              {ethPendingWrap || (ethMintable?.pending || []).length > 0 ? (
+                <p
+                  className="wi-muted"
+                  style={{ fontSize: '0.75rem', margin: '0 0 0.4rem', color: '#b8860b' }}
+                >
+                  <b>Receipt minted, not registered yet.</b>{' '}
+                  {(ethMintable?.pending || []).length > 0
+                    ? (ethMintable.pending || []).map((p) => (
+                        <span key={p.assetTxHash}>
+                          {String(p.assetTxHash).slice(0, 12)}… ({humanFromE8(BigInt(p.supplyE8 || '0'))}{' '}
+                          wETH):{' '}
+                          {p.state === 'expired' || p.state === 'gave-up'
+                            ? `could not be registered — ${p.lastError || 'contact ops'}. `
+                            : 'the bridge server has it queued and will finish it once the block is mined. '}
+                        </span>
+                      ))
+                    : `${String(ethPendingWrap.assetTxHash).slice(0, 12)}… — press Register wrap below. `}
+                  Do <b>not</b> mint again.
+                </p>
+              ) : null}
               <input
                 type="text"
                 className="input wi-portal-input"

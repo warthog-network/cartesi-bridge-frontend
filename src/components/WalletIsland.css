@@ -284,6 +284,12 @@ button.eth-section-btn.is-open {
   opacity: 0.55;
   margin-top: 0.15rem;
 }
+/* A hint that carries a fact the tile's number hides (e.g. wETH held outside
+   this wallet). Slightly more visible than the label-style hint above. */
+.wi-stat-hint--note {
+  opacity: 0.8;
+  color: #fcd34d;
+}
 
 .wi-steps {
   margin: 0.85rem 0 0.5rem;

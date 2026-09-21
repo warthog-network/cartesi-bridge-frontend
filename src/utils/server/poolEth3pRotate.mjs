@@ -156,15 +156,25 @@ function rotationView(r, block, extra = {}) {
   };
 }
 
+/** Anvil block for dueInEpochs without running the rotate state machine. */
+export async function ethRotationClockView(extra = {}) {
+  let block = null;
+  try {
+    block = await Promise.race([
+      anvilBlockNumber(),
+      new Promise((resolve) => setTimeout(() => resolve(null), 800)),
+    ]);
+  } catch {
+    /* */
+  }
+  return rotationView(loadRotate(), block, extra);
+}
+
 let tickLock = null;
 
 export async function tickEthRotation() {
+  // Match WART: never convoy every heartbeat behind the in-flight tick.
   if (tickLock) {
-    try {
-      await tickLock;
-    } catch {
-      /* */
-    }
     let block = null;
     try {
       block = await anvilBlockNumber();
@@ -259,6 +269,14 @@ async function tickEthRotationInner() {
     r.lastError = `rotate wait: ${rooms.length} ETH redeem room(s) open`;
     await saveRotate(r);
     return rotationView(r, block);
+  }
+  if (
+    ['need_birth', 'next_ready'].includes(r.phase) &&
+    r.lastError &&
+    /ETH redeem room/.test(String(r.lastError))
+  ) {
+    r.lastError = null;
+    await saveRotate(r);
   }
 
   const next = loadEthNext();

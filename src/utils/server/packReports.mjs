@@ -55,9 +55,10 @@ export function latestPackReport(pool, role, signerId = null) {
   prune(Date.now());
   const r = Number(role);
   if (signerId) return reports.get(`${pool}:${r}:${signerId}`) || null;
+  const prefix = `${pool}:${r}:`;
   let best = null;
-  for (const rec of reports.values()) {
-    if (rec.role !== r) continue;
+  for (const [k, rec] of reports) {
+    if (!k.startsWith(prefix)) continue;
     if (!best || rec.at > best.at) best = rec;
   }
   return best;

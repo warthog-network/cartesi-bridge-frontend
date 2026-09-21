@@ -22,9 +22,31 @@
  * promise-chain gate that reloads inside the lock.
  */
 import { writeFile, mkdir, rename, unlink } from 'node:fs/promises';
+import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 let atomicWriteSeq = 0;
+const jsonCache = new Map(); // path -> { mtimeMs, size, value }
+
+/** Sync JSON read with mtime cache. listOpen/ticketIsPaid used to re-parse
+ *  sessions+paid on every ticket of every heartbeat (~100% JSON.parse CPU). */
+export function readJsonSyncCached(file, fallback) {
+  try {
+    const st = statSync(file);
+    const hit = jsonCache.get(file);
+    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.value;
+    const value = JSON.parse(readFileSync(file, 'utf8'));
+    jsonCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, value });
+    return value;
+  } catch {
+    return fallback;
+  }
+}
+
+export function invalidateJsonCache(file) {
+  if (file) jsonCache.delete(file);
+  else jsonCache.clear();
+}
 
 /** Write `value` as pretty JSON so that no reader can observe a partial file. */
 export async function writeJsonAtomic(file, value) {
@@ -34,6 +56,7 @@ export async function writeJsonAtomic(file, value) {
   try {
     await writeFile(tmp, JSON.stringify(value, null, 2));
     await rename(tmp, file);
+    jsonCache.delete(file);
   } catch (e) {
     await unlink(tmp).catch(() => {});
     throw e;

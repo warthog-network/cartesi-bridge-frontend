@@ -26,7 +26,7 @@
  *    live Q's recovery material; cutover promotes it after the new P is live
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, writeFile, rename } from 'node:fs/promises';
+import { mkdir, writeFile, rename, copyFile, readdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
 /** A reseal request is a live conversation; stale ones must not linger. */
@@ -78,10 +78,58 @@ export function createSealedPreshareStore({ file, pool, ctx }) {
    * a trap for the next caller, so make it unique per write as well.
    */
   let saveSeq = 0;
-  async function save(d) {
+  const PACK_BACKUP_KEEP = 12;
+
+  async function backupStore(reason) {
+    try {
+      if (!existsSync(file)) return;
+      const dir = path.dirname(file);
+      const base = path.basename(file);
+      const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+      const dest = path.join(dir, `${base}.bak-${reason}-${stamp}`);
+      await copyFile(file, dest);
+      const prefix = `${base}.bak-`;
+      const names = (await readdir(dir))
+        .filter((n) => n.startsWith(prefix))
+        .sort();
+      while (names.length > PACK_BACKUP_KEEP) {
+        const old = names.shift();
+        await unlink(path.join(dir, old)).catch(() => null);
+      }
+    } catch (e) {
+      console.warn(`[${pool}3p] pack backup failed (${reason}): ${e?.message || e}`);
+    }
+  }
+
+  /**
+   * Whole-document writes used to drop the other seat's pack (2026-08-25 ETH e2,
+   * 2026-09-18 WART d1: packed 01:33, collect no pack 01:58). Never save a
+   * document that deletes a live/next pack unless the caller opted in (cutover).
+   */
+  function preservePacks(next, prev) {
+    if (!prev) return next;
+    next.packs = next.packs || {};
+    next.nextPacks = next.nextPacks || {};
+    for (const r of ['1', '2']) {
+      if (prev.packs?.[r] && !next.packs[r]) {
+        console.warn(
+          `[${pool}3p] sealed store refused to drop packs[${r}] from=${String(prev.packs[r].from || '').slice(0, 20)}`,
+        );
+        next.packs[r] = prev.packs[r];
+      }
+      if (prev.nextPacks?.[r] && !next.nextPacks[r]) {
+        next.nextPacks[r] = prev.nextPacks[r];
+      }
+    }
+    return next;
+  }
+
+  async function save(d, { replacePacks = false } = {}) {
+    const prev = load();
+    const out = replacePacks ? d : preservePacks(d, prev);
     await mkdir(path.dirname(file), { recursive: true });
     const tmp = `${file}.tmp-${process.pid}-${++saveSeq}`;
-    await writeFile(tmp, JSON.stringify(d, null, 2), { mode: 0o600 });
+    await writeFile(tmp, JSON.stringify(out, null, 2), { mode: 0o600 });
     await rename(tmp, file);
   }
 
@@ -307,6 +355,7 @@ export function createSealedPreshareStore({ file, pool, ctx }) {
           d.packs[String(r)] = stored;
           if (d.legacy?.[String(r)]) delete d.legacy[String(r)];
         }
+        await backupStore(forNext ? `next-d${r}` : `pack-d${r}`);
         await save(d);
         return { ok: true, role: r, n: pack.pieces.length, t: pack.t, slot };
       });
@@ -337,7 +386,8 @@ export function createSealedPreshareStore({ file, pool, ctx }) {
         d.nextPacks = {};
         d.requests = {};
         d.resealed = {};
-        await save(d);
+        await backupStore('cutover');
+        await save(d, { replacePacks: true });
         return { ok: true, promoted: Object.keys(promoted), roles: Object.keys(kept) };
       });
     },
@@ -357,12 +407,16 @@ export function createSealedPreshareStore({ file, pool, ctx }) {
         // every bystander tab retries this each beat while the seat is held,
         // and each throw was a 400 in nginx with nothing to act on.
         const occ = seatOccupantOf(r);
-        if (occ.occupant && occ.occupant !== sid && occ.live) {
+        if (occ.occupant === sid && typeof ctx.noteHolderCollect === 'function') {
+          ctx.noteHolderCollect(r, sid);
+        }
+        const occ2 = seatOccupantOf(r);
+        if (occ2.occupant && occ2.occupant !== sid && occ2.live) {
           return {
             ok: false,
             denied: true,
             role: r,
-            holder: occ.occupant,
+            holder: occ2.occupant,
             message: `reseal denied — d${r} holder is live`,
           };
         }
@@ -461,6 +515,10 @@ export function createSealedPreshareStore({ file, pool, ctx }) {
     collect({ signerId, role }) {
       const r = Number(role);
       const sid = String(signerId || '').trim();
+      const occ0 = seatOccupantOf(r);
+      if (occ0.occupant === sid && typeof ctx.noteHolderCollect === 'function') {
+        ctx.noteHolderCollect(r, sid);
+      }
       const occ = seatOccupantOf(r);
       const holder = occ.occupant;
       if (holder && holder !== sid && occ.live) {
@@ -477,7 +535,7 @@ export function createSealedPreshareStore({ file, pool, ctx }) {
       }
       const d = load();
       const pack = d.packs[String(r)];
-      if (!pack) return { ok: true, role: r, pack: null, resealed: [], vacant: !holder };
+      if (!pack) return { ok: true, role: r, pack: null, resealed: [], vacant: !holder || !occ.live };
       if (!packIsLive(pack, r)) {
         return { ok: true, role: r, stale: true, pack: null, resealed: [], vacant: !holder };
       }

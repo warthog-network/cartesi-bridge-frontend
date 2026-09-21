@@ -36,6 +36,7 @@ import {
 import { createSealedPreshareStore } from './sealedPreshare.mjs';
 import { latestPackReport } from './packReports.mjs';
 import { getInspect } from './inspectHub.mjs';
+import { nextBirthDeniedReason } from './pool3p.mjs';
 import { ETH3P_ADAPTER_ABI } from '../eth3pAdapter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -58,6 +59,16 @@ const ETH_HOLDERS_PATH =
   env('POOL_ETH3P_HOLDERS') || path.join(DEFAULT_DATA, 'pool-eth-3p-holders.json');
 const ETH_ORBIT_PATH =
   env('POOL_ETH3P_ORBIT') || path.join(DEFAULT_DATA, 'pool-eth-3p-orbit.json');
+/** Receipts minted on Warthog whose eth3p_register_wrap has not landed yet. */
+const ETH_PENDING_WRAPS_PATH =
+  env('POOL_ETH3P_PENDING_WRAPS') || path.join(DEFAULT_DATA, 'pool-eth-3p-pending-wraps.json');
+/** Headers the in-machine light client keeps (wartSpv.js createLightClient maxHeaders). */
+const LC_WINDOW_HEADERS = Math.max(64, Number(env('POOL_SPV_LC_WINDOW_HEADERS', '512')) || 512);
+/** How close to the pruning edge a receipt block may be and still be posted. */
+const LC_WINDOW_MARGIN = 16;
+const PENDING_WRAP_TICK_MS = Math.max(5000, Number(env('POOL_ETH3P_PENDING_TICK_MS', '20000')) || 20000);
+const PENDING_WRAP_MAX_ATTEMPTS = 8;
+const PENDING_WRAP_MAX_AGE_MS = 12 * 3600 * 1000;
 const ETH_WRAPS_PATH =
   env('POOL_ETH3P_WRAPS') || path.join(DEFAULT_DATA, 'pool-eth-3p-wraps.json');
 const ETH_BIND_PATH =
@@ -1251,10 +1262,15 @@ export async function birthEthSeatNext({
   paillierG,
   pok,
   rangeProof,
+  network,
 }) {
   const r = Number(role);
   if (r !== 1 && r !== 2) throw new Error('role must be 1 (e1) or 2 (e2)');
   const sid = String(signerId || '').trim();
+  const holding =
+    currentHolderId(1) === sid || currentHolderId(2) === sid;
+  const why = nextBirthDeniedReason(sid, { network, holding });
+  if (why) throw new Error(`next-Q birth denied — ${why}`);
   const dapp = loadEthNext();
   if (!dapp?.Pdapp) throw new Error('no next ETH 3P dapp');
   assertNextOpen(dapp);
@@ -1931,6 +1947,8 @@ export async function heartbeatEth3p({ signerId, seatEpoch, seatFault, nodePubHe
 }
 
 export async function publicEth3pStatus() {
+  // Opportunistic: finish any queued wrap registration whose block has landed.
+  tickPendingEthWraps().catch(() => null);
   await ensureEth3pDapp();
   const d = loadEthDapp() || {};
   const live = liveOrbitMembers();
@@ -2321,12 +2339,218 @@ async function burnBinAccountId() {
  * Recipient-as-minter: SPV-prove createAssets and register the wrap in-machine.
  * Host JSON is a cache of inspect/eth3p — never the wrap authority.
  */
+/* ------------------------------------------------------------------------ */
+/* Pending wrap registrations — the server finishes what a dead tab cannot.  */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Why this exists (2026-09-16): a 100 ETH deposit was locked, credited and its
+ * 99.9 WETH receipt minted from an Android tab. The one eth3p_register_wrap
+ * call hit TX_UNCONFIRMED (the block landed 10 s later), the tab was frozen
+ * and discarded before its retry fired, and nobody noticed until the machine
+ * light client had pruned the block — at which point the receipt could never
+ * be proved (see cartesi-eth-wrap-register-deadline-512-headers). Registration
+ * must therefore not depend on the browser staying alive: an unconfirmed
+ * register request is queued here and a server-side ticker finishes it.
+ */
+function codedError(message, code, extra = {}) {
+  const e = new Error(message);
+  e.code = code;
+  Object.assign(e, extra);
+  return e;
+}
+
+function loadPendingWraps() {
+  const p = loadJson(ETH_PENDING_WRAPS_PATH, null);
+  return p && Array.isArray(p.pending) ? p : { pending: [], done: [] };
+}
+
+async function savePendingWraps(store) {
+  store.done = (store.done || []).slice(-100);
+  await saveJson(ETH_PENDING_WRAPS_PATH, store);
+}
+
+async function upsertPendingWrap({ hash, issuer, supplyE8, assetName, error }) {
+  const store = loadPendingWraps();
+  let row = store.pending.find((r) => r.assetTxHash === hash);
+  const now = new Date().toISOString();
+  if (!row) {
+    row = {
+      assetTxHash: hash,
+      issuerWart: issuer,
+      supplyE8: String(supplyE8),
+      assetName: assetName || 'WETH',
+      state: 'waiting-block',
+      attempts: 0,
+      at: now,
+    };
+    store.pending.push(row);
+  }
+  row.lastSeenAt = now;
+  if (error) row.lastError = String(error).slice(0, 300);
+  await savePendingWraps(store);
+  return row;
+}
+
+async function dropPendingWrap(hash, outcome) {
+  const store = loadPendingWraps();
+  const i = store.pending.findIndex((r) => r.assetTxHash === hash);
+  if (i < 0) return;
+  const [row] = store.pending.splice(i, 1);
+  store.done = store.done || [];
+  store.done.push({ ...row, ...outcome, doneAt: new Date().toISOString() });
+  await savePendingWraps(store);
+}
+
+/** Public, per issuer (or all): what is queued and why it has not landed. */
+export function pendingEthWraps({ issuerWart = null } = {}) {
+  const issuer = issuerWart
+    ? String(issuerWart).replace(/^0x/i, '').toLowerCase()
+    : null;
+  return loadPendingWraps()
+    .pending.filter((r) => !issuer || r.issuerWart === issuer)
+    .map((r) => ({
+      assetTxHash: r.assetTxHash,
+      issuerWart: r.issuerWart,
+      supplyE8: r.supplyE8,
+      state: r.state,
+      attempts: r.attempts,
+      at: r.at,
+      lastTriedAt: r.lastTriedAt || null,
+      lastError: r.lastError || null,
+    }));
+}
+
+async function wartTxMinedHeight(hash) {
+  try {
+    const res = await fetch(`${WART_NODE.replace(/\/$/, '')}/transaction/lookup/${hash}`);
+    const j = await res.json();
+    const d = j?.data ?? j;
+    const h = d?.mined?.block?.height;
+    return h != null ? Number(h) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The machine light client only keeps LC_WINDOW_HEADERS headers; a receipt
+ * whose block fell off that window can never be proved, so say so instead of
+ * posting a claim the machine rejects. Returns null when inspect is unavailable
+ * (the guard is advisory — the machine is still the authority).
+ */
+async function assertReceiptInsideLcWindow(blockHeight) {
+  let best = null;
+  try {
+    const r = await getInspect('pool', { maxAgeMs: 30000 });
+    best = Number(r?.decoded?.spv?.bestHeight) || null;
+  } catch {
+    best = null;
+  }
+  if (!best) return null;
+  const floor = best - (LC_WINDOW_HEADERS - LC_WINDOW_MARGIN);
+  if (Number(blockHeight) < floor) {
+    throw codedError(
+      `RECEIPT_TOO_OLD: the receipt was minted in Warthog block ${blockHeight}, but the ` +
+        `bridge light client only keeps the newest ${LC_WINDOW_HEADERS} headers (now at ${best}). ` +
+        'This receipt can no longer be proved to the machine. Do not mint it again by hand — ' +
+        'contact ops: the ETH credit is intact and the deposit can be finished or refunded.',
+      'RECEIPT_TOO_OLD',
+      { retry: false, blockHeight: Number(blockHeight), lcBest: best },
+    );
+  }
+  return { best, floor };
+}
+
+let pendingTickBusy = false;
+let pendingTickLast = 0;
+
+/**
+ * Finish queued registrations whose createAssets block has been mined.
+ * Cheap when the queue is empty (one small file read). Single-flight and
+ * rate-limited so the status pollers can call it freely.
+ */
+export async function tickPendingEthWraps({ force = false } = {}) {
+  if (pendingTickBusy) return { skipped: 'busy' };
+  if (!force && Date.now() - pendingTickLast < PENDING_WRAP_TICK_MS) return { skipped: 'recent' };
+  pendingTickBusy = true;
+  pendingTickLast = Date.now();
+  const out = [];
+  try {
+    const store = loadPendingWraps();
+    for (const row of store.pending.slice()) {
+      if (row.state === 'expired' || row.state === 'gave-up') continue;
+      const ageMs = Date.now() - Date.parse(row.at || 0);
+      const mined = await wartTxMinedHeight(row.assetTxHash);
+      if (mined == null) {
+        if (ageMs > PENDING_WRAP_MAX_AGE_MS) {
+          row.state = 'expired';
+          row.lastError = 'createAssets never appeared in a Warthog block';
+          await savePendingWraps(store);
+          console.warn(`[eth3p] pending wrap ${row.assetTxHash.slice(0, 12)}… expired unmined`);
+        }
+        continue;
+      }
+      row.state = 'registering';
+      row.lastTriedAt = new Date().toISOString();
+      await savePendingWraps(store);
+      try {
+        const r = await registerEthWrap({
+          assetHash: row.assetTxHash,
+          assetTxHash: row.assetTxHash,
+          supplyE8: row.supplyE8,
+          issuerWart: row.issuerWart,
+          assetName: row.assetName || 'WETH',
+          _fromTicker: true,
+        });
+        console.warn(
+          `[eth3p] pending wrap ${row.assetTxHash.slice(0, 12)}… registered by the server` +
+            ` (${r.already ? 'already on host' : `machine tx ${r.wrap?.machineTx || '?'}`})`,
+        );
+        out.push({ assetTxHash: row.assetTxHash, ok: true });
+      } catch (e) {
+        // registerEthWrap re-reads the store; reload before mutating.
+        const fresh = loadPendingWraps();
+        const cur = fresh.pending.find((r) => r.assetTxHash === row.assetTxHash);
+        if (cur) {
+          cur.attempts = Number(cur.attempts || 0) + 1;
+          cur.lastError = String(e?.message || e).slice(0, 300);
+          cur.state =
+            e?.code === 'RECEIPT_TOO_OLD'
+              ? 'expired'
+              : cur.attempts >= PENDING_WRAP_MAX_ATTEMPTS
+                ? 'gave-up'
+                : 'waiting-retry';
+          await savePendingWraps(fresh);
+        }
+        console.warn(
+          `[eth3p] pending wrap ${row.assetTxHash.slice(0, 12)}… attempt failed: ${e?.message || e}`,
+        );
+        out.push({ assetTxHash: row.assetTxHash, ok: false, error: String(e?.message || e) });
+      }
+    }
+  } finally {
+    pendingTickBusy = false;
+  }
+  return { ok: true, results: out };
+}
+
+// One timer per process; the status pollers also tick it opportunistically.
+if (!globalThis.__eth3pPendingWrapTimer) {
+  const t = setInterval(() => {
+    tickPendingEthWraps().catch(() => null);
+  }, PENDING_WRAP_TICK_MS);
+  t.unref?.();
+  globalThis.__eth3pPendingWrapTimer = t;
+}
+
 export async function registerEthWrap({
   assetHash,
   supplyE8,
   issuerWart,
   assetTxHash,
   assetName,
+  _fromTicker = false,
 }) {
   const hash = String(assetTxHash || assetHash || '')
     .replace(/^0x/i, '')
@@ -2349,16 +2573,40 @@ export async function registerEthWrap({
   }
   const { buildWrapClaim } = await import('../../../../scripts/lib/wartSpvHost.mjs');
   const { submitPoolAdvance } = await import('./pool3pRotate.mjs');
-  const claim = await buildWrapClaim({
-    txHash: hash,
-    issuerWart: issuer,
-    supplyE8: supply.toString(),
-    assetName: assetName || 'WETH',
-    minConfirmations: 1,
-    node: WART_NODE,
-    minedWaitMs: WRAP_WAIT_MS,
-  });
+  let claim;
+  try {
+    claim = await buildWrapClaim({
+      txHash: hash,
+      issuerWart: issuer,
+      supplyE8: supply.toString(),
+      assetName: assetName || 'WETH',
+      minConfirmations: 1,
+      node: WART_NODE,
+      minedWaitMs: _fromTicker ? 0 : WRAP_WAIT_MS,
+    });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (/TX_UNCONFIRMED|need \d+ confs, have \d+/.test(msg)) {
+      // The receipt is on Warthog and must never be minted again; queue it so
+      // the server finishes the proof even if this browser tab dies.
+      await upsertPendingWrap({
+        hash,
+        issuer,
+        supplyE8: supply,
+        assetName: assetName || 'WETH',
+        error: msg,
+      }).catch(() => null);
+      throw codedError(
+        `${msg} The bridge server has queued this registration and will finish it ` +
+          'automatically once the block is mined — you can close this tab.',
+        'TX_UNCONFIRMED',
+        { retry: true, queued: true },
+      );
+    }
+    throw e;
+  }
   delete claim._hostVerified;
+  await assertReceiptInsideLcWindow(claim.blockHeight);
   const posted = await submitPoolAdvance(claim);
   const landed = await waitMachineWrap(hash);
   if (!landed) {
@@ -2401,6 +2649,7 @@ export async function registerEthWrap({
   wraps.wraps = wraps.wraps || [];
   wraps.wraps.push(wrap);
   await saveWraps(wraps);
+  await dropPendingWrap(hash, { outcome: 'registered', machineTx: posted.txHash }).catch(() => null);
   return { ok: true, wrap, burnBin: ETH_BURN_BIN, machine: landed.wrap };
 }
 
@@ -2553,7 +2802,8 @@ export function ethMintable({ issuerWart } = {}) {
     .toLowerCase();
   if (!/^[0-9a-f]{48}$/.test(issuer)) throw new Error('issuerWart (48-hex) required');
   const live = genesisCache.hash;
-  const credits = (loadWraps().credits || []).filter((c) => {
+  const ledger = loadWraps();
+  const credits = (ledger.credits || []).filter((c) => {
     if (c.wartAddress !== issuer) return false;
     if (!live) return true;
     return wrapEpochBacking(c, live) === 'backed';
@@ -2574,6 +2824,12 @@ export function ethMintable({ issuerWart } = {}) {
     mintableE8: largest.toString(),
     totalRemainingE8: total.toString(),
     credits: each,
+    /** Receipts minted but not yet proved; the server ticker is finishing them. */
+    pending: pendingEthWraps({ issuerWart: issuer }),
+    /** Receipt hashes already registered for this issuer (lets a tab drop its local "pending"). */
+    registeredHashes: (ledger.wraps || [])
+      .filter((w) => w.issuerWart === issuer)
+      .map((w) => w.assetHash),
   };
 }
 
@@ -2598,6 +2854,25 @@ export function ethWrapIndex() {
       at: w.at || null,
     };
   }
+  // Receipts a ledger reset archived. The tokens still exist on Warthog L1 —
+  // the chain is never reset — but the bridge's own books say they are not its
+  // receipts any more. Clients use this to untrack, and only this: an
+  // unregistered hash may be a mint whose register_wrap is still in flight.
+  const voided = {};
+  for (const v of wraps.voided || []) {
+    for (const w of Array.isArray(v?.wraps) ? v.wraps : []) {
+      if (!w?.assetHash || voided[w.assetHash]) continue;
+      voided[w.assetHash] = {
+        assetHash: w.assetHash,
+        assetName: w.assetName || 'WETH',
+        supplyE8: String(w.supplyE8 || '0'),
+        outstandingE8AtVoid: String(w.outstandingE8 || '0'),
+        issuerWart: w.issuerWart || null,
+        voidedAt: v.at || null,
+        reason: v.reason || null,
+      };
+    }
+  }
   return {
     ok: true,
     burnBin: ETH_BURN_BIN,
@@ -2605,6 +2880,8 @@ export function ethWrapIndex() {
     byHash,
     hashes: Object.keys(byHash),
     count: Object.keys(byHash).length,
+    voided,
+    voidedHashes: Object.keys(voided),
   };
 }
 

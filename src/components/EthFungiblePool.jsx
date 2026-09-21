@@ -37,7 +37,9 @@ async function poolPost(body) {
   });
   const j = await res.json().catch(() => ({}));
   if (!res.ok || j.ok === false) {
-    throw new Error(j.error || j.message || `pool ${res.status}`);
+    const err = new Error(j.error || j.message || `pool ${res.status}`);
+    if (j.code) err.code = String(j.code);
+    throw err;
   }
   return j;
 }
@@ -55,7 +57,9 @@ async function registerWrapWhenMined(send, note) {
       return await send();
     } catch (e) {
       const msg = e?.message || String(e);
-      if (!/TX_UNCONFIRMED|not mined yet/.test(msg) || Date.now() > deadline) throw e;
+      if (e?.code === 'RECEIPT_TOO_OLD') throw e;
+      const waiting = e?.code === 'TX_UNCONFIRMED' || /TX_UNCONFIRMED|not mined yet|need \d+ confs, have \d+/.test(msg);
+      if (!waiting || Date.now() > deadline) throw e;
       note?.('Waiting for the createAssets block — the receipt is minted, do not mint again…');
       await new Promise((r) => setTimeout(r, 3000));
     }

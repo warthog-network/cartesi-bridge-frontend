@@ -47,7 +47,7 @@ import {
   ticketNeedsNoticeProof,
 } from './poolTicketVerify.mjs';
 import { createSealedPreshareStore } from './sealedPreshare.mjs';
-import { writeJsonAtomic, makeJsonGate } from './jsonStore.mjs';
+import { writeJsonAtomic, makeJsonGate, readJsonSyncCached } from './jsonStore.mjs';
 import { latestPackReport } from './packReports.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -71,6 +71,41 @@ function nonceAlreadyUsed(fromAddress, nonceId) {
   } catch {
     return false;
   }
+}
+
+/** Warthog rejects a transfer whose pin is too far behind the current pin. */
+const PREP_PIN_STALE_BLOCKS = 20;
+const PREP_NODE_URL =
+  (globalThis.process?.env?.WARTHOG_RPC) ||
+  (globalThis.process?.env?.FUNGIBLE_POOL_NODE) ||
+  'http://127.0.0.1:3001';
+
+let pinHeadCache = { at: 0, pin: 0 };
+
+async function currentPinHeight() {
+  const now = Date.now();
+  if (now - pinHeadCache.at < 2000 && pinHeadCache.pin > 0) return pinHeadCache.pin;
+  try {
+    const res = await fetch(`${String(PREP_NODE_URL).replace(/\/$/, '')}/chain/head`);
+    if (!res.ok) return 0;
+    const j = await res.json();
+    const cur = Number(
+      j?.data?.chainHead?.pinHeight ?? j?.data?.pinHeight ?? j?.data?.chainHead?.height ?? 0,
+    );
+    if (!Number.isFinite(cur) || cur <= 0) return 0;
+    pinHeadCache = { at: now, pin: cur };
+    return cur;
+  } catch {
+    return 0;
+  }
+}
+
+async function prepPinIsStale(prep) {
+  const pin = Number(prep?.pinHeight);
+  if (!Number.isFinite(pin)) return false;
+  const cur = await currentPinHeight();
+  if (!cur) return false;
+  return cur - pin > PREP_PIN_STALE_BLOCKS;
 }
 
 export const POOL3P_SCHEME = 'wart-3p-ecdsa-lindell-v1';
@@ -781,6 +816,7 @@ const wartPreshare = createSealedPreshareStore({
           '',
       ),
     nextP: (role) => nextSeatP(role),
+    noteHolderCollect: (role, sid) => noteHolderLostShare(role, sid),
   },
 });
 
@@ -856,11 +892,49 @@ export async function getPresharePiece({ signerId, role }) {
   };
 }
 
+/**
+ * A LIVE seat holder asking to rebuild its own share from a pack means the tab
+ * that heartbeats for d<role> does not hold d<role>: the client only calls
+ * collect after every cached share failed to match the live P. Q 9143e026…
+ * (2026-09-18) sat like this for hours — heartbeats green, R1 posted (needs no
+ * share), sweep never finishing — and the only trace was a 400 "no pack" once
+ * a minute. Record it so status/rotation can say "holder has no share".
+ */
+const holderLostShare = new Map(); // role -> { signerId, firstAt, lastAt, count }
+export function holderLostShareView() {
+  const out = {};
+  const now = Date.now();
+  for (const [role, rec] of holderLostShare) {
+    if (now - rec.lastAt > 10 * 60 * 1000) continue; // stale: the tab recovered or left
+    const cur = seatOccupant(Number(role));
+    if (cur.occupant !== rec.signerId) continue;
+    out[role] = { ...rec, ageMs: now - rec.firstAt };
+  }
+  return out;
+}
+let lastLostWarn = 0;
+function noteHolderLostShare(role, sid) {
+  const now = Date.now();
+  const prev = holderLostShare.get(String(role));
+  const rec = prev && prev.signerId === sid
+    ? { ...prev, lastAt: now, count: prev.count + 1 }
+    : { signerId: sid, firstAt: now, lastAt: now, count: 1 };
+  holderLostShare.set(String(role), rec);
+  if (now - lastLostWarn > 5 * 60 * 1000) {
+    lastLostWarn = now;
+    console.warn(
+      `[pool3p] LIVE d${role} holder ${sid.slice(0, 13)} cannot find its share (asked for a pack ` +
+        `${rec.count}× since ${new Date(rec.firstAt).toISOString()}) — it will never finish a sweep or redeem`,
+    );
+  }
+}
+
 export async function collectPreshare({ role, signerId }) {
   const r = Number(role);
   const sid = String(signerId || '').trim();
   const { occupant: holder, live: holderLive } = seatOccupant(r);
   const vacant = !holder || !holderLive;
+  if (!vacant && holder === sid) noteHolderLostShare(r, sid);
   if (!vacant && holder !== sid) {
     // 200, not a throw: old clients retry this every beat while a live holder
     // sits in the seat, and each throw was a 400 in nginx and nothing useful.
@@ -938,11 +1012,7 @@ function emptySessions() {
 }
 
 async function loadSessions() {
-  try {
-    return JSON.parse(await readFile(SESS_PATH, 'utf8'));
-  } catch {
-    return emptySessions();
-  }
+  return loadSessionsDoc();
 }
 
 async function saveSessions(s) {
@@ -1138,7 +1208,7 @@ export function paidRecordFor(ticketId, extra = {}) {
     if (fromLog) return { ...fromLog, status: 'paid', scheme: fromLog.scheme || POOL3P_SCHEME };
   }
   try {
-    const s = JSON.parse(readFileSync(SESS_PATH, 'utf8'));
+    const s = loadSessionsDoc();
     const row = paidRowFromSession(s.tickets?.[id]);
     if (row && (amt ? samePaidAmount(row, amt) : true)) return row;
   } catch {
@@ -1332,33 +1402,112 @@ function holderStale(rec, now = nowMs()) {
  * next, and every other tab looped on collect → 400.
  */
 /**
- * Seat allowlist. POOL_3P_SEAT_ALLOWLIST = comma-separated signer ids (or
- * id prefixes). Empty = open participation (anyone live may birth/claim a seat).
- * When set, unlisted nodes stay orbit voters: they attest tickets and hold
- * sealed pack pieces, but cannot hold d1/d2 — and a holder that is not listed
- * is vacated on its next heartbeat so a listed tab can rebuild the seat from
- * the orbit pack. Added 2026-09-09 after an anonymous participant running the
- * wrong network (Official1, not DeFi) birthed d1 of the live Q and every
- * rotation sweep and withdrawal then hung on a tab that could never verify.
+ * Seat policy (2026-09-16): no UUID allowlist.
+ * Orbit-only when (1) signer id matches POOL_3P_SEAT_DENYLIST prefixes
+ * (default alabama-) or (2) the peer last reported a network other than
+ * POOL_3P_SEAT_REQUIRE_NETWORK (default defi). Unknown network: cannot
+ * take a new seat, but an existing holder is not vacated until we know
+ * they are off DeFi. Next-Q birth is fail-closed for that unknown case
+ * unless the tab already holds a live seat — waitlisted official1 used
+ * to slip through `forVacate: true` and birth d1. VPS orbit id stays
+ * orbit-only.
  */
-function seatAllowlist() {
-  return String(env('POOL_3P_SEAT_ALLOWLIST', ''))
+function csvEnv(key, fallback = '') {
+  return String(env(key, fallback))
     .split(',')
-    .map((x) => x.trim())
+    .map((x) => x.trim().toLowerCase())
     .filter(Boolean);
 }
-export function seatAllowed(sid) {
-  const list = seatAllowlist();
-  if (!list.length) return true;
+function seatDenylist() {
+  return csvEnv('POOL_3P_SEAT_DENYLIST', 'alabama-');
+}
+function requiredSeatNetwork() {
+  return String(env('POOL_3P_SEAT_REQUIRE_NETWORK', 'defi')).trim().toLowerCase();
+}
+const lastNetworkById = new Map();
+export function noteSignerNetwork(sid, network) {
+  const id = String(sid || '').trim();
+  const net = network ? String(network).trim().toLowerCase().slice(0, 16) : null;
+  if (!id || id.length < 8 || !net) return null;
+  lastNetworkById.set(id, net);
+  return net;
+}
+export function signerNetwork(sid) {
   const id = String(sid || '');
-  return list.some((entry) => id === entry || id.startsWith(entry));
+  if (lastNetworkById.has(id)) return lastNetworkById.get(id);
+  try {
+    const m = loadOrbit()?.members?.[id];
+    return m?.network ? String(m.network).toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+export function seatDeniedReason(sid, { network, forVacate = false } = {}) {
+  const id = String(sid || '');
+  if (!id) return 'missing signer';
+  if (id === ORBIT_VPS_ID || /^pool-3p-signer-[12]$/.test(id) || isVpsFallbackId(id)) {
+    return 'VPS orbit-only';
+  }
+  const low = id.toLowerCase();
+  for (const prefix of seatDenylist()) {
+    if (low.startsWith(prefix) || low.includes(prefix)) {
+      return `denylist (${prefix})`;
+    }
+  }
+  const want = requiredSeatNetwork();
+  if (!want) return null;
+  const net = (network ? String(network).trim().toLowerCase() : null) || signerNetwork(id);
+  if (net && net !== want) return `network ${net} \u2260 ${want}`;
+  if (!net && !forVacate) return `not on ${want} testnet`;
+  return null;
+}
+export function seatAllowed(sid, opts = {}) {
+  return !seatDeniedReason(sid, opts);
+}
+
+/**
+ * Next-Q birth gate. Vacate-style checks allow unknown network so a DeFi
+ * site tab is not kicked before it tags `defi`. Birth must not: an
+ * official1 tab that has not tagged yet used to become next d1, then get
+ * seat-policy-vacated after cutover with the only copy of the share.
+ *
+ * Deny denylist / VPS / known wrong network even for a live holder.
+ * Unknown network may birth only if this tab already holds a live seat
+ * (the DeFi dealers that omit `network` on heartbeat). Do not trust a
+ * self-reported `defi` from a waitlisted tab.
+ */
+export function nextBirthDeniedReason(sid, { network, holding = false } = {}) {
+  const claimed = network ? String(network).trim().toLowerCase() : null;
+  const want = requiredSeatNetwork();
+  if (claimed && want && claimed !== want) {
+    noteSignerNetwork(sid, claimed);
+    return `network ${claimed} \u2260 ${want}`;
+  }
+  const why = seatDeniedReason(sid, { forVacate: true });
+  if (why) return why;
+  const recorded = signerNetwork(sid);
+  if (recorded && want && recorded === want) return null;
+  if (holding) return null;
+  return want ? `not on ${want} testnet` : null;
+}
+
+function lostShareActive(role, occupant) {
+  if (!occupant) return false;
+  const rec = holderLostShare.get(String(role));
+  if (!rec || rec.signerId !== occupant) return false;
+  return Date.now() - rec.lastAt <= 10 * 60 * 1000;
 }
 
 function seatOccupant(role) {
   const rec = loadHolders().roles?.[String(role)] || null;
   const occupant = rec?.signerId || null;
-  const live = !!(occupant && (!holderStale(rec) || liveOrbitMembers().includes(occupant)));
-  return { occupant, live, rec };
+  const lostShare = lostShareActive(role, occupant);
+  const live = !!(
+    occupant &&
+    !lostShare &&
+    (!holderStale(rec) || liveOrbitMembers().includes(occupant))
+  );
+  return { occupant, live, rec, lostShare };
 }
 
 function liveSeatP(role) {
@@ -1383,7 +1532,11 @@ function recoverableBornSeats(live = liveOrbitMembers()) {
     if (!P) continue;
     const rec = loadHolders().roles?.[r] || null;
     const occupant = rec?.signerId || null;
-    if (occupant && (live.includes(occupant) || !holderStale(rec))) continue;
+    const sitting =
+      occupant &&
+      !lostShareActive(r, occupant) &&
+      (live.includes(occupant) || !holderStale(rec));
+    if (sitting) continue;
     out[r] = {
       expectedP: P,
       bornSignerId: born?.signerId || null,
@@ -1753,6 +1906,7 @@ export function orbitSnapshot() {
         ageMs: Number.isFinite(seen) ? now - seen : null,
         live: live.includes(id),
         version: m.version || null,
+        network: m.network || lastNetworkById.get(id) || null,
       };
     })
     .sort((a, b) => a.id.localeCompare(b.id));
@@ -1783,6 +1937,17 @@ function holderSnapshot() {
       : null;
   }
   return out;
+}
+
+/** Live recipients we want on a durable pack (Chrome + Brave site + ext + spare). t stays 2. */
+const PACK_FLOOR = 4;
+
+function packCoversEnough(covered, need, t) {
+  const nNeed = Number(need) || 0;
+  const nT = Math.max(2, Number(t) || 2);
+  const nCov = Number(covered) || 0;
+  const want = Math.min(PACK_FLOOR, Math.max(nT, nNeed));
+  return nCov >= Math.min(want, nNeed || nCov);
 }
 
 /** Who currently holds Shamir pieces of each seat (for vacant rebuild). */
@@ -1825,7 +1990,7 @@ export function packSnapshot() {
       if (nextEarly?.holders) {
         const cov = need.filter((id) => nextEarly.holders.includes(id));
         return {
-          ready: cov.length >= Math.min(Number(nextEarly.t || 2), need.length || 1),
+          ready: packCoversEnough(cov.length, need.length, nextEarly.t),
           from: nextEarly.from || null,
           recipients: nextEarly.holders,
           liveCovered: cov.length,
@@ -1852,7 +2017,7 @@ export function packSnapshot() {
       const holders = sealedEarly.holders || [];
       const cov = need.filter((id) => holders.includes(id));
       out[r] = {
-        ready: cov.length >= Math.min(Number(sealedEarly.t || 2), need.length || 1),
+        ready: packCoversEnough(cov.length, need.length, sealedEarly.t),
         sealed: true,
         from: sealedEarly.from || null,
         recipients: holders,
@@ -1860,6 +2025,7 @@ export function packSnapshot() {
         liveNeed: need.length,
         at: sealedEarly.at || null,
         next: nextReady,
+        missingPack: false,
       };
       continue;
     }
@@ -1876,6 +2042,7 @@ export function packSnapshot() {
         liveNeed: need.length,
         at: pack?.at || sealedEarly?.at || null,
         next: nextReady,
+        missingPack: !sealedEarly,
       };
       continue;
     }
@@ -1884,7 +2051,7 @@ export function packSnapshot() {
       const holders = sealed.holders || [];
       const coveredSealed = need.filter((id) => holders.includes(id));
       out[r] = {
-        ready: coveredSealed.length >= Math.min(Number(sealed.t || 2), need.length || 1),
+        ready: packCoversEnough(coveredSealed.length, need.length, sealed.t),
         sealed: true,
         from: sealed.from || null,
         recipients: holders,
@@ -1892,6 +2059,7 @@ export function packSnapshot() {
         liveNeed: need.length,
         at: sealed.at || null,
         next: nextReady,
+        missingPack: false,
       };
       continue;
     }
@@ -1973,7 +2141,10 @@ export function recoverabilityView(packs = packSnapshot()) {
     atRisk,
     seats,
     summary: atRisk.length
-      ? `d${atRisk.join(' + d')} unrecoverable — share exists only in the holder tab`
+      ? `d${atRisk.join(' + d')} unrecoverable — no durable pack` +
+        (atRisk.some((r) => seats[r].holderLive)
+          ? ' (share exists only in the holder tab)'
+          : ' (seat vacant; collect allowed, nothing to reseal)')
       : 'both seats have a live pack',
   };
 }
@@ -1990,12 +2161,17 @@ function noteClientVersion(sid, version) {
   return v;
 }
 
-export async function heartbeatPool3p({ signerId, seatEpoch, clientVersion } = {}) {
+export async function heartbeatPool3p({ signerId, seatEpoch, clientVersion, network, client } = {}) {
   const sid = String(signerId || '').trim();
   if (sid.length < 16) throw new Error('signerId required');
   await maybeAbandonStaleSeats();
   const version = noteClientVersion(sid, clientVersion);
-  await touchOrbit(sid, version ? { version } : {});
+  const net = noteSignerNetwork(sid, network);
+  const extra = {};
+  if (version) extra.version = version;
+  if (net) extra.network = net;
+  if (client) extra.client = String(client).slice(0, 24);
+  await touchOrbit(sid, extra);
 
   const nowIso = new Date().toISOString();
   // One pass under the lock: reading both roles and writing back separately
@@ -2010,13 +2186,13 @@ export async function heartbeatPool3p({ signerId, seatEpoch, clientVersion } = {
     }
     return mine;
   });
-  if (role > 0 && !seatAllowed(sid)) {
-    // A holder that is no longer on the allowlist gives the seat up here, so a
-    // listed tab can rebuild it from the orbit pack. Its share is unchanged
-    // (client-born Q) but it cannot claim the seat back.
-    logShareEvent('seat vacated', { ticketId: '-', signerId: sid, reason: `d${role} holder is not on the seat allowlist` });
-    await refreshSeat(role, 'allowlist');
-    role = 0;
+  if (role > 0) {
+    const why = seatDeniedReason(sid, { forVacate: true });
+    if (why) {
+      logShareEvent('seat vacated', { ticketId: '-', signerId: sid, reason: `d${role} holder blocked: ${why}` });
+      await refreshSeat(role, 'seat-policy');
+      role = 0;
+    }
   }
 
   // Vacant / ghost pickup. Open rooms must not block claim_born — the room
@@ -2059,6 +2235,7 @@ export async function heartbeatPool3p({ signerId, seatEpoch, clientVersion } = {
     holders: holderSnapshot(),
     holder1: currentHolderId(1),
     holder2: currentHolderId(2),
+    holderLostShare: holderLostShareView(),
     orbit: orbitSnapshot(),
     leaseMs: LEASE_MS,
     open: listOpenPool3pTickets(),
@@ -2110,13 +2287,7 @@ export async function orbitAttest({ signerId, ticketId } = {}) {
 
 export function orbitQuorumInfo(ticketId) {
   const live = liveOrbitMembers();
-  const s = (() => {
-    try {
-      return JSON.parse(readFileSync(SESS_PATH, 'utf8'));
-    } catch {
-      return { tickets: {} };
-    }
-  })();
+  const s = loadSessionsDoc();
   const att = s.tickets?.[String(ticketId)]?.orbitAttests || {};
   const h1 = currentHolderId(1);
   const h2 = currentHolderId(2);
@@ -2229,7 +2400,7 @@ function enrollPayloadForRole(role, signerId, already) {
  * First unique browser/extension gets d1, second gets d2.
  * Same signerId always gets the same role. Third+ are waitlisted (no secret).
  */
-export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
+export async function enrollPool3pSigner({ signerId, role: _hint, network, client } = {}) {
   const sid = String(signerId || '').trim();
   if (sid.length < 16 || sid.length > 120) {
     throw new Error('signerId must be 16–120 chars');
@@ -2241,7 +2412,11 @@ export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
   if (!dapp) throw new Error('3P pool not configured');
 
   await maybeAbandonStaleSeats();
-  await touchOrbit(sid);
+  const net = noteSignerNetwork(sid, network);
+  const extra = {};
+  if (net) extra.network = net;
+  if (client) extra.client = String(client).slice(0, 24);
+  await touchOrbit(sid, extra);
 
   if (sid === ORBIT_VPS_ID) {
     return {
@@ -2259,33 +2434,10 @@ export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
 
   const ts = new Date().toISOString();
 
-  // Born dealer identity wins over a swapped lease.
-  if (dapp.clientBorn || clientBornOn()) {
-    for (const r of ['1', '2']) {
-      const bornSid = dapp.seats?.[r]?.signerId || dapp.seats?.[Number(r)]?.signerId;
-      if (bornSid && bornSid === sid) {
-        if (!seatAllowed(sid)) break;
-        // Born identity wins over a *swapped* lease, not over a live holder that
-        // rebuilt this seat from the orbit pack. Evicting that holder on every
-        // beat of a throttled dealer tab is what flapped d2 (and refused the
-        // live holder's Enc(d2) in between). Wait for the seat to idle out.
-        const occ = seatOccupant(r);
-        if (occ.occupant && occ.occupant !== sid && occ.live) break;
-        await withHolders((hh) => {
-          hh.roles = hh.roles || {};
-          const other = r === '1' ? '2' : '1';
-          if (hh.roles[other]?.signerId === sid) delete hh.roles[other];
-          hh.roles[r] = {
-            signerId: sid,
-            assignedAt: hh.roles[r]?.assignedAt || ts,
-            lastSeen: ts,
-          };
-          hh.address = dapp.address;
-        });
-        return enrollPayloadForRole(Number(r), sid, true);
-      }
-    }
-  }
+  // Born dealer does not auto-sit a vacant seat. Occupancy is either an
+  // already-leased heartbeat (loop below) or claim_born with pok of live P.
+  // Auto-assign here is why vacate d1 lasted ~1s on 2026-09-18: the tab that
+  // birthed P1 retook the lease without hex, and collect stayed "holder is live".
 
   for (const r of ['1', '2']) {
     const mine = await withHolders((hh) => {
@@ -2311,29 +2463,18 @@ export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
   }
 
   async function claim(role) {
-    if (!seatAllowed(sid)) return null;
+    // Unknown network may birth an empty seat; known official1/alabama cannot.
+    if (seatDeniedReason(sid, { forVacate: true })) return null;
     const key = String(role);
     const occupant = loadHolders().roles?.[key]?.signerId;
     const bornSid =
       dapp.seats?.[key]?.signerId || dapp.seats?.[role]?.signerId || null;
     const born = !!(dapp.seats?.[key]?.P || dapp.seats?.[role]?.P);
     const clientBorn = !!(dapp.clientBorn || clientBornOn());
-    // Born client-born seats stay with the tab that created P. Strangers
-    // cannot "claim" them — they have no Enc(d1) / current hex.
-    if (clientBorn && born && bornSid && sid === bornSid) {
-      const occ = seatOccupant(role);
-      if (occ.occupant && occ.occupant !== sid && occ.live) return null;
-      await withHolders((hh) => {
-        hh.roles = hh.roles || {};
-        hh.roles[key] = {
-          signerId: sid,
-          assignedAt: hh.roles[key]?.assignedAt || ts,
-          lastSeen: ts,
-        };
-      });
-      return enrollPayloadForRole(role, sid, true);
-    }
-    if (clientBorn && born && bornSid && sid !== bornSid) {
+    // Born client-born seats are not leased by enroll. Strangers have no hex;
+    // the original dealer must claim_born (cache or pack) the same as anyone
+    // else once the lease is empty. Enroll-assign here blocked recovery.
+    if (clientBorn && born) {
       return null;
     }
     if (holdersFrozen()) return null;
@@ -2417,13 +2558,19 @@ export async function enrollPool3pSigner({ signerId, role: _hint } = {}) {
 }
 
 /** Adopt a vacant born seat by proving di·G equals the live point. */
-export async function claimBornSeat({ signerId, role, shareHex, pok }) {
+export async function claimBornSeat({ signerId, role, shareHex, pok, network } = {}) {
   const r = Number(role);
   if (r !== 1 && r !== 2) throw new Error('role must be 1 or 2');
   const sid = String(signerId || '').trim();
   if (sid.length < 16) throw new Error('signerId required');
-  if (!seatAllowed(sid)) {
-    throw new Error('claim denied — signer is not on the seat allowlist (orbit-only)');
+  if (network) noteSignerNetwork(sid, network);
+  // Unknown network: do not vacate an existing holder, and do not block the
+  // original dealer from claim_born (2026-09-18 fa2f got "not on defi testnet"
+  // because the site tab omits network, while the extension tagged defi and
+  // sat d2 from a pack). Known official1/alabama still denied.
+  const why = seatDeniedReason(sid, { forVacate: true });
+  if (why) {
+    throw new Error(`claim denied — ${why}`);
   }
   const dapp = loadDapp();
   if (!dapp?.clientBorn && !clientBornOn()) throw new Error('not client-born');
@@ -2445,6 +2592,19 @@ export async function claimBornSeat({ signerId, role, shareHex, pok }) {
     throw new Error('claim denied — need Schnorr pok of dlog(P) (or shareHex on legacy rebuild)');
   }
   const ts = new Date().toISOString();
+  const bornSid =
+    dapp.seats?.[String(r)]?.signerId || dapp.seats?.[r]?.signerId || null;
+  // A denylisted / wrong-network original dealer is still in orbit (they vote)
+  // but cannot claim_born. Do not treat that as "they should claim" — it
+  // deadlocks pack recovery, which is the whole point of parking the tab.
+  if (bornSid && bornSid !== sid && liveOrbitMembers().includes(bornSid)) {
+    const blocked = seatDeniedReason(bornSid, { forVacate: true });
+    if (!blocked) {
+      throw new Error(
+        `claim denied — original d${r} dealer is live; they should claim_born`,
+      );
+    }
+  }
   const claimed = await withHolders((h) => {
     h.roles = h.roles || {};
     const occRec = h.roles[String(r)];
@@ -2457,6 +2617,7 @@ export async function claimBornSeat({ signerId, role, shareHex, pok }) {
     // sweep's Lindell round before d2 could ever land.
     const occupantLive = !!(
       occupant &&
+      !lostShareActive(r, occupant) &&
       (!holderStale(occRec) || liveOrbitMembers().includes(occupant))
     );
     if (occupantLive && occupant !== sid) return false;
@@ -2486,6 +2647,7 @@ export function publicStatus() {
     signer2Id: d.signer2Id,
     holder1: h.roles?.['1']?.signerId || null,
     holder2: h.roles?.['2']?.signerId || null,
+    holderLostShare: holderLostShareView(),
     dealer1: d.seats?.['1']?.signerId || null,
     dealer2: d.seats?.['2']?.signerId || null,
     holders: holderSnapshot(),
@@ -2516,7 +2678,7 @@ export function publicStatus() {
       2: !!d.seats?.[2]?.P,
     },
     orbitVpsId: ORBIT_VPS_ID,
-    packFloor: 4,
+    packFloor: PACK_FLOOR,
     packs: packs3p,
     // Derived, so a monitor never has to reimplement "is this Q one closed tab
     // away from stranded". See recoverabilityView().
@@ -2525,10 +2687,11 @@ export function publicStatus() {
     rooms: listOpenPool3pTickets(),
     paid: listPaidPool3pTickets(),
     rotation: null,
-    d1Live: !!(currentHolderId(1) && liveOrbitMembers().includes(currentHolderId(1))),
-    d2Live: !!(currentHolderId(2) && liveOrbitMembers().includes(currentHolderId(2))),
+    d1Live: !!seatOccupant(1).live,
+    d2Live: !!seatOccupant(2).live,
     ...recoverVacantView(),
-    seatAllowlist: seatAllowlist().length ? seatAllowlist().map((x) => x.slice(0, 20)) : null,
+    seatDenylist: seatDenylist(),
+    seatRequireNetwork: requiredSeatNetwork() || null,
     hasDappShare: !!d.dappShareHex,
     hasCkeyD1: !!d.ckeyD1,
     hasD1: false,
@@ -2640,7 +2803,8 @@ export async function pool3pReuseOrPrepare(ticketId, { toAddress, amountE8, make
     const sameAmt =
       amountE8 == null || String(old?.amountE8 || '') === String(amountE8);
     const nonceSpent = nonceAlreadyUsed(old?.fromAddress, old?.nonceId);
-    if (old?.hashHex && sameTo && sameAmt && !nonceSpent) {
+    const pinStale = await prepPinIsStale(old);
+    if (old?.hashHex && sameTo && sameAmt && !nonceSpent && !pinStale) {
       return old;
     }
     const prep = await makePrep();
@@ -2879,6 +3043,7 @@ export function pool3pNoteSkip({
   pruneSkips(rec.at);
   if (!skipsByTicket.has(id)) skipsByTicket.set(id, new Map());
   skipsByTicket.get(id).set(sid, rec);
+  if (rec.network) noteSignerNetwork(sid, rec.network);
   logShareEvent('skip', {
     ticketId: id,
     signerId: sid,
@@ -3163,6 +3328,71 @@ export async function resetPool3pR1({ ticketId, signerId } = {}) {
   });
 }
 
+/** Do not reset more often than this after a d1-retry. */
+const R1_RETRY_COOLDOWN_MS = 60_000;
+
+/**
+ * When a finish-ready room cannot broadcast: lost k1, gone R1 poster, stale
+ * pin, or a long stall. Null = leave the transcript (another live tab may
+ * still hold k1). Never matches wait_d2 (no ciphertext).
+ */
+export function stuckFinishRetryWhy(
+  t,
+  { stalledMs = 0, stallMs = 300000, liveIds = [], now = Date.now(), pinStale = false } = {},
+) {
+  if (!t) return null;
+  if (t.status === 'paid' || t.payout?.txHash) return null;
+  if (!t.haveR1 || !t.ciphertext) return null;
+  if (
+    t.lindellReset === 'd1-retry' &&
+    now - Number(t.updatedAt || 0) < R1_RETRY_COOLDOWN_MS
+  ) {
+    return null;
+  }
+  const r1Sid = t.r1SignerId || null;
+  const postedGone = !!(r1Sid && Array.isArray(liveIds) && liveIds.length && !liveIds.includes(r1Sid));
+  if (pinStale) return 'stale-pin';
+  if (postedGone) return 'r1-signer-gone';
+  if (Number(stalledMs) >= Number(stallMs)) return 'stall';
+  return null;
+}
+
+/**
+ * Drop a finish-ready R1 that can no longer be submitted, so the live d1
+ * holder can post a fresh nonce. Does not run on wait_d2 or a paid ticket.
+ */
+export async function maybeResetStuckFinish(
+  ticketId,
+  { stalledMs = 0, stallMs = 300000 } = {},
+) {
+  const id = String(ticketId || '').trim();
+  if (!id) return { ok: false, skipped: 'no ticket' };
+  const t = loadSessionsDoc().tickets?.[id];
+  if (!t) return { ok: false, skipped: 'no room' };
+  if (ticketNeedsNoticeProof(id) && !t.noticeProofOk) {
+    return { ok: false, skipped: 'notice-proof' };
+  }
+  const pinStale = await prepPinIsStale(t.prep);
+  const why = stuckFinishRetryWhy(t, {
+    stalledMs,
+    stallMs,
+    liveIds: liveOrbitMembers(),
+    pinStale,
+  });
+  if (!why) return { ok: false, skipped: 'still finishable' };
+  const holder = currentHolderId(1);
+  const rst = await resetPool3pR1({
+    ticketId: id,
+    signerId: holder || t.r1SignerId || '',
+  });
+  logShareEvent('r1 retry', {
+    ticketId: id,
+    signerId: holder || t.r1SignerId || '-',
+    reason: why,
+  });
+  return { ok: true, why, ...rst };
+}
+
 function summarizeSess(sess) {
   if (!sess) return { ok: false };
   const paidHash = sess.payout?.txHash || null;
@@ -3193,6 +3423,8 @@ function summarizeSess(sess) {
     pokC: sess.pokC || null,
     paillierN,
     paillierG,
+    r1SignerId: sess.r1SignerId || null,
+    pinHeight: sess.prep?.pinHeight ?? null,
     hashHex: sess.hashHex || null,
     amountE8: sess.amountE8 || sess.prep?.amountE8 || null,
     toAddress: sess.toAddress || sess.prep?.toAddress || null,
@@ -3222,7 +3454,6 @@ export async function openPool3pPayout({ ticketId, toAddress, amountE8 }) {
     // be able to finish, and it is what holds the rotation off in the first place.
     const normAddr = (a) => String(a || '').replace(/^0x/i, '').toLowerCase();
     const reopeningUnpaid =
-      sessionAbandoned(raw) &&
       !!raw.amountE8 &&
       !!raw.toAddress &&
       String(raw.amountE8) === String(amountE8 ?? raw.amountE8) &&
@@ -3261,12 +3492,7 @@ export async function openPool3pPayout({ ticketId, toAddress, amountE8 }) {
 }
 
 export function listOpenPool3pTickets() {
-  let s;
-  try {
-    s = JSON.parse(readFileSync(SESS_PATH, 'utf8'));
-  } catch {
-    s = { tickets: {} };
-  }
+  const s = loadSessionsDoc();
   const seen = new Set();
   const out = [];
   const push = (t) => {
@@ -3408,12 +3634,8 @@ function spendHoldersLive() {
 }
 
 export async function expireStaleUserRooms(now = Date.now()) {
-  let s;
-  try {
-    s = JSON.parse(readFileSync(SESS_PATH, 'utf8'));
-  } catch {
-    return { ok: true, closed: [] };
-  }
+  const s = loadSessionsDoc();
+  if (!s?.tickets) return { ok: true, closed: [] };
   const closed = [];
   const holdersLive = spendHoldersLive();
   for (const t of Object.values(s.tickets || {})) {
@@ -3457,13 +3679,7 @@ export async function reopenAbandonedAuthorizedTickets(tickets = []) {
     if (String(t.status || 'authorized') !== 'authorized') continue;
     if (!ticketOnLiveQ(t, { poolAddress: t.poolAddress })) continue;
     if (ticketIsPaid(id, { amountE8: t.amountE8 })) continue;
-    let sess = null;
-    try {
-      const s = JSON.parse(readFileSync(SESS_PATH, 'utf8'));
-      sess = s.tickets?.[id] || null;
-    } catch {
-      sess = null;
-    }
+    const sess = loadSessionsDoc().tickets?.[id] || null;
     if (
       sess &&
       !sessionAbandoned(sess) &&
@@ -3490,12 +3706,13 @@ export async function reopenAbandonedAuthorizedTickets(tickets = []) {
 }
 
 function loadPaidLog() {
-  try {
-    const j = JSON.parse(readFileSync(PAID_PATH, 'utf8'));
-    return Array.isArray(j.pays) ? j : { pays: [] };
-  } catch {
-    return { pays: [] };
-  }
+  const j = readJsonSyncCached(PAID_PATH, { pays: [] });
+  return Array.isArray(j?.pays) ? j : { pays: [] };
+}
+
+function loadSessionsDoc() {
+  const s = readJsonSyncCached(SESS_PATH, { tickets: {} });
+  return s && typeof s === 'object' ? s : { tickets: {} };
 }
 
 async function rememberPaid(row) {
@@ -3529,12 +3746,7 @@ async function rememberPaid(row) {
 
 export function listPaidPool3pTickets(limit = 16) {
   const fromLog = loadPaidLog().pays || [];
-  let s;
-  try {
-    s = JSON.parse(readFileSync(SESS_PATH, 'utf8'));
-  } catch {
-    s = { tickets: {} };
-  }
+  const s = loadSessionsDoc();
   const seenTicket = new Set();
   const seenTx = new Set();
   const rows = [];
@@ -3598,7 +3810,9 @@ export async function pool3pStatusTicket(ticketId) {
   const paid = paidLogHit(id, t);
   if (paid) return paidStatusView(paid, t);
   if (!t) return { ok: false };
-  return roomView(t);
+  const view = roomView(t);
+  view.prepPinStale = await prepPinIsStale(t.prep);
+  return view;
 }
 
 export async function pool3pMarkPaid(ticketId, payout) {
