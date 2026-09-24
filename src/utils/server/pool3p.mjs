@@ -47,6 +47,7 @@ import {
   ticketNeedsNoticeProof,
 } from './poolTicketVerify.mjs';
 import { createSealedPreshareStore } from './sealedPreshare.mjs';
+import { sweepPackDecision } from './sweepPackGate.mjs';
 import { writeJsonAtomic, makeJsonGate, readJsonSyncCached } from './jsonStore.mjs';
 import { latestPackReport } from './packReports.mjs';
 
@@ -1155,6 +1156,11 @@ const ROTATE_STATE_PATH =
  */
 const ROTATE_COMMITTED = new Set(['announced', 'sweeping', 'cutover']);
 
+/** next_ready is deliberately absent: pack wait lives there, and user rooms stay open. */
+export function rotationBlocksNewUserRooms(phase = rotatePhaseNow()) {
+  return ROTATE_COMMITTED.has(String(phase || 'idle'));
+}
+
 export function rotatePhaseNow() {
   try {
     return String(JSON.parse(readFileSync(ROTATE_STATE_PATH, 'utf8')).phase || 'idle');
@@ -1489,6 +1495,30 @@ export function nextBirthDeniedReason(sid, { network, holding = false } = {}) {
   if (recorded && want && recorded === want) return null;
   if (holding) return null;
   return want ? `not on ${want} testnet` : null;
+}
+
+/**
+ * Next-Q packs that are safe to sweep onto.
+ *
+ * Eligible recipients are live orbit members who could claim the seat:
+ * not a next-Q dealer, not the VPS, not denylisted, not on the wrong network.
+ * `t` of those must already hold a sealed piece of each incoming seat.
+ */
+export function nextPackSweepReady() {
+  let nextPacks = {};
+  try {
+    nextPacks = wartPreshare.summary().nextPacks || {};
+  } catch {
+    nextPacks = {};
+  }
+  const dealers = new Set(
+    ['1', '2'].map((role) => nextBornSignerIdOf(role)).filter(Boolean),
+  );
+  const eligibleIds = liveOrbitMembers().filter((id) => {
+    if (!id || id === ORBIT_VPS_ID || dealers.has(id)) return false;
+    return !seatDeniedReason(id, { forVacate: true });
+  });
+  return sweepPackDecision({ nextPacks, eligibleIds, asset: 'wart' });
 }
 
 function lostShareActive(role, occupant) {
@@ -1979,7 +2009,9 @@ export function packSnapshot() {
     const pack = p.packs?.[r];
     const holder = r === '1' ? h1 : h2;
     const other = r === '1' ? h2 : h1;
-    const need = live.filter((id) => id && id !== holder && id !== other);
+    const need = live.filter(
+      (id) => id && id !== holder && id !== other && id !== ORBIT_VPS_ID,
+    );
     const liveP = liveSeatP(Number(r));
     const packedP = compactPoint(pack?.Pnext);
     const stale = !!(liveP && packedP && packedP !== liveP);
@@ -3464,7 +3496,7 @@ export async function openPool3pPayout({ ticketId, toAddress, amountE8 }) {
       (!raw?.ticketId || sessionAbandoned(raw))
     ) {
       const phase = rotatePhaseNow();
-      if (ROTATE_COMMITTED.has(phase)) {
+      if (rotationBlocksNewUserRooms(phase)) {
         throw new Error(
           `POOL_ROTATING: pool is rotating (${phase}) — retry in a few seconds`,
         );

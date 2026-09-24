@@ -36,7 +36,8 @@ import {
 import { createSealedPreshareStore } from './sealedPreshare.mjs';
 import { latestPackReport } from './packReports.mjs';
 import { getInspect } from './inspectHub.mjs';
-import { nextBirthDeniedReason } from './pool3p.mjs';
+import { nextBirthDeniedReason, seatDeniedReason } from './pool3p.mjs';
+import { sweepPackDecision } from './sweepPackGate.mjs';
 import { ETH3P_ADAPTER_ABI } from '../eth3pAdapter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -820,6 +821,30 @@ function ethPacksView(live = liveOrbitMembers()) {
     };
   }
   return out;
+}
+
+/**
+ * Next ETH packs that are safe to sweep onto. Same rule as WART: t eligible
+ * peers who could claim the seat, excluding both next dealers.
+ */
+export function ethNextPackSweepReady() {
+  let nextPacks = {};
+  try {
+    nextPacks = ethPreshare.summary().nextPacks || {};
+  } catch {
+    nextPacks = {};
+  }
+  const next = loadEthNext();
+  const dealers = new Set(
+    ['1', '2']
+      .map((role) => next?.seats?.[role]?.signerId || next?.seats?.[String(role)]?.signerId)
+      .filter(Boolean),
+  );
+  const eligibleIds = liveOrbitMembers().filter((id) => {
+    if (!id || id === ETH3P_ORBIT_VPS_ID || dealers.has(id)) return false;
+    return !seatDeniedReason(id, { forVacate: true });
+  });
+  return sweepPackDecision({ nextPacks, eligibleIds, asset: 'eth' });
 }
 
 function recoverableEthBornSeats(live = liveOrbitMembers()) {
@@ -2928,7 +2953,7 @@ export async function classifyEthBurn({ assetHash, amountE8 } = {}) {
     };
   }
   const rotatePhase = ethRotatePhaseNow();
-  if (ETH_ROTATE_COMMITTED.has(rotatePhase)) {
+  if (ethRotationBlocksNewUserRooms(rotatePhase)) {
     const msg =
       `ETH pool is rotating (${rotatePhase}) — wait until the sweep finishes before burning. ` +
       'A burn now would send WETH to the bin with no ETH payout until rotation completes.';
@@ -3234,6 +3259,11 @@ function compactSignedRow(t) {
 /** ETH has no announce step, so the sweep is the point of no return. */
 const ETH_ROTATE_COMMITTED = new Set(['sweeping', 'cutover']);
 
+/** next_ready is the pack wait. Redeems keep opening until a sweep ticket exists. */
+export function ethRotationBlocksNewUserRooms(phase = ethRotatePhaseNow()) {
+  return ETH_ROTATE_COMMITTED.has(String(phase || 'idle'));
+}
+
 /** ETH rotation phase off disk — poolEth3pRotate imports this module. */
 function ethRotatePhaseNow() {
   try {
@@ -3381,7 +3411,7 @@ export async function openEthRedeem({
   // refused; an open one keeps its room so it can finish.
   if (!s.tickets[ticketId] || s.tickets[ticketId].status === 'abandoned') {
     const phase = ethRotatePhaseNow();
-    if (ETH_ROTATE_COMMITTED.has(phase)) {
+    if (ethRotationBlocksNewUserRooms(phase)) {
       throw new Error(
         `POOL_ROTATING: ETH pool is rotating (${phase}) — retry in a few seconds`,
       );

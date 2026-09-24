@@ -31,6 +31,7 @@ import {
   recoverabilityView,
   paidRecordFor,
   nextBirthDeniedReason,
+  nextPackSweepReady,
   maybeResetStuckFinish,
 } from './pool3p.mjs';
 import { getInspect, invalidateInspect, isReplaying, machineView } from './inspectHub.mjs';
@@ -548,35 +549,27 @@ async function outboundSweepGate(hash) {
 }
 
 /**
- * Incoming Q sealed nextPacks (counts only — packs stay sealed).
+ * Incoming packs, counted only as a warning once money has moved.
  *
- * Observe-only. Hard-gating cutover on this (2026-09-04) froze Path A after
- * a paid sweep: inspect stayed on the empty live Q while the next Q already
- * held the WART, because browsers pack the *live* P and nextPacks never
- * filled (the previous cutover was already recoveryAtCutover unrecoverable).
- * AGENTS.md: recovery coverage is observe-only. Holders pack the now-live P
- * after promoteOnCutover, which is how the outgoing Q got its packs.
+ * The hard wait is earlier, in next_ready, before announce. Gating cutover
+ * (2026-09-04) froze Path A after a paid sweep: the next Q already held the
+ * WART and inspect was still on the empty live Q. Do not bring that back.
  */
 function incomingNextPacksReady() {
-  let sum;
   try {
-    sum = wartSealedPreshare.summary();
+    return nextPackSweepReady();
   } catch {
-    sum = { nextPacks: {} };
+    return sweepPackMissing();
   }
-  const missing = [];
-  for (const role of ['1', '2']) {
-    const p = sum.nextPacks?.[role];
-    const t = Math.max(1, Number(p?.t || 2));
-    const n = Number(p?.n || 0);
-    if (!p || p.next !== true || n < t) missing.push(role);
-  }
+}
+
+function sweepPackMissing() {
   return {
-    ok: missing.length === 0,
-    missing,
-    reason: missing.length
-      ? `sweep wait: next packs not ready (d${missing.join('+d')} sole-copy on incoming Q)`
-      : null,
+    ok: false,
+    missing: ['1', '2'],
+    eligible: 0,
+    reason:
+      'sweep wait: next packs need 2 seat-eligible signers besides the dealers, have 0 — deposits and withdrawals stay on the live Q',
   };
 }
 
@@ -640,6 +633,7 @@ export function rotationView(r = loadRotate(), block = null, extra = {}) {
     clock:
       (r.phase || 'idle') === 'idle' ? (dueIn === 0 ? 'due' : 'running') : 'rotating',
     phase: r.phase || 'idle',
+    paused: !!r.paused,
     machineReady: extra.machineReady ?? null,
     sweepTicketId: r.sweepTicketId || null,
     sweepTxHash: r.sweepTxHash || lastPaidRotate()?.txHash || null,
@@ -648,6 +642,11 @@ export function rotationView(r = loadRotate(), block = null, extra = {}) {
     setTx: r.setTx || null,
     lastError: r.lastError || extra.lastError || null,
     deferredForRooms,
+    deferredForPacks: !!(
+      extra.deferredForPacks ||
+      ((r.phase || 'idle') === 'next_ready' &&
+        String(r.lastError || extra.lastError || '').startsWith('sweep wait: next packs'))
+    ),
     openUserRooms: rooms.map((t) => t.ticketId),
     next: next
       ? {
@@ -790,6 +789,14 @@ async function tickRotationInner() {
   } catch {
     return rotationView(r, null);
   }
+  /**
+   * Operator pause in the rotate file (same as ETH): freeze the state machine
+   * including an in-flight sweep so signer tabs can reload without the room
+   * immediately reopening. A systemd restart would drop seat leases.
+   */
+  if (r.paused) {
+    return rotationView(r, block);
+  }
   if (r.anchorBlock == null || block < Number(r.anchorBlock)) {
     r.anchorBlock = block;
     await saveRotate(r);
@@ -910,6 +917,26 @@ async function tickRotationInner() {
     await saveRotate(r);
   }
   if (r.phase === 'next_ready' && machineReady && next?.address && elapsed >= interval) {
+    /**
+     * Stay here until both incoming seats have a sealed pack held by two
+     * signers who could claim them. next_ready is not a committed phase, so
+     * new withdrawals still open and deposits still credit the live Q.
+     * Announce is what starts refusing new rooms. An open sweep or cutover
+     * never comes back through this branch.
+     */
+    if (envOn('POOL_3P_REQUIRE_NEXT_PACKS', true)) {
+      const packs = incomingNextPacksReady();
+      if (!packs.ok) {
+        if (r.lastError !== packs.reason) {
+          r.lastError = packs.reason;
+          await saveRotate(r);
+        }
+        return rotationView(loadRotate(), block, {
+          machineReady,
+          deferredForPacks: true,
+        });
+      }
+    }
     try {
       const posted = await submitPoolAdvance({
         type: 'pool_announce_next',
@@ -1122,12 +1149,9 @@ async function maybeOpenOrAdvanceSweep(r, next) {
   }
 
   /**
-   * Next packs are recovery coverage for the incoming Q. They used to hard-gate
-   * opening a sweep so we would not move coins into a sole-copy next Q. In
-   * production the browsers pack the live P, not the announced next P, so the
-   * gate never cleared — and after the 2026-09-04 sweep it also froze cutover
-   * with the money already on next. Warn, then proceed; cutover is observe-only
-   * on this (AGENTS.md). Holders pack the now-live P after promoteOnCutover.
+   * Observe-only once we are about to open. The hard wait already ran in
+   * next_ready. This log is the leftover for a sweep that is opening anyway
+   * (POOL_3P_REQUIRE_NEXT_PACKS=0) or that reached here with packs still thin.
    */
   noteMissingNextPacks('opening sweep');
 
@@ -1247,19 +1271,16 @@ async function maybeOpenOrAdvanceSweep(r, next) {
       return;
     }
     /**
-     * Hard gate (2026-09-18): do not move the pool's money onto a Q whose seat
-     * shares exist in exactly one browser tab. Q 9143e026… lost d1 two seconds
-     * after cutover (the holder's tab never persisted its next-born share) and
-     * 234.8 WART froze with no pack anywhere to rebuild it from. Gating here —
-     * before the sweep is opened — is safe: the live Q keeps serving, nothing
-     * has been paid yet, and the 2026-09-04 freeze only happened because the
-     * gate sat AFTER a paid sweep. Off by default until every holder runs a
-     * build that re-packs after cutover (browser-node ≥ 1.5.2, ac45ca4).
+     * Backstop for a rotation that is already announced or sweeping with no
+     * ticket yet. Drop back to next_ready so POOL_ROTATING does not refuse
+     * withdrawals while the packs are still missing. A paid or open sweep
+     * returns before this point; cutover does not call this function.
      */
-    if (envOn('POOL_3P_REQUIRE_NEXT_PACKS', false)) {
+    if (envOn('POOL_3P_REQUIRE_NEXT_PACKS', true)) {
       const packs = incomingNextPacksReady();
       if (!packs.ok) {
-        r.lastError = `${packs.reason} — sweep NOT opened (POOL_3P_REQUIRE_NEXT_PACKS=1)`;
+        r.phase = 'next_ready';
+        r.lastError = packs.reason;
         await saveRotate(r);
         return;
       }

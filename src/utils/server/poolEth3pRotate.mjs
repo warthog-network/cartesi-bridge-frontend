@@ -19,6 +19,7 @@ import {
   rememberEthPaid,
   syncEth3pAdapterPool,
   ethSealedPreshare,
+  ethNextPackSweepReady,
   refreshEthSweepTicket,
 } from './poolEth3p.mjs';
 
@@ -128,6 +129,11 @@ function rotationView(r, block, extra = {}) {
     sweepTxHash: r.sweepTxHash || extra.sweepTxHash || null,
     lastError: r.lastError || extra.lastError || null,
     deferredForRooms: deferred,
+    deferredForPacks: !!(
+      extra.deferredForPacks ||
+      ((r.phase || 'idle') === 'next_ready' &&
+        String(r.lastError || extra.lastError || '').startsWith('sweep wait: next packs'))
+    ),
     next: nextView,
     last: r.last || null,
   };
@@ -225,7 +231,9 @@ async function tickEthRotationInner() {
     }
     return rotationView(r, block, { live, sealed: false });
   }
-  if (r.lastError && String(r.lastError).includes('not sealed')) {
+  // Only the live-key message. The next-pack wait also says "not sealed", and
+  // matching it reset anchorBlock every other tick so the ETH clock never elapsed.
+  if (r.lastError === 'rotate wait: live ETH 3P not sealed') {
     r.anchorBlock = block;
     r.lastError = null;
     await saveRotate(r);
@@ -314,6 +322,21 @@ async function tickEthRotationInner() {
   }
 
   if (r.phase === 'next_ready' && next?.address) {
+    /**
+     * Same wait as WART, without an announce step. next_ready is not in
+     * ETH_ROTATE_COMMITTED, so redeems and adapter deposits keep using the
+     * live EOA until a sweep ticket actually opens.
+     */
+    if (envOn('POOL_3P_REQUIRE_NEXT_PACKS', true)) {
+      const packs = ethNextPackSweepReady();
+      if (!packs.ok) {
+        if (r.lastError !== packs.reason) {
+          r.lastError = packs.reason;
+          await saveRotate(r);
+        }
+        return rotationView(r, block, { deferredForPacks: true });
+      }
+    }
     r.phase = 'sweeping';
     await saveRotate(r);
   }
@@ -360,6 +383,22 @@ async function archiveEthNextOnce(r, next) {
 
 async function maybeSweep(r, next) {
   const nextAddr = String(next?.address || '').toLowerCase();
+  /**
+   * No ticket yet: this sweep has not reserved the next address. A missing
+   * pack sends the phase back to next_ready so classifyEthBurn / openEthRedeem
+   * keep accepting. An in-flight ticket falls through and finishes.
+   */
+  if (!r.sweepTicketId && envOn('POOL_3P_REQUIRE_NEXT_PACKS', true)) {
+    const packs = ethNextPackSweepReady();
+    if (!packs.ok) {
+      r.phase = 'next_ready';
+      if (r.lastError !== packs.reason) {
+        r.lastError = packs.reason;
+        await saveRotate(r);
+      }
+      return;
+    }
+  }
   if (r.sweepTicketId) {
     const t = eth3pStatusTicket(r.sweepTicketId);
     /**
