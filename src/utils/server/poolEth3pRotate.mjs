@@ -317,7 +317,20 @@ async function tickEthRotationInner() {
       await saveRotate(r);
     }
   } else if (r.phase === 'need_birth' && next?.address && next.seats?.[1]?.P && next.seats?.[2]?.P) {
+    // Both points exist, but birth is not finished until each share is sealed.
+    // Staying in need_birth keeps the sweep from opening on an unpacked key.
+    if (envOn('POOL_3P_REQUIRE_NEXT_PACKS', true)) {
+      const packs = ethNextPackSweepReady();
+      if (!packs.ok) {
+        if (r.lastError !== packs.reason) {
+          r.lastError = packs.reason;
+          await saveRotate(r);
+        }
+        return rotationView(r, block, { deferredForPacks: true });
+      }
+    }
     r.phase = 'next_ready';
+    if (r.lastError && String(r.lastError).includes('next packs not sealed')) r.lastError = null;
     await saveRotate(r);
   }
 

@@ -883,7 +883,20 @@ async function tickRotationInner() {
 
   const next = loadNextDapp();
   if (r.phase === 'need_birth' && next?.address && next.seats?.[1]?.P && next.seats?.[2]?.P) {
+    // Points are in. Birth finishes, and the sweep may be considered, only
+    // once both incoming shares are sealed to peers who could claim them.
+    if (envOn('POOL_3P_REQUIRE_NEXT_PACKS', true)) {
+      const packs = incomingNextPacksReady();
+      if (!packs.ok) {
+        if (r.lastError !== packs.reason) {
+          r.lastError = packs.reason;
+          await saveRotate(r);
+        }
+        return rotationView(loadRotate(), block, { deferredForPacks: true });
+      }
+    }
     r.phase = 'next_ready';
+    if (r.lastError && String(r.lastError).includes('next packs not sealed')) r.lastError = null;
     await saveRotate(r);
   }
 

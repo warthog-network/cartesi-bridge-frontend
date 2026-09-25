@@ -750,7 +750,37 @@ function liveOrbitMembers(o = loadOrbit(), now = nowMs()) {
 }
 
 function currentHolderId(role) {
-  return loadHolders().roles?.[String(role)]?.signerId || null;
+  const rec = loadHolders().roles?.[String(role)];
+  // A lease with awaitingSeal has birthed (or claimed) a point that is not
+  // sealed yet. It may finish the birth handshake. It is not the seat holder.
+  if (!rec?.signerId || rec.awaitingSeal) return null;
+  return rec.signerId;
+}
+
+/** True when the live sealed pack for this seat has at least t pieces. */
+function liveEthPackSealed(role) {
+  try {
+    const p = ethPreshare.summary().packs?.[String(role)];
+    if (!p || p.live === false) return false;
+    const t = Math.max(2, Number(p.t) || 2);
+    return (p.holders || []).length >= t;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A born seat's lease counts as the holder only after its share is sealed.
+ * An unborn lease (no P yet) stays a birth lease so the tab can still birth.
+ */
+function syncAwaitingSeal(rec, role, born) {
+  if (!rec) return;
+  if (!born) {
+    delete rec.awaitingSeal;
+    return;
+  }
+  if (liveEthPackSealed(role)) delete rec.awaitingSeal;
+  else rec.awaitingSeal = true;
 }
 
 /**
@@ -1896,6 +1926,8 @@ export async function heartbeatEth3p({ signerId, seatEpoch, seatFault, nodePubHe
       if (h.roles?.[r]?.signerId === sid) {
         role = Number(r);
         h.roles[r].lastSeen = new Date().toISOString();
+        const seat = loadEthDapp()?.seats?.[r] || loadEthDapp()?.seats?.[Number(r)];
+        syncAwaitingSeal(h.roles[r], Number(r), !!seat?.P);
         if (seatFault) {
           recordSeatFault(h.roles[r], seatFault);
         } else {

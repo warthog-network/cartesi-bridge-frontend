@@ -2213,6 +2213,8 @@ export async function heartbeatPool3p({ signerId, seatEpoch, clientVersion, netw
     for (const r of ['1', '2']) {
       if (hh.roles?.[r]?.signerId === sid) {
         hh.roles[r].lastSeen = nowIso;
+        const seat = loadDapp()?.seats?.[r] || loadDapp()?.seats?.[Number(r)];
+        syncAwaitingSeal(hh.roles[r], Number(r), !!seat?.P);
         mine = Number(r);
       }
     }
@@ -2361,7 +2363,30 @@ function assertOrbitForSign(ticketId) {
 }
 
 function currentHolderId(role) {
-  return loadHolders().roles?.[String(role)]?.signerId || null;
+  const rec = loadHolders().roles?.[String(role)];
+  if (!rec?.signerId || rec.awaitingSeal) return null;
+  return rec.signerId;
+}
+
+function liveWartPackSealed(role) {
+  try {
+    const p = wartPreshare.summary().packs?.[String(role)];
+    if (!p || p.live === false) return false;
+    const t = Math.max(2, Number(p.t) || 2);
+    return (p.holders || []).length >= t;
+  } catch {
+    return false;
+  }
+}
+
+function syncAwaitingSeal(rec, role, born) {
+  if (!rec) return;
+  if (!born) {
+    delete rec.awaitingSeal;
+    return;
+  }
+  if (liveWartPackSealed(role)) delete rec.awaitingSeal;
+  else rec.awaitingSeal = true;
 }
 
 function enrollPayloadForRole(role, signerId, already) {
